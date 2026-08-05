@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="pstore — A native GUI for prompt authoring with versioned markdown files, inline LLM hints, automatic model selection, and one-keystroke handoff to coding agents.">
+  <title>pstore — Prompt Store</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0d0d0f;
+      --bg-elevated: #16161a;
+      --fg: #e8e8ed;
+      --fg-muted: #8b8b98;
+      --accent: #00d4aa;
+      --accent-dim: #00b896;
+      --border: #2a2a32;
+      --card: #1a1a20;
+      --code-bg: #121216;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+    code, pre { font-family: 'JetBrains Mono', monospace; }
+    a { color: var(--accent); text-decoration: none; transition: color 0.15s; }
+    a:hover { color: var(--accent-dim); }
+    .container { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+    header {
+      padding: 60px 0 40px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(180deg, var(--bg) 0%, var(--bg-elevated) 100%);
+    }
+    .logo { display: inline-flex; align-items: center; gap: 12px; }
+    .logo-mark {
+      width: 40px; height: 40px;
+      background: linear-gradient(135deg, var(--accent) 0%, #0099ff 100%);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 18px; color: var(--bg);
+    }
+    h1 { font-size: clamp(2.5rem, 5vw, 3.5rem); font-weight: 700; letter-spacing: -0.02em; margin-top: 16px; }
+    .tagline { font-size: 1.25rem; color: var(--fg-muted); margin-top: 12px; max-width: 60ch; }
+    .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 6px 12px; border-radius: 6px;
+      background: var(--card); border: 1px solid var(--border);
+      font-size: 0.8rem; font-weight: 500; color: var(--fg-muted);
+    }
+    .badge.accent { background: rgba(0, 212, 170, 0.15); border-color: var(--accent); color: var(--accent); }
+    main { padding: 48px 0; }
+    section { margin-bottom: 56px; }
+    h2 { font-size: 1.75rem; font-weight: 600; margin-bottom: 20px; }
+    h3 { font-size: 1.15rem; font-weight: 600; margin: 24px 0 12px; color: var(--fg-muted); }
+    p { color: var(--fg-muted); margin-bottom: 16px; }
+    ul { margin-left: 20px; color: var(--fg-muted); }
+    li { margin-bottom: 8px; }
+    .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+    .feature-card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 12px; padding: 24px; transition: border-color 0.15s, transform 0.15s;
+    }
+    .feature-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+    .feature-icon {
+      width: 44px; height: 44px; border-radius: 10px;
+      background: rgba(0, 212, 170, 0.15);
+      display: flex; align-items: center; justify-content: center;
+      color: var(--accent); margin-bottom: 16px;
+    }
+    .feature-card h3 { margin: 0 0 8px; color: var(--fg); font-size: 1.05rem; }
+    .feature-card p { margin: 0; font-size: 0.9rem; }
+    .screenshot { border-radius: 12px; border: 1px solid var(--border); overflow: hidden; margin: 24px 0; }
+    .screenshot img { width: 100%; height: auto; display: block; background: var(--code-bg); }
+    .code-block {
+      background: var(--code-bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px; overflow-x: auto;
+      margin: 16px 0; font-size: 0.85rem; line-height: 1.55;
+    }
+    .code-block code { color: #d4d4dc; }
+    .install-section { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 32px; }
+    .install-tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .install-tab {
+      padding: 8px 16px; background: transparent; border: 1px solid var(--border);
+      border-radius: 6px; color: var(--fg-muted); font-size: 0.85rem; cursor: pointer;
+      transition: all 0.15s;
+    }
+    .install-tab.active, .install-tab:hover { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+    .install-panel { display: none; }
+    .install-panel.active { display: block; animation: fadeIn 0.15s; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+    .cmd { display: flex; align-items: center; gap: 12px; background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
+    .cmd code { flex: 1; color: var(--fg); }
+    .copy-btn {
+      padding: 6px 12px; background: var(--border); border: none; border-radius: 6px;
+      color: var(--fg); font-size: 0.8rem; cursor: pointer; transition: background 0.15s;
+    }
+    .copy-btn:hover { background: var(--accent); color: var(--bg); }
+    .copy-btn.copied { background: var(--accent); }
+    footer {
+      border-top: 1px solid var(--border); padding: 32px 0; color: var(--fg-muted);
+      font-size: 0.85rem; text-align: center;
+    }
+    .links { display: flex; justify-content: center; gap: 24px; margin-bottom: 16px; flex-wrap: wrap; }
+    @media (max-width: 600px) {
+      header { padding: 40px 0 32px; }
+      main { padding: 32px 0; }
+      .install-section { padding: 24px 16px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container">
+      <div class="logo">
+        <span class="logo-mark">p</span>
+        <span style="font-weight:700;font-size:1.5rem;">pstore</span>
+      </div>
+      <h1>Prompt Store</h1>
+      <p class="tagline">A native GUI that makes prompt authoring a first-class activity — versioned markdown files, inline LLM hints, automatic model selection, and one-keystroke handoff to coding agents.</p>
+      <div class="badges">
+        <span class="badge accent">Rust + egui</span>
+        <span class="badge">Native GUI</span>
+        <span class="badge">Cross-platform</span>
+        <span class="badge">MIT License</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+    <section id="overview">
+      <h2>Why pstore?</h2>
+      <p>Writing a good prompt for a coding agent is iterative. Today that work happens in a scratch buffer with no history, no help while writing, and no idea which of the installed agents/models is the right (cheapest, fastest-adequate) target.</p>
+      <p>pstore solves this by treating prompt authoring as a first-class workflow:</p>
+      <ul>
+        <li><strong>Versioned markdown files</strong> in your working folder — plain <code>.md</code> files you can git, grep, and edit anywhere</li>
+        <li><strong>Inline LLM hints</strong> while typing — context-aware suggestions without leaving the editor</li>
+        <li><strong>Automatic difficulty/capability scoring</strong> — picks the cheapest adequate model for the task</li>
+        <li><strong>One-click PII masking</strong> — replace names, addresses and identifiers with placeholders before the prompt reaches an agent</li>
+        <li><strong>One-keystroke handoff</strong> — send the prompt to a real agent session instantly</li>
+      </ul>
+    </section>
+
+    <section id="features">
+      <h2>Features</h2>
+      <div class="feature-grid">
+        <article class="feature-card">
+          <div class="feature-icon">📝</div>
+          <h3>Versioned Prompts</h3>
+          <p>Every save creates a snapshot in <code>.pstore/versions/</code>. Full history, diffs, and one-click restore — all as plain markdown files.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon">💡</div>
+          <h3>Inline Hints</h3>
+          <p>Select text and get LLM-powered suggestions: clarify, expand, add constraints, fix ambiguity. Inserted directly at the cursor.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon">🎯</div>
+          <h3>Smart Model Routing</h3>
+          <p>A capability classifier scores your prompt across 6 dimensions and a difficulty classifier rates how hard it is. Picks the cheapest model that meets the threshold — no more overpaying for Opus when you need Haiku.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon">🛡️</div>
+          <h3>PII Sanitizer</h3>
+          <p>Finds names, addresses, IBANs, tax codes and card numbers and swaps them for stable placeholders like <code>[FULLNAME_1]</code>. Structured identifiers are confirmed by their checksum, so code and version numbers are left alone. You see the diff before anything changes.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon">🔒</div>
+          <h3>Models Run Locally</h3>
+          <p>Every model pstore runs itself is a small encoder loaded in-process via Candle, on Metal, CUDA or CPU. Download them once from the Models window — with the size stated up front and progress shown — and nothing about your prompt leaves the machine again.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon">⚡</div>
+          <h3>One-Key Handoff</h3>
+          <p>Press <kbd>Enter</kbd> (or your binding) to launch the selected agent with the prompt. Supports Claude Code, Codex, Gemini, Cursor, and 10+ others.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon">🔧</div>
+          <h3>The Whole Field, Not a Verdict</h3>
+          <p>Every (agent, model, effort) combination is scored and shown with its speed and its rationale, so you can disagree with the pick. Token price is displayed alongside — and deliberately kept out of the score.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon">💳</div>
+          <h3>Metered Models Stay Out of the Way</h3>
+          <p>Claude Fable 5 is the one model billed per token rather than covered by the subscription. It is scored like everything else, but only picked automatically when it fits better than every included model by a clear margin — never by a tie or a rounding accident. Pin it from the target list when you do want it.</p>
+        </article>
+        <article class="feature-card">
+          <div class="feature-icon">📁</div>
+          <h3>Plain Files Everywhere</h3>
+          <p>Prompts are <code>.md</code> files in your project. Sidecar state in <code>.pstore/</code>. No lock-in, no database, works with git and any editor.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="install">
+      <h2>Installation</h2>
+      <div class="install-section">
+        <div class="install-tabs" role="tablist">
+          <button class="install-tab active" role="tab" data-tab="cargo">cargo install</button>
+          <button class="install-tab" role="tab" data-tab="binary">Pre-built Binary</button>
+          <button class="install-tab" role="tab" data-tab="source">From Source</button>
+        </div>
+
+        <div class="install-panel active" role="tabpanel" data-tab="cargo">
+          <div class="cmd">
+            <code>cargo install --git https://github.com/alexpacio/pstore</code>
+            <button class="copy-btn" data-copy="cargo install --git https://github.com/alexpacio/pstore">Copy</button>
+          </div>
+          <p style="color: var(--fg-muted); font-size: 0.9rem;">Requires Rust 1.78+. Installs the <code>pstore</code> binary to <code>~/.cargo/bin/</code>.</p>
+        </div>
+
+        <div class="install-panel" role="tabpanel" data-tab="binary">
+          <p style="color: var(--fg-muted); margin-bottom: 16px;">Download the latest release for your platform:</p>
+          <div class="cmd">
+            <code># Linux (x86_64)</code>
+            <button class="copy-btn" data-copy="curl -L https://github.com/alexpacio/pstore/releases/latest/download/pstore-x86_64-unknown-linux-gnu.tar.gz | tar xz">Copy</button>
+          </div>
+          <div class="cmd">
+            <code># macOS (Apple Silicon)</code>
+            <button class="copy-btn" data-copy="curl -L https://github.com/alexpacio/pstore/releases/latest/download/pstore-aarch64-apple-darwin.tar.gz | tar xz">Copy</button>
+          </div>
+          <div class="cmd">
+            <code># Windows (x86_64)</code>
+            <button class="copy-btn" data-copy="curl -L https://github.com/alexpacio/pstore/releases/latest/download/pstore-x86_64-pc-windows-msvc.zip -o pstore.zip">Copy</button>
+          </div>
+        </div>
+
+        <div class="install-panel" role="tabpanel" data-tab="source">
+          <div class="cmd">
+            <code>git clone https://github.com/alexpacio/pstore</code>
+            <button class="copy-btn" data-copy="git clone https://github.com/alexpacio/pstore">Copy</button>
+          </div>
+          <div class="cmd">
+            <code>cd pstore && cargo build --release</code>
+            <button class="copy-btn" data-copy="cd pstore && cargo build --release">Copy</button>
+          </div>
+          <div class="cmd">
+            <code>./target/release/pstore</code>
+            <button class="copy-btn" data-copy="./target/release/pstore">Copy</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="usage">
+      <h2>Quick Start</h2>
+      <div class="code-block"><code># In your project directory
+pstore
+
+# Or specify a prompt directory
+pstore ~/my-prompts</code></div>
+      <p>This opens the pstore window with a sidebar listing all <code>.md</code> files in the directory. Create a new prompt, start typing, and use the features:</p>
+      <ul>
+        <li><kbd>Ctrl+S</kbd> — Save (creates a version snapshot)</li>
+        <li><kbd>Ctrl+R</kbd> — Score every installed model and effort level</li>
+        <li><kbd>Ctrl+Enter</kbd> — Request a hint about the selection or question</li>
+        <li><kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Shift+Z</kbd> — Undo / Redo</li>
+        <li><kbd>Ctrl+M</kbd> — Toggle preview mode</li>
+      </ul>
+      <p>Action bar: <code>Score models</code> · <code>Shrink</code> · <code>Sanitize</code> · <code>Send →</code> · <code>Hint…</code> · <code>Models…</code></p>
+      <h3>Configuration</h3>
+      <p>Settings are stored in <code>.pstore/config.json</code> in your prompt directory:</p>
+      <div class="code-block"><code>{
+  "hint_score_tolerance": 8.0, // points of fit a hint may trade for speed
+  "preview": false,            // start in preview mode
+  "sidebar_width": 260,        // sidebar width in points
+  "pinned_agent": null,        // override auto-selected agent
+  "allow_model_download": true // may pstore fetch weights from Hugging Face at all
+}</code></div>
+    </section>
+
+    <section id="local-models">
+      <h2>The Local Models</h2>
+      <p>pstore uses three checkpoints and runs all of them <strong>in its own process, on your machine</strong>. None is contacted at inference time; the only network traffic is the one-off weight download you start from <strong>Models…</strong>, which states each file's size up front and shows its progress as it arrives.</p>
+      <ul>
+        <li><a href="https://huggingface.co/regolo/brick-modernbert-capability-classifier"><code>regolo/brick-modernbert-capability-classifier</code></a> — multi-label capability vector over the six routing dimensions (ModernBERT, sigmoid head). 795&nbsp;MB.</li>
+        <li><a href="https://huggingface.co/nvidia/prompt-task-and-complexity-classifier"><code>nvidia/prompt-task-and-complexity-classifier</code></a> — task type plus six complexity dimensions, reweighted for coding prompts into easy/medium/hard (DeBERTa-v3). 744&nbsp;MB.</li>
+        <li><a href="https://huggingface.co/rizzoaiacademy/rizzo-pii-0.3B"><code>rizzoaiacademy/rizzo-pii-0.3B</code></a> — BIO token classification over 22 kinds of personal data, from <a href="https://github.com/Rizzo-AI-Academy/rizzo-pii">rizzo-pii</a> (mmBERT). 1.26&nbsp;GB.</li>
+      </ul>
+      <p>Weights land in the shared Hugging Face cache, so other tools reuse them. Until a checkpoint is downloaded the feature that needs it degrades <em>visibly</em>: routing falls back to a built-in surface-feature estimate and says so in the status bar; sanitizing falls back to checksum-validated patterns (IBAN mod-97, Luhn, codice fiscale, partita IVA, email) and says so in the review window.</p>
+      <p>Brick's own difficulty checkpoints are LoRAs on Qwen3.5-0.8B — a hybrid attention/SSM architecture candle-transformers has no implementation for — so they could never load, and difficulty quietly fell back to the heuristic. The NVIDIA classifier replaces that half. Its published complexity score is weighted for general-purpose prompts, where <code>creativity</code> and <code>domain_knowledge</code> turn out to be near-constant across coding prompts; pstore reweights the model's own dimensions towards the ones that discriminate here, and the weights, thresholds and calibration set are all in <code>src/router/difficulty.rs</code>.</p>
+      <p>The <strong>hint</strong> and <strong>shrink</strong> features are different in kind: they deliberately drive <em>your</em> installed coding agent, which is the point of the tool. Those are the only paths where prompt text leaves the process, they are always an explicit action, and the sanitizer exists to run before them.</p>
+    </section>
+
+    <section id="architecture">
+      <h2>Architecture</h2>
+      <h3>Project Structure</h3>
+      <div class="code-block"><code>pstore/
+├── src/
+│   ├── main.rs              # Application entry point
+│   ├── config.rs            # Runtime config & persisted preferences
+│   ├── models.rs            # Local checkpoint catalogue + download/load status board
+│   ├── pii/
+│   │   ├── mod.rs           # Findings, placeholder plan, BIO decoding
+│   │   ├── detect.rs        # Checksum-validated identifiers (IBAN, Luhn, CF, P.IVA)
+│   │   └── model.rs         # rizzo-pii token classifier on Candle
+│   ├── router/
+│   │   ├── capability.rs    # Brick ModernBERT capability classifier
+│   │   ├── difficulty.rs    # NVIDIA DeBERTa task/complexity classifier
+│   │   ├── heuristic.rs     # Surface-feature fallback for both signals
+│   │   ├── hub.rs           # Hugging Face cache probe / download with progress
+│   │   └── scoring.rs       # (agent, model, effort) ranking
+│   ├── store/
+│   │   ├── mod.rs           # PromptStore: list/create/read/write/rename/delete
+│   │   └── version.rs       # Version history (snapshots, diffs, index)
+│   ├── editor/
+│   │   ├── mod.rs           # Buffer: text, selection, dirty tracking
+│   │   └── undo.rs          # Snapshot-based undo/redo with coalescing
+│   └── agents/
+│       └── registry.rs      # Static agent/model specs & capability vectors
+├── Cargo.toml
+└── README.md</code></div>
+      <h3>Key Design Decisions</h3>
+      <ul>
+        <li><strong>Plain files:</strong> Prompts are <code>.md</code> files. Sidecar state in <code>.pstore/</code>. No database, no lock-in.</li>
+        <li><strong>Snapshot-based undo:</strong> Coalesces typing into word/line granules. Programmatic edits (shrink, hint, restore) are single atomic steps.</li>
+        <li><strong>Static agent registry:</strong> All agent CLIs and model specs in one file. Adapting to upstream flag changes is a one-line edit.</li>
+        <li><strong>Capability routing:</strong> Uses a 6-dimension skill vector per model. Quality/cost tradeoff controlled by a single <code>r</code> parameter (Brick-style objective).</li>
+        <li><strong>Local inference only:</strong> Every model pstore runs itself is loaded in-process via Candle. Weights are downloaded on request, never at startup, and the app degrades visibly rather than silently when one is missing.</li>
+        <li><strong>Nothing applied unreviewed:</strong> Shrink and sanitize both propose a diff. Accepting is one undo step, and the previous text is already in version history.</li>
+        <li><strong>egui/eframe:</strong> Native GUI, no Electron. Small binary, fast startup, works on Linux/macOS/Windows.</li>
+      </ul>
+    </section>
+
+    <section id="agents">
+      <h2>Supported Agents</h2>
+      <p>pstore knows how to drive these coding agents out of the box:</p>
+      <div class="feature-grid">
+        <article class="feature-card"><h3>Claude Code</h3><p>Haiku 4.5 / Sonnet 5 / Opus 5 / Fable 5 with full model selection</p></article>
+        <article class="feature-card"><h3>OpenAI Codex</h3><p>GPT-5.1 Codex</p></article>
+        <article class="feature-card"><h3>Gemini CLI</h3><p>Gemini 3 Flash / Pro</p></article>
+        <article class="feature-card"><h3>Cursor Agent</h3><p>Model from Cursor config</p></article>
+        <article class="feature-card"><h3>OpenCode</h3><p>Model from OpenCode config</p></article>
+        <article class="feature-card"><h3>Crush</h3><p>Model from <code>~/.config/crush/crush.json</code></p></article>
+        <article class="feature-card"><h3>Aider</h3><p>Model flag support</p></article>
+        <article class="feature-card"><h3>Goose</h3><p>Session-based interaction</p></article>
+        <article class="feature-card"><h3>Qwen Code</h3><p>Model flag support</p></article>
+        <article class="feature-card"><h3>GitHub Copilot CLI</h3><p>Model flag support</p></article>
+        <article class="feature-card"><h3>Factory Droid</h3><p>Model flag support</p></article>
+        <article class="feature-card"><h3>Amp</h3><p>Stdin-based prompt delivery</p></article>
+      </div>
+    </section>
+
+    <section id="contributing">
+      <h2>Contributing</h2>
+      <p>Contributions welcome! See the <a href="https://github.com/alexpacio/pstore">GitHub repository</a> for issues and PRs.</p>
+      <h3>Development</h3>
+      <div class="code-block"><code># Run in dev mode
+cargo run
+
+# Run tests
+cargo test
+
+# Check formatting
+cargo fmt --check
+
+# Lint
+cargo clippy -- -D warnings</code></div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container">
+      <div class="links">
+        <a href="https://github.com/alexpacio/pstore">GitHub</a>
+        <a href="https://github.com/alexpacio/pstore/issues">Issues</a>
+        <a href="https://github.com/alexpacio/pstore/blob/main/LICENSE">MIT License</a>
+      </div>
+      <p>Built with Rust + egui · pstore is not affiliated with any agent vendor</p>
+    </div>
+  </footer>
+
+  <script>
+    // Tab switching
+    document.querySelectorAll('.install-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        const target = tab.dataset.tab;
+        document.querySelectorAll('.install-tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.install-panel').forEach(p => p.classList.remove('active'));
+        tab.classList.add('active');
+        document.querySelector(`.install-panel[data-tab="${target}"]`).classList.add('active');
+      });
+    });
+
+    // Copy buttons
+    document.querySelectorAll('.copy-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const text = btn.dataset.copy;
+        try {
+          await navigator.clipboard.writeText(text);
+          btn.textContent = 'Copied!';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = 'Copy';
+            btn.classList.remove('copied');
+          }, 1500);
+        } catch (e) {
+          btn.textContent = 'Failed';
+          setTimeout(() => btn.textContent = 'Copy', 1500);
+        }
+      });
+    });
+  </script>
+</body>
+</html>

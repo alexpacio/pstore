@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>404 — Page Not Found | pstore</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0d0d0f;
+      --fg: #e8e8ed;
+      --fg-muted: #8b8b98;
+      --accent: #00d4aa;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      text-align: center; padding: 24px;
+    }
+    code { font-family: 'JetBrains Mono', monospace; }
+    .code-404 { font-size: 8rem; font-weight: 700; color: var(--accent); line-height: 1; letter-spacing: -0.05em; }
+    h1 { font-size: 2rem; margin: 24px 0 12px; }
+    p { color: var(--fg-muted); margin-bottom: 24px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div>
+    <div class="code-404">404</div>
+    <h1>Page Not Found</h1>
+    <p>The prompt you're looking for doesn't exist.</p>
+    <a href="/pstore/">← Back to pstore</a>
+  </div>
+</body>
+</html>

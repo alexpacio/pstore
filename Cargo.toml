@@ -1,0 +1,68 @@
+[package]
+name = "pstore"
+version = "0.1.0"
+edition = "2024"
+description = "Versioned prompt editor that scores the coding-agent models and effort levels installed on your machine"
+license = "Apache-2.0"
+
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+clap = { version = "4.6.5", features = ["derive"] }
+dirs = "6.0.0"
+eframe = "0.36.0"
+egui = "0.36.0"
+egui_commonmark = "0.25.0"
+# Used by the PII detectors. Not optional: the checksum-backed patterns are what the
+# sanitiser falls back to when the tagger's weights are not downloaded, so they have to
+# work in every build. Already in the tree as a transitive dependency.
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+similar = "3.1.2"
+
+# Local Brick classifiers. Optional so `cargo build --no-default-features` stays
+# fast and dependency-light; the app falls back to the built-in heuristic scorer.
+candle-core = { version = "0.11.0", optional = true }
+candle-nn = { version = "0.11.0", optional = true }
+candle-transformers = { version = "0.11.0", optional = true }
+# `fancy-regex` is the pure-Rust regex backend; the default `onig` would add a C
+# library build for no benefit here. Dropping the other defaults also skips the
+# esaxx/rayon training machinery, which pstore never uses — it only loads a
+# tokenizer.json and encodes text.
+tokenizers = { version = "0.23.1", optional = true, default-features = false, features = [
+  "fancy-regex",
+] }
+# `blocking` selects hf-hub's synchronous API, which is what the worker threads want —
+# pstore deliberately has no async runtime.
+hf-hub = { version = "1.0.0", optional = true, default-features = false, features = [
+  "blocking",
+  "rustls-tls",
+] }
+
+[features]
+default = ["candle"]
+# In-process Brick classifiers on Candle.
+candle = [
+  "dep:candle-core",
+  "dep:candle-nn",
+  "dep:candle-transformers",
+  "dep:tokenizers",
+  "dep:hf-hub",
+]
+# NVIDIA GPU. Opt-in: it needs the CUDA toolkit, and requiring that would break a
+# plain `cargo build` for most users. Metal needs no feature — on macOS candle-core
+# picks it up through the target-specific dependency below.
+cuda = ["candle-core?/cuda", "candle-nn?/cuda", "candle-transformers?/cuda"]
+
+# Metal is on by default for macOS builds, so the GPU path the app advertises is
+# actually compiled in. Feature unification applies this to the shared candle-core.
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.11.0", optional = true, features = ["metal"] }
+candle-nn = { version = "0.11.0", optional = true, features = ["metal"] }
+candle-transformers = { version = "0.11.0", optional = true, features = ["metal"] }
+
+[profile.release]
+# The UI should feel immediate and the binary ships as one file.
+opt-level = 3
+lto = "thin"
+strip = true
