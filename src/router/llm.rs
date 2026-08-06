@@ -240,16 +240,17 @@ pub fn complete_json(
     }
 
     models::set(checkpoint.id, models::Phase::Loading);
-    let run = supervise(cmd).map_err(|e| {
+    let run = supervise(cmd, checkpoint).map_err(|e| {
         models::set(checkpoint.id, models::Phase::Failed(e.clone()));
         format!("running {}: {e}", binary.display())
     })?;
 
-    if run.stopped {
+    if let Some(why) = run.stopped {
         // Nothing is wrong with the model or the machine, so this is not a `Failed` phase:
-        // the app is closing and took the process with it.
+        // something deliberately took the process away — the app is closing, or the user
+        // picked the other build and this run was holding the one they left.
         models::set(checkpoint.id, models::Phase::Cached);
-        return Err("the model was stopped because pstore is closing".into());
+        return Err(why.reason().into());
     }
 
     if !run.ok {
@@ -271,8 +272,12 @@ pub fn complete_json(
 /// 20 ms against a call measured in seconds is noise.
 const POLL: Duration = Duration::from_millis(20);
 
-/// Every model process alive right now, keyed by pid.
-static LIVE: Mutex<Vec<(u32, Arc<Mutex<Child>>)>> = Mutex::new(Vec::new());
+/// Every model process alive right now: pid, the checkpoint it is holding, and the handle.
+///
+/// The checkpoint id is what makes "never two builds resident at once" enforceable. Without
+/// it a switch could only kill everything or nothing, and there would be no way to answer the
+/// question this registry exists to answer: *which* weights is that 7 GB?
+static LIVE: Mutex<Vec<(u32, &'static str, Arc<Mutex<Child>>)>> = Mutex::new(Vec::new());
 
 /// Raised once the app is on its way out, so no further weights are mapped.
 static CLOSING: AtomicBool = AtomicBool::new(false);
@@ -286,32 +291,53 @@ fn recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
+/// Why a run ended before it produced an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stopped {
+    /// The app is on its way out.
+    Closing,
+    /// The user selected the other build, and this run was holding the old one.
+    Switched,
+}
+
+impl Stopped {
+    /// What to tell the user, phrased as a state of affairs rather than an error.
+    fn reason(self) -> &'static str {
+        match self {
+            Stopped::Closing => "the model was stopped because pstore is closing",
+            Stopped::Switched => {
+                "the model was stopped because the local model was switched — try again"
+            }
+        }
+    }
+}
+
 /// One finished — or killed — model process.
 struct Run {
     /// Whether it exited successfully.
     ok: bool,
     stdout: String,
     stderr: String,
-    /// Whether it was killed on the way out rather than left to finish.
-    stopped: bool,
+    /// Why it was killed, if it did not finish on its own.
+    stopped: Option<Stopped>,
 }
 
-/// Run `cmd` to completion, killing it if the app closes first.
+/// Run `cmd` to completion, killing it if the app closes or the selected build changes.
 ///
-/// The child is registered in [`LIVE`] for the whole of its life, which is what makes
-/// [`shutdown`] possible. Both pipes are drained on their own threads: `llama-completion`
-/// writes kilobytes of load-time chatter to stderr, and an unread pipe would stall the
-/// generation rather than fail it.
-fn supervise(mut cmd: Command) -> Result<Run, String> {
-    // Refused rather than started: a worker that reached here between resolving the weights
-    // and spawning must not map 7.17 GB as the window disappears.
+/// The child is registered in [`LIVE`] under `checkpoint` for the whole of its life, which is
+/// what makes both [`shutdown`] and [`unload_other_builds`] possible. Both pipes are drained
+/// on their own threads: `llama-completion` writes kilobytes of load-time chatter to stderr,
+/// and an unread pipe would stall the generation rather than fail it.
+fn supervise(mut cmd: Command, checkpoint: models::Checkpoint) -> Result<Run, String> {
+    // Refused rather than started, for two races that both end with weights mapped that
+    // should not be. A worker between resolving the weights and spawning must not map 7.17 GB
+    // as the window disappears — and it must not map the *old* build after the user has
+    // switched, which is the one way two builds could still end up resident at once.
     if CLOSING.load(Ordering::Relaxed) {
-        return Ok(Run {
-            ok: false,
-            stdout: String::new(),
-            stderr: String::new(),
-            stopped: true,
-        });
+        return Ok(Run::killed(Stopped::Closing));
+    }
+    if checkpoint.id != models::active().id {
+        return Ok(Run::killed(Stopped::Switched));
     }
 
     let mut child = cmd
@@ -327,30 +353,55 @@ fn supervise(mut cmd: Command) -> Result<Run, String> {
 
     let pid = child.id();
     let child = Arc::new(Mutex::new(child));
-    recover(&LIVE).push((pid, Arc::clone(&child)));
+    recover(&LIVE).push((pid, checkpoint.id, Arc::clone(&child)));
 
-    // The lock is only ever held across a non-blocking `try_wait`, so `shutdown` can take
-    // it at any point during the generation.
+    // The lock is only ever held across a non-blocking `try_wait`, so `shutdown` and a build
+    // switch can take it at any point during the generation.
     let status = loop {
         match recover(&child).try_wait() {
             Ok(Some(s)) => break Some(s),
-            // Already reaped by `shutdown`, or the child is gone. Either way it is over.
+            // Already reaped by a kill, or the child is gone. Either way it is over.
             Err(_) => break None,
             Ok(None) => {}
         }
         std::thread::sleep(POLL);
     };
-    recover(&LIVE).retain(|(p, _)| *p != pid);
+    recover(&LIVE).retain(|(p, _, _)| *p != pid);
 
     let ok = status.is_some_and(|s| s.success());
+    // A run that finished cleanly still counts as finished — its answer is good even if
+    // nothing is left to display it. Only a run that failed asks why, and the answer is
+    // whichever deliberate kill could have reached it.
+    let stopped = (!ok)
+        .then(|| {
+            if CLOSING.load(Ordering::Relaxed) {
+                Some(Stopped::Closing)
+            } else if checkpoint.id != models::active().id {
+                Some(Stopped::Switched)
+            } else {
+                None
+            }
+        })
+        .flatten();
+
     Ok(Run {
         ok,
         stdout: out.join().unwrap_or_default(),
         stderr: err.join().unwrap_or_default(),
-        // A run that finished cleanly as the app closed still counts as finished — its
-        // answer is good, even if nothing is left to display it.
-        stopped: !ok && CLOSING.load(Ordering::Relaxed),
+        stopped,
     })
+}
+
+impl Run {
+    /// A run that never started, or was killed before it could answer.
+    fn killed(why: Stopped) -> Self {
+        Run {
+            ok: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            stopped: Some(why),
+        }
+    }
 }
 
 fn drain<R: Read>(pipe: Option<&mut R>) -> String {
@@ -361,21 +412,70 @@ fn drain<R: Read>(pipe: Option<&mut R>) -> String {
     s
 }
 
-/// Kill and reap every model process running now. Returns how many there were.
-fn stop_live() -> usize {
-    // Taken rather than iterated, so a run that finishes by itself in the meantime cannot be
-    // waited on from two places.
-    let live: Vec<(u32, Arc<Mutex<Child>>)> = std::mem::take(&mut *recover(&LIVE));
-    for (_, child) in &live {
+/// Kill and reap every live model process the predicate selects, by checkpoint id.
+///
+/// Returns the checkpoints that were actually holding weights, so the caller can correct
+/// their rows on the status board — a killed run leaves a checkpoint marked `Loading` or
+/// `Ready` that is now neither.
+fn stop_live_where(mut wanted: impl FnMut(&str) -> bool) -> Vec<&'static str> {
+    // The doomed entries are removed from `LIVE` under the lock and killed outside it, so a
+    // run that finishes by itself in the meantime cannot be waited on from two places, and
+    // a second caller cannot pick up the same child.
+    let doomed: Vec<(u32, &'static str, Arc<Mutex<Child>>)> = {
+        let mut live = recover(&LIVE);
+        let (doomed, keep) = std::mem::take(&mut *live)
+            .into_iter()
+            .partition(|(_, id, _)| wanted(id));
+        *live = keep;
+        doomed
+    };
+
+    for (_, _, child) in &doomed {
         let mut c = recover(child);
         // Both calls fail on a child that has just exited on its own, which is the state
         // this function exists to reach.
         let _ = c.kill();
         // Reaped here rather than left to the supervising thread: a zombie holds its slot,
-        // and the parent is about to leave.
+        // and the caller may be on its way out.
         let _ = c.wait();
     }
-    live.len()
+    doomed.into_iter().map(|(_, id, _)| id).collect()
+}
+
+/// Kill and reap every model process running now. Returns how many there were.
+fn stop_live() -> usize {
+    stop_live_where(|_| true).len()
+}
+
+/// Stop anything still holding a build that is no longer the selected one.
+///
+/// **The invariant this exists for: at most one build's weights are resident at any moment.**
+/// Nothing is resident *between* calls — every call is its own subprocess — so switching build
+/// is normally free. The exception is switching *during* a call: the running process goes on
+/// holding its 3.8 or 7.17 GB until it finishes, and the next call would map the other build
+/// alongside it. On a machine chosen for the small build because memory is tight, that is
+/// 11 GB at once, which is the situation the choice was made to avoid.
+///
+/// So the old run is killed rather than waited out. It cannot produce a useful answer anyway:
+/// its result would be a ranking from the build the user has just decided against.
+///
+/// Call it **after** publishing the new preference, so [`models::active`] already reflects the
+/// switch — that ordering is also what makes the guard in [`supervise`] catch a worker that is
+/// mid-flight. Cheap and safe when nothing is running, which is the common case.
+pub fn unload_other_builds() -> usize {
+    let keep = models::active().id;
+    let stopped = stop_live_where(|id| id != keep);
+    for id in &stopped {
+        // Weights on disk, nothing running: true of the build we just left.
+        models::set(id, models::Phase::Cached);
+    }
+
+    // The background server holds weights resident by definition, and for as long as it is
+    // up — so it is the one thing that can hold a build the user has left for an unbounded
+    // time rather than the tail of one call. It has to be reached by the same switch.
+    let served = crate::serve::stop_unless(keep);
+
+    stopped.len() + usize::from(served)
 }
 
 /// Where the model's reasoning stops and its answer starts.
@@ -808,6 +908,82 @@ fn pii_prompt(chunk: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Shrinking
+// ---------------------------------------------------------------------------
+
+/// The largest chunk a shrink pass may compress in one call, in characters.
+///
+/// A shrink is the one call whose *output* is the size of its input: the rewrite is shorter
+/// than the original, but only by a fraction, so the window has to hold the instruction, the
+/// chunk, and a second copy of the chunk. Solving [`fit_context`]'s arithmetic for the chunk
+/// gives the bound below — under the default 8 192-token ceiling that is ~8 900 characters,
+/// which the cap then brings down.
+///
+/// The cap is not about memory. Instruction-following on a 2-bit checkpoint degrades over a
+/// long passage — the register slips back to prose halfway down — and a chunk that fits the
+/// window can still be more than the model will rewrite evenly.
+///
+/// The answer is four fifths of what fits, not all of it, because [`crate::shrink::chunks`]
+/// may overrun by a quarter to keep a fenced code block whole. Truncation here is silent —
+/// llama.cpp drops the tail of a prompt that does not fit — so the room has to be left
+/// before it is needed.
+pub fn shrink_chunk_chars() -> usize {
+    /// Below this, a chunk is too small to compress usefully.
+    const MIN: usize = 400;
+    /// Above this, the rewrite gets uneven regardless of what fits.
+    const MAX: usize = 6000;
+
+    let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
+    let instruction = crate::shrink::INSTRUCTION.len();
+    // fit_context: (instruction + chunk)/CHARS_PER_TOKEN * 1.25 + output + 256 <= ceiling,
+    // with output bounded by `shrink_output_tokens` at the chunk's own token count + 25%.
+    let budget = (CHARS_PER_TOKEN / 1.25) * ceiling.saturating_sub(320) as f32;
+    let fits = (budget as usize).saturating_sub(instruction) / 2;
+    (fits * 4 / 5).clamp(MIN, MAX)
+}
+
+/// Room for the rewrite: the chunk's own length, plus headroom.
+///
+/// Bounded above the input on purpose. A rewrite that saves nothing is a legitimate answer —
+/// an already-terse prompt has nothing to give — and clipping the reply at the token cap
+/// would not produce a shorter prompt, it would produce invalid JSON and an error.
+fn shrink_output_tokens(chunk: &str) -> usize {
+    let tokens = (chunk.len() as f32 / CHARS_PER_TOKEN).ceil() as usize;
+    (tokens + tokens / 4 + 64).clamp(128, 4096)
+}
+
+/// Rewrite one chunk of a prompt in the compressed form [`crate::shrink`] asks for.
+///
+/// Greedy, like the personal-data scan and for the same reason: most of the output is text
+/// copied from the input — paths, identifiers, code — and there is nothing for temperature
+/// to diversify but the copy. Reasoning is not enabled either; deliberating about a sentence
+/// costs more seconds than the sentence is worth, once per chunk.
+pub fn shrink(chunk: &str) -> Result<String, String> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["prompt"],
+        "properties": {
+            "prompt": {"type": "string", "minLength": 1}
+        }
+    });
+
+    let reply = complete_json(
+        &crate::shrink::compose(chunk),
+        Constrain::Schema(&schema),
+        shrink_output_tokens(chunk),
+    )?;
+
+    reply
+        .get("prompt")
+        .and_then(Value::as_str)
+        // The schema constrains the shape, not the manners: a model told "no preamble" still
+        // opens with one often enough that the cleanup has to stay.
+        .map(crate::shrink::clean)
+        .ok_or_else(|| "the model's reply had no rewritten prompt".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -842,6 +1018,9 @@ pub fn reset() {
 /// prevent.
 pub fn shutdown() {
     CLOSING.store(true, Ordering::Relaxed);
+    // The server first: it is the only child that would otherwise outlive the window
+    // indefinitely, holding both the memory and the port.
+    crate::serve::stop();
     if stop_live() > 0 {
         // Weights on disk, nothing running: what is true a moment before the app exits. Set
         // on whichever build was selected — the run that was killed can only have been that
@@ -915,6 +1094,39 @@ mod tests {
         assert_eq!(fit_context(&huge, 400, 2048), 2048);
         // An absurdly low ceiling still leaves a usable window rather than zero.
         assert_eq!(fit_context(&huge, 400, 1), MIN_CONTEXT);
+    }
+
+    /// A shrink chunk, its stretch, the instruction and the rewrite all have to fit the
+    /// window at once. If they do not, `llama-cli` drops the tail of the prompt without
+    /// saying so and the model rewrites a document it only partly saw.
+    #[test]
+    fn a_stretched_shrink_chunk_still_fits_the_window() {
+        let chunk = shrink_chunk_chars();
+        assert!(chunk >= 400, "unusably small chunk: {chunk}");
+
+        // The worst case chunks() can produce: max_chars plus a quarter, to keep a fenced
+        // code block whole.
+        let stretched = "x".repeat(chunk + chunk / 4);
+        let prompt = crate::shrink::compose(&stretched);
+        let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
+        let ctx = fit_context(&prompt, shrink_output_tokens(&stretched), ceiling);
+        assert!(
+            ctx < ceiling,
+            "a stretched chunk needs {ctx} tokens against a {ceiling} ceiling — \
+             shrink_chunk_chars is over-estimating what fits"
+        );
+    }
+
+    /// The rewrite is allowed to be as long as the original. A prompt with nothing to give
+    /// back must come home as valid JSON, not as a reply clipped at the token cap.
+    #[test]
+    fn shrink_output_has_room_for_an_unchanged_rewrite() {
+        let text = "x".repeat(3_000);
+        let tokens = shrink_output_tokens(&text);
+        assert!(
+            tokens as f32 > text.len() as f32 / CHARS_PER_TOKEN,
+            "{tokens} tokens cannot hold a rewrite the size of its input"
+        );
     }
 
     /// `llama-cli` prints its own framing around the generation, and which framing depends
@@ -1077,7 +1289,7 @@ mod tests {
 
     /// Pids currently registered as live.
     fn live_pids() -> Vec<u32> {
-        recover(&LIVE).iter().map(|(p, _)| *p).collect()
+        recover(&LIVE).iter().map(|(p, _, _)| *p).collect()
     }
 
     /// Wait for `f`, up to `secs`, rather than sleeping a fixed amount.
@@ -1101,17 +1313,18 @@ mod tests {
     #[cfg(unix)]
     fn a_supervised_run_captures_both_streams() {
         let _guard = recover(&PROCESSES);
-        let run = supervise(sh("echo out; echo err >&2")).expect("the child should start");
+        let run = supervise(sh("echo out; echo err >&2"), models::active())
+            .expect("the child should start");
 
         assert!(run.ok, "a clean exit should be reported as success");
-        assert!(!run.stopped);
+        assert_eq!(run.stopped, None);
         assert!(run.stdout.contains("out"));
         // stderr matters: it is the only diagnostic when a real run fails to load.
         assert!(run.stderr.contains("err"));
 
-        let failed = supervise(sh("exit 3")).expect("the child should start");
+        let failed = supervise(sh("exit 3"), models::active()).expect("the child should start");
         assert!(!failed.ok);
-        assert!(!failed.stopped, "a failure is not a shutdown");
+        assert_eq!(failed.stopped, None, "a failure is not a deliberate stop");
     }
 
     /// The whole point of the registry: a generation in flight when the window closes has to
@@ -1123,7 +1336,7 @@ mod tests {
         let before = live_pids();
         let started = std::time::Instant::now();
         // A child that would far outlive the test, so only being killed can end it.
-        let worker = std::thread::spawn(|| supervise(sh("sleep 30")));
+        let worker = std::thread::spawn(|| supervise(sh("sleep 30"), models::active()));
 
         // Its own pid, not merely "something is registered": another test may be running the
         // real model at the same time.
@@ -1153,6 +1366,102 @@ mod tests {
         stop_live();
     }
 
+    /// The invariant: two builds' weights are never resident at once.
+    ///
+    /// Switching build while a call is in flight is the only way that could happen — the old
+    /// run goes on holding its weights until it finishes, and the next call would map the
+    /// other build alongside it. On a machine where the small build was chosen *because*
+    /// memory is tight, that is both builds at once, which is the thing being prevented.
+    #[test]
+    #[cfg(unix)]
+    fn switching_build_stops_the_run_holding_the_old_one() {
+        use crate::config::LocalModel;
+
+        let _guard = recover(&PROCESSES);
+        let before = live_pids();
+        let started = std::time::Instant::now();
+
+        // Select the small build and start a run against it — `supervise` refuses to spawn a
+        // build that is not the selected one, which is the other half of this invariant.
+        let mut prefs = crate::config::prefs_snapshot();
+        let restore = prefs.local_model;
+        prefs.local_model = LocalModel::OneBit;
+        crate::config::publish(&prefs);
+
+        // A run that would far outlive the test, so only the switch can end it.
+        let old = LocalModel::OneBit.checkpoint();
+        let worker = std::thread::spawn(move || supervise(sh("sleep 30"), old));
+
+        let mut mine = None;
+        assert!(
+            until(5, || {
+                mine = live_pids().into_iter().find(|p| !before.contains(p));
+                mine.is_some()
+            }),
+            "the child was never registered, so nothing could have killed it"
+        );
+
+        // Now switch, exactly as the Models window does: publish first, then unload — the
+        // unload asks which build is selected *now*.
+        prefs.local_model = LocalModel::Ternary;
+        crate::config::publish(&prefs);
+        let stopped = unload_other_builds();
+
+        let run = worker.join().expect("the supervising thread").unwrap();
+        prefs.local_model = restore;
+        crate::config::publish(&prefs);
+
+        assert!(
+            stopped >= 1,
+            "the run holding the old build should be found"
+        );
+        assert_eq!(
+            run.stopped,
+            Some(Stopped::Switched),
+            "the caller has to be told why, or this reads as a broken model"
+        );
+        assert!(!run.ok);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?} — the old run was waited out rather than stopped",
+            started.elapsed()
+        );
+
+        // The build we left is on disk and running nothing, which is what its row must say.
+        assert!(!crate::models::phase(old.id).is_busy());
+        stop_live();
+    }
+
+    /// A switch must not stop a run that is holding the build the user just chose. Killing
+    /// everything would be simpler and would turn every switch into a lost ranking.
+    #[test]
+    #[cfg(unix)]
+    fn switching_leaves_the_selected_build_running() {
+        let _guard = recover(&PROCESSES);
+        let before = live_pids();
+        let current = models::active();
+        let worker = std::thread::spawn(move || supervise(sh("sleep 2"), current));
+
+        let mut mine = None;
+        assert!(until(5, || {
+            mine = live_pids().into_iter().find(|p| !before.contains(p));
+            mine.is_some()
+        }));
+
+        assert_eq!(
+            unload_other_builds(),
+            0,
+            "nothing is holding a build other than the selected one"
+        );
+        assert!(
+            live_pids().contains(&mine.expect("just checked")),
+            "the run holding the selected build was killed"
+        );
+
+        stop_live();
+        let _ = worker.join();
+    }
+
     /// Shutdown also has to close the door behind it: a worker that reaches the spawn a
     /// moment later must not map the weights again on the way out.
     #[test]
@@ -1161,13 +1470,17 @@ mod tests {
         let _guard = recover(&PROCESSES);
         CLOSING.store(true, Ordering::Relaxed);
 
-        let run = supervise(sh("echo should not run"));
+        let run = supervise(sh("echo should not run"), models::active());
         // Restored before any assertion, so a failure here cannot leave the flag raised and
         // break every later test in the binary.
         CLOSING.store(false, Ordering::Relaxed);
         let run = run.expect("refusal is not an error");
 
-        assert!(run.stopped, "the run should report that it never started");
+        assert_eq!(
+            run.stopped,
+            Some(Stopped::Closing),
+            "the run should report that it never started, and why"
+        );
         assert!(!run.ok);
         assert!(
             run.stdout.is_empty(),

@@ -365,6 +365,31 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".local/share/opencode/auth.json", ".config/opencode"],
         models: &[],
     },
+    // Rust, ~26 MB, no runtime to install, and it takes a custom OpenAI-compatible provider
+    // — which is what makes it the natural front end for the model pstore already has on
+    // disk. See `crate::agents::wire`, which writes it a project-local config pointing at the
+    // background server.
+    //
+    // No `model_flag`: the model comes from `.zerostack/config.toml`, along with the provider
+    // it belongs to. Passing a bare model name without its provider is how you get an agent
+    // that starts and then cannot route a single turn.
+    // Headless is `-p`, with the prompt as a positional argument — **not** a `run`
+    // subcommand. Most agents here spell it `run`; this one does not, and `zerostack run "…"`
+    // does not fail, it silently sends the word "run" as the first word of the prompt.
+    AgentSpec {
+        id: "zerostack",
+        display: "zerostack",
+        bin: "zerostack",
+        headless: &["-p"],
+        model_flag: None,
+        effort_flag: EffortFlag::Unsupported,
+        efforts: &[],
+        headless_extra: &[],
+        prompt_via: PromptVia::Arg,
+        interactive: &[],
+        creds: &[".config/zerostack", ".local/share/zerostack"],
+        models: &[],
+    },
     AgentSpec {
         id: "crush",
         display: "Crush",

@@ -22,6 +22,7 @@ pstore treats prompt authoring as a first-class workflow:
 | **Versioned prompts** | Every save creates a snapshot in `.pstore/versions/`. Full history, diffs, one-click restore — all plain markdown. |
 | **Inline hints** | Select text, type a question, or both — the selection and the question reach the agent as distinct things. Answers land in a panel, never silently in the document. |
 | **Plan** | Rewrites a rough request into a structured instruction for a coding agent: objective, ordered steps, constraints, acceptance criteria. The output *is* the next prompt, not a document to read. |
+| **Shrink** | Rewrites the selection — or the whole prompt — telegraphically: no articles, no pleasantries, each fact stated once, while code, paths, identifiers and constraints stay verbatim. The local model decides what a word is carrying, so `the` in a code span and `the 20 ms poll must not change` survive where a stop-word stripper would eat both. Arrives as a diff with a size summary and a warning if a file reference or code block went missing. |
 | **Smart routing** | Every (agent, model, effort) combination your machine can run is handed to a local 27B model along with your prompt; it returns a ranked shortlist with a reason for each pick. |
 | **PII sanitizer** | Finds names, addresses, IBANs, tax codes and card numbers and swaps them for placeholders — before the prompt reaches an agent. |
 | **One local model** | A single checkpoint — your pick of two sizes — runs everything pstore infers, as a subprocess on your machine. Nothing about your prompt leaves it. |
@@ -35,8 +36,8 @@ pstore treats prompt authoring as a first-class workflow:
 ## The local model
 
 pstore runs **one** checkpoint for everything it infers itself — which agent and model
-should answer a prompt, and where the personal data in it is. You choose which of two builds
-of it to run, in the Models window:
+should answer a prompt, where the personal data in it is, and how to say the same thing in
+fewer words. You choose which of two builds of it to run, in the Models window:
 
 | Build | Quality | Peak memory | Download |
 | --- | --- | --- | --- |
@@ -65,8 +66,19 @@ Set it in the Models window, or by hand:
 ```
 
 Switching takes effect on the next model call, not the next launch — nothing is resident
-between calls. Weights go to the shared Hugging Face cache (`~/.cache/huggingface`), so other
-tools reuse them.
+between calls.
+
+**The two are never resident at the same time.** Since every call is its own subprocess,
+switching is normally free; the exception is switching *while* a call is running, where the
+old process would go on holding its 3.8 or 7.17 GB and the next call would map the other build
+alongside it — both at once, on a machine that may have been given the small build precisely
+because memory is tight. So the run holding the build you left is stopped rather than waited
+out (its answer would come from the build you just rejected anyway), and a worker that is
+mid-flight when you switch is refused before it maps anything. The status bar says how many
+runs were stopped, and the affected action reports that it was interrupted rather than failing.
+
+Weights go to the shared Hugging Face cache (`~/.cache/huggingface`), so other tools reuse
+them.
 
 ### How it runs
 
@@ -128,6 +140,43 @@ speed, never quality. But its measured 1.34× is on the CUDA serving path, Prism
 enable it on Apple Silicon at all (a batch-1 verification pass does not amortise there), and
 it accelerates only generation — under half of a ranking call.
 
+### Run it in the background, for other agents
+
+pstore's own calls are one-shot: process starts, answers, exits. That is right for one call
+per user action and wrong for a coding agent, which makes many calls a session and would pay
+the start-up *and* re-evaluate its whole prompt every turn.
+
+So the Models window has **Run in background**. It puts the selected build behind
+`llama-server` — same weights, same release, same `--jinja` template — as an
+OpenAI-compatible endpoint on loopback:
+
+```
+http://127.0.0.1:8787/v1
+```
+
+Your prompts still never leave the machine; this is the same promise pstore's own inference
+makes, extended to whatever you point at it. The server binds `127.0.0.1` and never
+`0.0.0.0` — a listener on every interface would quietly turn that promise into a service
+anyone on the network could reach. It is off by default, holds 5–8.4 GB for as long as it
+runs, and stops when you say so, when you switch build, or when pstore closes.
+
+**Pointing an agent at it.** Once it is serving, the same row offers to configure the agents
+that accept a custom OpenAI-compatible provider:
+
+| Agent | File pstore writes |
+| --- | --- |
+| [zerostack](https://github.com/gi-dellav/zerostack) | `.zerostack/config.toml` |
+| [OpenCode](https://opencode.ai/) | `opencode.json` |
+
+Both are **project-local** files, written beside your prompts — never your global config.
+A file pstore did not write is reported and left byte-for-byte alone; one it did write is
+kept current, and the same button removes it again. The endpoint and the model name come
+from the running server rather than from a guess, because the name an agent must send back
+is the weights file's own.
+
+Both agents are driven as subprocesses, like every other agent pstore runs — nothing is
+linked in, so their licences stay their own.
+
 ### Memory footprint
 
 The context window is **fitted to each call** rather than pinned:
@@ -180,10 +229,11 @@ versioning, diffing and agent handoff are unaffected.
 found" is a claim, and making it without having looked is how personal data reaches an
 agent.
 
-The **hint**, **shrink** and **plan** features drive *your* installed coding agent (Claude
-Code, Codex, Gemini CLI, …), which is the point of the tool. Those are the only paths where
-prompt text leaves the machine, they are always an explicit action, and the sanitizer exists
-to run before them.
+The **hint** and **plan** features drive *your* installed coding agent (Claude Code, Codex,
+Gemini CLI, …), which is the point of the tool. Together with **Send →** those are the only
+paths where prompt text leaves the machine, they are always an explicit action, and the
+sanitizer exists to run before them. **Shrink** is not among them: it compresses on the
+local checkpoint, so a prompt can be tightened before anything has seen it.
 
 ---
 
@@ -275,7 +325,7 @@ pstore/
 │   ├── models.rs            # Checkpoint catalogue + download status board
 │   ├── runtime.rs           # Finding/fetching/verifying the binary that runs it
 │   ├── plan.rs              # Planning instruction + structural checks on the result
-│   ├── shrink.rs            # Compression instruction + integrity checks
+│   ├── shrink.rs            # Telegraphic rewrite: instruction, chunking, integrity checks
 │   ├── hints.rs             # Hint subjects (selection, question, or both) + composition
 │   ├── pii/
 │   │   └── mod.rs           # Findings, placeholder plan, overlap resolution

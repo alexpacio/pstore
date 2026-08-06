@@ -223,6 +223,22 @@ pub fn shutdown_model() {
     llm::shutdown();
 }
 
+/// Stop anything still running the build the user has just switched away from, so the two
+/// builds' weights are never resident at the same time. See [`llm::unload_other_builds`].
+///
+/// Call it after publishing the new preference. Returns how many runs were stopped, which is
+/// normally zero — nothing is resident between calls.
+pub fn unload_other_model_builds() -> usize {
+    #[cfg(feature = "local-llm")]
+    {
+        llm::unload_other_builds()
+    }
+    #[cfg(not(feature = "local-llm"))]
+    {
+        0
+    }
+}
+
 /// Check the model and runtime are ready now rather than on the next ranking.
 ///
 /// Returns the reason when either is missing, so the Models window can show it. Blocking;

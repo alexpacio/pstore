@@ -4,3 +4,4 @@ pub mod detect;
 pub mod failover;
 pub mod launch;
 pub mod registry;
+pub mod wire;

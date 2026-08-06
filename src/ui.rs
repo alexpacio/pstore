@@ -140,7 +140,10 @@ impl Ui {
                 ui.spinner();
                 if ui
                     .button("Stop shrink")
-                    .on_hover_text("Kill the agent process and keep the prompt as it is")
+                    .on_hover_text(
+                        "Stop compressing after the part being rewritten, and keep the \
+                         prompt as it is",
+                    )
                     .clicked()
                 {
                     self.app.cancel_shrink();
@@ -148,7 +151,10 @@ impl Ui {
             } else if ui
                 .button("Shrink")
                 .on_hover_text(
-                    "Compress this prompt while keeping code, paths and constraints verbatim",
+                    "Rewrite the selection — or the whole prompt, when nothing is selected — \
+                     telegraphically: no articles, no pleasantries, one fact stated once, \
+                     while code, paths and constraints stay verbatim. Runs on the local \
+                     model, and shows you the diff before changing anything.",
                 )
                 .clicked()
             {
@@ -709,6 +715,9 @@ impl Ui {
             .default_height(520.0)
             .show(ctx, |ui| {
                 ui.strong(proposal.savings.summary());
+                if proposal.source.range.is_some() {
+                    ui.weak("The selection only — the rest of the prompt is untouched.");
+                }
                 for w in &proposal.warnings {
                     ui.colored_label(egui::Color32::from_rgb(200, 120, 40), format!("⚠ {w}"));
                 }
@@ -789,6 +798,126 @@ impl Ui {
         let _ = busy;
     }
 
+    /// Running the checkpoint as a background service, and pointing agents at it.
+    ///
+    /// Two decisions the user has to be able to see: a resident 27B is gigabytes held until
+    /// they stop it, and wiring an agent puts a file in their repository. Both are stated
+    /// here, both are one click, and both are reversible from the same row.
+    fn serve_row(&mut self, ui: &mut egui::Ui, usable: bool, busy: bool) {
+        ui.horizontal(|ui| {
+            ui.strong("Background server");
+            ui.weak("· OpenAI-compatible, loopback only");
+        });
+        ui.weak(
+            "Runs the selected build as a service so a coding agent can use it instead of a \
+             vendor's API. Your prompts still never leave this machine. It holds the weights \
+             in memory until you stop it.",
+        );
+
+        let serving = crate::serve::status();
+        let starting = self.app.serve_job.is_some();
+
+        match &serving {
+            Some(s) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("● serving {} · pid {}", s.title(), s.pid));
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.monospace(s.base_url());
+                    copy_button(ui, &s.base_url(), "Copy URL");
+                    ui.weak("model");
+                    ui.monospace(s.model_name());
+                    copy_button(ui, &s.model_name(), "Copy model");
+                });
+            }
+            None if starting => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak("starting — mapping the weights…");
+                });
+            }
+            None => {
+                ui.weak("not running");
+            }
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            if serving.is_some() {
+                if ui
+                    .add_enabled(!starting, egui::Button::new("Stop server"))
+                    .on_hover_text("Ends the process and frees the memory it is holding")
+                    .clicked()
+                {
+                    crate::serve::stop();
+                    self.app.status = "background server stopped".into();
+                }
+            } else if ui
+                .add_enabled(
+                    usable && !busy && !starting,
+                    egui::Button::new("Run in background"),
+                )
+                .on_hover_text(
+                    "Start the selected build as a local service. First start maps the \
+                     weights, which takes a few seconds.",
+                )
+                .clicked()
+            {
+                self.app.start_server();
+            }
+
+            // Wiring is only meaningful once there is an endpoint to point at: a config file
+            // naming a port with nothing behind it is worse than no config file.
+            if let Some(s) = &serving {
+                for w in crate::agents::wire::WIRINGS {
+                    let installed = self
+                        .app
+                        .agents
+                        .iter()
+                        .any(|a| a.spec.id == w.agent_id && a.usable());
+                    let wired = w.path(&self.app.config.dir).exists();
+                    let label = if wired {
+                        format!("Unwire {}", w.display)
+                    } else {
+                        format!("Point {} here", w.display)
+                    };
+                    let hover = if wired {
+                        format!("Delete {} — only if pstore wrote it", w.file)
+                    } else {
+                        format!(
+                            "Write {} in this project, pointing {} at {}",
+                            w.file,
+                            w.display,
+                            s.base_url()
+                        )
+                    };
+                    if ui
+                        .add_enabled(installed, egui::Button::new(label).small())
+                        .on_hover_text(if installed {
+                            hover
+                        } else {
+                            format!("{} is not installed on this machine", w.display)
+                        })
+                        .clicked()
+                    {
+                        let outcome = if wired {
+                            crate::agents::wire::revert(w, &self.app.config.dir)
+                        } else {
+                            crate::agents::wire::apply(w, &self.app.config.dir, s)
+                        };
+                        self.app.status = outcome.label(w.display);
+                    }
+                }
+            }
+        });
+
+        if serving.is_some() {
+            ui.weak(
+                "Wiring writes a project-local config file beside your prompts — never your \
+                 global one — and a file pstore did not write is left alone.",
+            );
+        }
+    }
+
     fn models_window(&mut self, ctx: &egui::Context) {
         if !self.app.models_open {
             return;
@@ -797,6 +926,7 @@ impl Ui {
         let mut fetch: Vec<crate::models::Checkpoint> = Vec::new();
         let mut load: Vec<crate::models::Checkpoint> = Vec::new();
         let mut cancel = false;
+        let mut switched = false;
         let busy = self.app.models_job.is_some();
 
         egui::Window::new("Local models")
@@ -957,6 +1087,7 @@ impl Ui {
                 if chosen != self.app.config.prefs.local_model {
                     self.app.config.prefs.local_model = chosen;
                     prefs_changed = true;
+                    switched = true;
                 }
 
                 // Switching to a build that is not on disk is allowed — it is how you decide
@@ -1074,6 +1205,24 @@ impl Ui {
                     // snapshot, so a change that is not published never takes effect.
                     crate::config::publish(&self.app.config.prefs);
                     self.app.config.prefs.save(&self.app.config.dir);
+                }
+
+                ui.separator();
+                self.serve_row(ui, usable, busy);
+
+                // Strictly after publishing: the unload asks which build is selected *now*,
+                // and a worker mid-flight is refused against the same freshly-published
+                // answer. Both builds' weights must never be resident at once.
+                if switched {
+                    let stopped = crate::router::unload_other_model_builds();
+                    self.app.status = if stopped > 0 {
+                        format!(
+                            "using {} — stopped {stopped} run(s) still holding the other build",
+                            selected.title
+                        )
+                    } else {
+                        format!("using {}", selected.title)
+                    };
                 }
             });
 

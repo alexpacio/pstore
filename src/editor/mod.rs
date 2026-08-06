@@ -154,6 +154,21 @@ impl Buffer {
         if lo == hi {
             return self.insert_at_caret(snippet, label);
         }
+        self.replace_range(lo, hi, snippet, label);
+    }
+
+    /// Replace the character range `lo..hi` with `snippet` as a single undo step.
+    ///
+    /// Indices are characters, like [`Selection`], and are clamped to the buffer. Separate
+    /// from [`replace_selection`](Self::replace_selection) because work that started against
+    /// a passage has to land on *that* passage: a shrink takes seconds, and the caret has
+    /// usually moved by the time it comes back.
+    pub fn replace_range(&mut self, lo: usize, hi: usize, snippet: &str, label: &'static str) {
+        let len = self.text.chars().count();
+        let (lo, hi) = (lo.min(len), hi.min(len));
+        if lo > hi {
+            return;
+        }
         let mut out: String = self.text.chars().take(lo).collect();
         out.push_str(snippet);
         out.extend(self.text.chars().skip(hi));
@@ -166,6 +181,15 @@ impl Buffer {
         self.history.push_atomic(&self.text, caret, label);
         self.dirty = true;
         self.last_change = None;
+    }
+
+    /// The text currently occupying the character range `lo..hi`.
+    ///
+    /// Returns `None` when the range no longer fits the buffer, which is itself an answer:
+    /// the document changed under whatever captured it.
+    pub fn range_text(&self, lo: usize, hi: usize) -> Option<String> {
+        (lo <= hi && hi <= self.text.chars().count())
+            .then(|| self.text.chars().skip(lo).take(hi - lo).collect())
     }
 
     /// Undo one step, applying it to the buffer. Returns whether anything changed.

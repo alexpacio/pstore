@@ -40,6 +40,18 @@ pub const BINARY: &str = if cfg!(windows) {
     "llama-completion"
 };
 
+/// The binary behind [`crate::serve`], for running the checkpoint as a background service.
+///
+/// Same release, same kernels, same weights — the only difference is that it stays up and
+/// speaks HTTP, so a coding agent can use the model pstore already downloaded instead of
+/// reaching a vendor's API. Extracted alongside [`BINARY`] rather than fetched on demand:
+/// they come out of one archive, and 15 MB now beats a second download later.
+pub const SERVER_BINARY: &str = if cfg!(windows) {
+    "llama-server.exe"
+} else {
+    "llama-server"
+};
+
 /// One platform's prebuilt archive, with the digest GitHub publishes for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Asset {
@@ -237,6 +249,18 @@ fn which_on_path() -> Option<PathBuf> {
         .find(|p| is_executable(p))
 }
 
+/// The `llama-server` beside the resolved runtime, if it is there.
+///
+/// Deliberately derived from [`locate`] rather than searched for independently: the server
+/// and the one-shot binary are a matched pair from one release, and a `llama-server` from
+/// somewhere else on `PATH` is most likely stock llama.cpp, which cannot load these weights.
+/// An override that points at a `llama-completion` gets its sibling checked the same way.
+pub fn locate_server(override_path: Option<&str>) -> Option<PathBuf> {
+    let rt = locate(override_path)?;
+    let candidate = rt.path.parent()?.join(SERVER_BINARY);
+    is_executable(&candidate).then_some(candidate)
+}
+
 /// Why the runtime is not usable, phrased so the Models window can show it verbatim.
 pub fn missing_reason(override_path: Option<&str>) -> String {
     match override_path.filter(|p| !p.trim().is_empty()) {
@@ -263,7 +287,9 @@ pub fn progress() -> Phase {
 
 #[cfg(feature = "local-llm")]
 mod provision {
-    use super::{Asset, BINARY, Origin, PathBuf, Phase, Runtime, asset, managed_dir};
+    use super::{
+        Asset, BINARY, Origin, PathBuf, Phase, Runtime, SERVER_BINARY, asset, managed_dir,
+    };
     use std::io::Read;
     use std::sync::{Mutex, OnceLock};
 
@@ -417,6 +443,7 @@ mod provision {
         // in particular is not optional: the binary is a thin shim over it.
         let wanted = |name: &str| {
             name == BINARY
+                || name == SERVER_BINARY
                 || name.ends_with(".so")
                 || name.ends_with(".dylib")
                 || name.ends_with(".dll")
@@ -485,8 +512,15 @@ mod provision {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
-                .map_err(|e| format!("making {BINARY} executable: {e}"))?;
+            for name in [BINARY, SERVER_BINARY] {
+                let p = dir.join(name);
+                // The server is a convenience, not a requirement: an archive without it
+                // still gives a working pstore, and `serve` says so if it is asked for.
+                if p.is_file() {
+                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
+                        .map_err(|e| format!("making {name} executable: {e}"))?;
+                }
+            }
         }
         Ok(binary)
     }

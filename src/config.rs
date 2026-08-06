@@ -102,6 +102,19 @@ pub struct Prefs {
     /// bounds memory on a small machine; raising it costs KV cache roughly linearly and is
     /// only needed for prompts larger than anything pstore currently sends.
     pub model_context_ceiling: usize,
+    /// Port the background model server binds on loopback.
+    ///
+    /// Only consulted when the server is started from the Models window; nothing listens
+    /// otherwise. Change it if something else already owns the default — the server refuses
+    /// to start on a busy port rather than silently sharing it.
+    pub model_server_port: u16,
+    /// Context window the background server is built with.
+    ///
+    /// Unlike pstore's own calls, this one cannot be fitted per prompt: the server is built
+    /// once and serves whatever arrives, and a coding agent's context grows through a
+    /// session. So it is a real setting rather than a ceiling, and it costs KV cache for as
+    /// long as the server runs.
+    pub model_server_context: usize,
     /// Which build of the checkpoint to run — `"ternary"` or `"1-bit"`.
     ///
     /// Switching takes effect on the next model call, not the next launch: nothing is
@@ -134,6 +147,10 @@ impl Default for Prefs {
             llama_cli_path: None,
             model_context_ceiling: 8192,
             local_model: LocalModel::default(),
+            model_server_port: 8787,
+            // Enough for a coding agent's session without pinning gigabytes of cache: at
+            // 4-bit KV on this architecture, 32k costs a few hundred megabytes.
+            model_server_context: 32_768,
             // Measured: 1 400 characters is where the reasoning on a hard routing prompt
             // has finished its analysis and started repeating itself.
             model_reasoning_budget: 1400,
@@ -158,6 +175,8 @@ struct Layer {
     llama_cli_path: Option<String>,
     model_context_ceiling: Option<usize>,
     local_model: Option<LocalModel>,
+    model_server_port: Option<u16>,
+    model_server_context: Option<usize>,
     model_reasoning_budget: Option<usize>,
     filter: Option<Filter>,
 }
@@ -203,6 +222,12 @@ impl Layer {
         }
         if let Some(v) = self.local_model {
             base.local_model = v;
+        }
+        if let Some(v) = self.model_server_port {
+            base.model_server_port = v;
+        }
+        if let Some(v) = self.model_server_context {
+            base.model_server_context = v;
         }
         if let Some(v) = self.model_reasoning_budget {
             base.model_reasoning_budget = v;

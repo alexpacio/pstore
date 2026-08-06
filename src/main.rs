@@ -17,6 +17,7 @@ mod pii;
 mod plan;
 mod router;
 mod runtime;
+mod serve;
 mod shrink;
 mod store;
 mod ui;

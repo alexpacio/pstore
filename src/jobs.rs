@@ -73,6 +73,8 @@ pub enum Event {
     Detected { id: JobId, agents: Vec<Detected> },
     /// A sanitisation pass finished.
     Scanned { id: JobId, scan: Box<pii::Scan> },
+    /// A shrink pass finished; carries the whole rewritten prompt.
+    Shrunk { id: JobId, text: String },
     /// A job with no payload of its own finished; `note` goes to the status bar.
     ///
     /// Model downloads report through here: their detail is on the [`crate::models`]
@@ -94,6 +96,7 @@ impl Event {
             | Event::Ranked { id, .. }
             | Event::Detected { id, .. }
             | Event::Scanned { id, .. }
+            | Event::Shrunk { id, .. }
             | Event::Done { id, .. }
             | Event::Cancelled { id, .. } => *id,
         }
@@ -108,6 +111,7 @@ impl Event {
                 | Event::Ranked { .. }
                 | Event::Detected { .. }
                 | Event::Scanned { .. }
+                | Event::Shrunk { .. }
                 | Event::Done { .. }
                 | Event::Cancelled { .. }
         )
@@ -235,6 +239,35 @@ impl Runner {
                 }
             }
         })
+    }
+
+    /// Start the background model server and wait until it answers.
+    ///
+    /// On a worker because it maps up to 7.17 GB and then polls a health check: doing it on
+    /// the UI thread would freeze the window for the whole load.
+    pub fn serve_model(&self) -> Handle {
+        self.spawn(
+            Kind::Models,
+            "starting the background model server".into(),
+            move |id, tx, _| {
+                let note = match crate::serve::start() {
+                    Ok(s) => format!("serving {} at {}", s.title(), s.base_url()),
+                    Err(error) => {
+                        let _ = tx.send(Event::Failed {
+                            id,
+                            kind: Kind::Models,
+                            error,
+                        });
+                        return;
+                    }
+                };
+                let _ = tx.send(Event::Done {
+                    id,
+                    kind: Kind::Models,
+                    note,
+                });
+            },
+        )
     }
 
     /// Look at the model cache and record what is already downloaded.
@@ -365,6 +398,52 @@ impl Runner {
                         kind: Kind::Sanitize,
                         error,
                     });
+                }
+            },
+        )
+    }
+
+    /// Compress `text` with the local model.
+    ///
+    /// Long prompts are several model calls in sequence — see [`crate::shrink::run`] — so
+    /// cancellation is checked between them and reported as such. A pass that was stopped
+    /// must not arrive as a result: a partly-compressed prompt looks exactly like a
+    /// finished one in the diff.
+    pub fn shrink(&self, text: String) -> Handle {
+        self.spawn(
+            Kind::Shrink,
+            "shrinking the prompt".into(),
+            move |id, tx, cancel| {
+                let mut note = |text: String| {
+                    let _ = tx.send(Event::Note { id, text });
+                };
+                let outcome = crate::shrink::run(&text, &cancel, &mut note);
+                // Checked after the fact as well as between chunks: a stop pressed during
+                // the last generation cannot interrupt it, but it still means the user does
+                // not want the answer.
+                match outcome {
+                    Ok(text) if !cancel.load(Ordering::Relaxed) => {
+                        let _ = tx.send(Event::Shrunk { id, text });
+                    }
+                    Ok(_) => {
+                        let _ = tx.send(Event::Cancelled {
+                            id,
+                            kind: Kind::Shrink,
+                        });
+                    }
+                    Err(_) if cancel.load(Ordering::Relaxed) => {
+                        let _ = tx.send(Event::Cancelled {
+                            id,
+                            kind: Kind::Shrink,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Event::Failed {
+                            id,
+                            kind: Kind::Shrink,
+                            error,
+                        });
+                    }
                 }
             },
         )
@@ -675,8 +754,11 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no Done event: {events:?}"));
+        // Names *a* build rather than the currently-selected one: the preference is
+        // process-wide and other tests switch it, so pinning this to `active()` would be a
+        // test that occasionally loses a race it is not about.
         assert!(
-            note.contains(crate::models::active().title),
+            crate::models::ALL.iter().any(|c| note.contains(c.title)),
             "the readout should name the build in use, got {note}"
         );
         assert!(

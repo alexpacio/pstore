@@ -1,39 +1,225 @@
 //! Shrinking a prompt without losing what makes it work.
 //!
-//! The constraint set below is the whole point: compression that drops a file path, a
-//! version number or an error string has not shrunk the prompt, it has broken it. So
-//! the instruction is explicit about what must survive byte-for-byte, and the result
-//! is shown as a diff for approval before it touches the document.
+//! The target register is telegraphic — caveman speech. Articles, copulas and politeness
+//! carry no instruction, so they go; `fix the retry loop that is in src/jobs.rs, and please
+//! keep the poll at 20 ms` becomes `fix retry loop in src/jobs.rs, keep 20 ms poll`. Prose
+//! written for a person is mostly connective tissue, and an agent does not need it.
+//!
+//! What makes that safe rather than lossy is that the local model does the cutting. A
+//! mechanical stripper — drop every `the`, every `is`, every word on a stop list — cannot
+//! tell `the retry loop` from `the 20 ms poll must not change`, and it cannot see that a
+//! `the` inside a code span is code. The model reads the whole passage and decides per
+//! word, which is the only way "shorter" and "still means the same thing" hold at once.
+//!
+//! The constraint set below is the other half: compression that drops a file path, a
+//! version number or an error string has not shrunk the prompt, it has broken it. So the
+//! instruction is explicit about what must survive byte-for-byte, [`integrity_warnings`]
+//! checks the structural part of that afterwards, and the result is shown as a diff for
+//! approval before it touches the document.
+//!
+//! It runs on this machine, on the same checkpoint as ranking and the personal-data scan —
+//! no coding agent is involved and the prompt does not leave. [`run`] is the entry point;
+//! it is blocking and belongs on a worker thread.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The compression instruction.
 ///
 /// Written as "preserve these, collapse those" rather than "be shorter", because a
-/// bare "shorten this" reliably eats the specifics a coding agent needs.
+/// bare "shorten this" reliably eats the specifics a coding agent needs. The last line
+/// is the one that keeps the register honest: telegraphic is only a win while the agent
+/// would still do the same thing, and a word whose removal changes that is not filler.
 pub const INSTRUCTION: &str = "\
-Rewrite the prompt below so it is shorter while remaining exactly as useful to a \
-coding agent.
+Rewrite the prompt below in the fewest words a coding agent can still act on. Write it \
+telegraphically, as instructions rather than prose.
 
-Preserve verbatim, without exception:
-- every code block and inline code span
+Compress by:
+- dropping articles (a, an, the) and copulas (is, are, was, will be) where the sense survives
+- dropping pleasantries, hedging, and self-reference: please, I would like you to, I think, \
+if possible
+- turning sentences into imperative fragments: \"fix retry loop in src/jobs.rs, keep 20 ms poll\"
+- stating each fact once, and cutting restatement, summary, and background the agent can \
+infer from the code itself
+- merging sentences that share a subject, while keeping one bullet per requirement
+
+Copy verbatim, without exception:
+- every code block and inline code span, compressing nothing inside them
 - every file path, directory name, and glob
 - every identifier: function, type, variable, module, crate, and package names
 - every version number, error message, log line, and command
 - every explicit constraint, requirement, and acceptance criterion
 - the markdown structure: headings, lists, and code fences
 
-Remove only:
-- repetition and restatement
-- filler, hedging, and pleasantries
-- background the agent can infer from the code itself
-- verbose phrasing that a shorter phrase covers exactly
+Ambiguity is not compression: keep any word whose removal would change what the agent does, \
+including negations, conditions, and the subject of an instruction.
 
-Do not add new facts, requirements, examples, or interpretation. Do not answer the \
-prompt or act on it. Output only the rewritten prompt, with no preamble, no commentary, \
-and no code fence wrapping the whole thing.";
+Do not add new facts, requirements, examples, or interpretation. Do not answer the prompt or \
+act on it. Return only the rewritten prompt, with no preamble, no commentary, and no code \
+fence wrapping the whole thing.";
 
-/// Compose the request sent to an agent.
+/// Compose the request sent to the local model.
 pub fn compose(document: &str) -> String {
     format!("{INSTRUCTION}\n\n---\n\n{document}")
+}
+
+/// Shrink a whole prompt, one model call per chunk.
+///
+/// Blocking, and slow in units of seconds per chunk — the model is a subprocess that maps
+/// the weights before it answers — so call it from a worker thread. `note` reports progress
+/// for the status bar, and `cancel` is honoured between chunks, which is the only place a
+/// pass can be interrupted: a generation already in flight runs to completion.
+///
+/// Returns the reason on failure rather than a partial document. Half a shrunk prompt is
+/// not a shorter prompt, it is a truncated one, and it must never reach the diff.
+pub fn run(
+    text: &str,
+    cancel: &AtomicBool,
+    note: &mut dyn FnMut(String),
+) -> Result<String, String> {
+    let pieces = chunks(text, crate::router::llm::shrink_chunk_chars());
+    let total = pieces.len();
+    let mut out = String::with_capacity(text.len());
+
+    for (n, (body, separator)) in pieces.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        // Whitespace between chunks, and any run of blank lines, has nothing to compress.
+        if body.trim().is_empty() {
+            out.push_str(body);
+            out.push_str(separator);
+            continue;
+        }
+        if total > 1 {
+            note(format!("shrinking… part {} of {total}", n + 1));
+        }
+        let rewritten = crate::router::llm::shrink(body)?;
+        if rewritten.trim().is_empty() {
+            return Err(format!(
+                "the model returned nothing for part {} of {total}",
+                n + 1
+            ));
+        }
+        out.push_str(&rewritten);
+        out.push_str(separator);
+    }
+
+    Ok(out)
+}
+
+/// How far a chunk may exceed `max_chars` to keep a fenced code block whole.
+///
+/// [`crate::router::llm::shrink_chunk_chars`] leaves this much room under the context
+/// window on purpose, so a stretched chunk still fits rather than being silently truncated
+/// by llama.cpp.
+const STRETCH: usize = 4; // max_chars + max_chars / STRETCH
+
+/// Split `text` into pieces small enough for one model call.
+///
+/// Each piece is `(body, separator)`: the text to rewrite, and the whitespace that followed
+/// it in the original. Rewrites are joined back with those separators, so a paragraph break
+/// between two chunks survives a pass that neither chunk knew about.
+///
+/// Cuts prefer a blank line **outside** a fenced code block, and a fence that would be split
+/// is either pushed whole into the next chunk or kept whole by stretching this one. A chunk
+/// boundary inside a fence would hand the model an unterminated code block — the one thing
+/// the instruction insists it copy byte-for-byte, presented in a shape that no longer looks
+/// like code. A single fenced block longer than `max_chars + max_chars / 4` is the one case
+/// that cannot be honoured; it is split like prose, and [`integrity_warnings`] is what
+/// reports the damage if the model then mangles it.
+pub fn chunks(text: &str, max_chars: usize) -> Vec<(&str, &str)> {
+    let max = max_chars.max(1);
+    let (breaks, fences) = layout(text);
+    let mut out = Vec::new();
+    let mut start = 0usize;
+
+    while start < text.len() {
+        let rest = &text[start..];
+        let end = match rest.char_indices().nth(max) {
+            // What is left fits in one call.
+            None => text.len(),
+            Some((limit, _)) => {
+                let hard = start + limit;
+                // Only take a break that leaves a chunk worth the call; a blank line in the
+                // first few characters would otherwise produce a pass per paragraph.
+                let floor = start + limit / 2;
+                let paragraph = breaks
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|p| *p > floor && *p <= hard);
+
+                match (
+                    paragraph,
+                    fences.iter().find(|(a, b)| (*a..*b).contains(&hard)),
+                ) {
+                    (Some(p), _) => p,
+                    // The fence opens inside this chunk: end the chunk where it opens and
+                    // let the block start the next one.
+                    (None, Some((a, _))) if *a > start => *a,
+                    // The chunk already begins in the block, so the only way to keep it
+                    // whole is to carry it to its close.
+                    (None, Some((_, b))) if *b <= start + max + max / STRETCH => *b,
+                    (None, _) => fallback_cut(rest, limit) + start,
+                }
+            }
+        };
+        let piece = &text[start..end];
+        let body = piece.trim_end();
+        out.push((body, &piece[body.len()..]));
+        start = end;
+    }
+    out
+}
+
+/// Where the document may be cut, and where it may not.
+///
+/// Returns the offsets just past a blank line outside any code block, and the byte ranges of
+/// the fenced blocks themselves. An unterminated fence runs to the end of the document,
+/// which is what the markdown renderer does with it too.
+fn layout(text: &str) -> (Vec<usize>, Vec<(usize, usize)>) {
+    let mut breaks = Vec::new();
+    let mut fences = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut offset = 0usize;
+
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+
+        if line.trim_start().starts_with("```") {
+            match open.take() {
+                Some(a) => fences.push((a, offset)),
+                None => open = Some(start),
+            }
+            continue;
+        }
+        if open.is_none() && line.trim().is_empty() {
+            breaks.push(offset);
+        }
+    }
+    if let Some(a) = open {
+        fences.push((a, text.len()));
+    }
+    (breaks, fences)
+}
+
+/// Where to cut when no blank line falls in the window.
+///
+/// A line break first, then a word break, then the window edge — which is a character
+/// boundary because the caller found it with `char_indices`. Prose with no paragraph breaks
+/// still has to be split somewhere, and mid-word is the only unacceptable answer.
+fn fallback_cut(rest: &str, limit: usize) -> usize {
+    let window = &rest[..limit];
+    let floor = limit / 2;
+    [
+        window.rfind('\n').map(|i| i + 1),
+        window.rfind(' ').map(|i| i + 1),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|c| *c > floor)
+    .unwrap_or(limit)
 }
 
 /// Strip anything an agent wrapped around the rewritten prompt.
@@ -252,6 +438,115 @@ mod tests {
         }
         assert!(INSTRUCTION.contains("Do not add new facts"));
         assert!(INSTRUCTION.contains("Do not answer the prompt"));
+    }
+
+    /// The register is the feature. An instruction that only says "shorter" produces prose
+    /// that is 10% shorter; the words below are what produce instructions instead.
+    #[test]
+    fn instruction_asks_for_the_telegraphic_register() {
+        for must in ["telegraphically", "articles", "copulas", "imperative"] {
+            assert!(INSTRUCTION.contains(must), "instruction omits {must:?}");
+        }
+        assert!(
+            INSTRUCTION.contains("Ambiguity is not compression"),
+            "the limit on how far to compress has to be stated"
+        );
+    }
+
+    #[test]
+    fn a_short_document_is_one_chunk_with_no_separator() {
+        let pieces = chunks("Fix the retry loop.", 100);
+        assert_eq!(pieces, vec![("Fix the retry loop.", "")]);
+    }
+
+    #[test]
+    fn chunks_reassemble_into_the_original() {
+        let text = "# Task\n\nFirst paragraph, which is fairly long.\n\nSecond paragraph, \
+                    also long.\n\nThird one.\n";
+        for max in [10, 25, 40, 60, 1000] {
+            let joined: String = chunks(text, max)
+                .iter()
+                .map(|(body, sep)| format!("{body}{sep}"))
+                .collect();
+            assert_eq!(joined, text, "max_chars = {max}");
+        }
+    }
+
+    #[test]
+    fn chunks_cut_on_blank_lines_and_hand_back_the_break() {
+        let text = "Alpha beta gamma delta.\n\nEpsilon zeta eta theta.";
+        let pieces = chunks(text, 30);
+        assert_eq!(
+            pieces,
+            vec![
+                ("Alpha beta gamma delta.", "\n\n"),
+                ("Epsilon zeta eta theta.", "")
+            ]
+        );
+    }
+
+    /// The bug this guards: a cut inside a fence hands the model an unterminated code
+    /// block, which is exactly the content the instruction insists it copy verbatim.
+    ///
+    /// The block below is 33 characters, so every window here can hold it — at 30 only by
+    /// stretching, which is the point.
+    #[test]
+    fn chunks_keep_a_code_fence_whole() {
+        let text = "Intro line here.\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\nOutro line.";
+        for max in [30, 40, 60] {
+            let pieces = chunks(text, max);
+            for (body, _) in &pieces {
+                assert_eq!(
+                    body.matches("```").count() % 2,
+                    0,
+                    "chunk splits a fence at max_chars = {max}: {body:?}"
+                );
+            }
+            assert!(
+                pieces
+                    .iter()
+                    .any(|(b, _)| b.contains("fn a() {}") && b.contains("fn b() {}")),
+                "the block should arrive in one piece at max_chars = {max}: {pieces:?}"
+            );
+        }
+    }
+
+    /// A fence longer than a chunk plus its stretch has to be split — there is no window
+    /// that holds it. What must still hold is that the document survives the round trip.
+    #[test]
+    fn an_oversized_fence_is_split_rather_than_looping() {
+        let body: String = (0..40).map(|i| format!("let x{i} = {i};\n")).collect();
+        let text = format!("Intro.\n\n```rust\n{body}```\n\nOutro.");
+        let pieces = chunks(&text, 60);
+        assert!(pieces.len() > 2, "got {} pieces", pieces.len());
+        let joined: String = pieces.iter().map(|(b, s)| format!("{b}{s}")).collect();
+        assert_eq!(joined, text);
+    }
+
+    #[test]
+    fn chunks_split_unbroken_prose_on_a_word_boundary() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let pieces = chunks(text, 20);
+        assert!(pieces.len() > 1, "got {pieces:?}");
+        for (body, _) in &pieces {
+            assert!(!body.is_empty() && !body.starts_with(' '), "got {pieces:?}");
+        }
+        let joined: String = pieces.iter().map(|(b, s)| format!("{b}{s}")).collect();
+        assert_eq!(joined, text);
+    }
+
+    #[test]
+    fn chunking_terminates_on_multibyte_text_and_degenerate_limits() {
+        let text = "però — naïve café\n\nsecondo paragrafo però";
+        assert_eq!(
+            chunks(text, 1)
+                .iter()
+                .map(|(b, s)| format!("{b}{s}"))
+                .collect::<String>(),
+            text
+        );
+        assert!(chunks("", 100).is_empty());
+        assert!(!chunks("abc", 0).is_empty());
     }
 
     #[test]

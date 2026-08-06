@@ -29,15 +29,15 @@ pub struct PiiReview {
 
 /// An action waiting on a ranking before it can start.
 ///
-/// Both hint and shrink have to pick an agent to run, and picking one now means asking the
+/// Both hint and plan have to pick an agent to run, and picking one now means asking the
 /// model — seconds, not microseconds. Rather than refuse until the user has ranked
 /// manually, the request is parked here and dispatched when the ranking arrives.
+///
+/// Shrink is not here: it runs on the local model and needs no agent at all.
 #[derive(Debug, Clone)]
 enum Pending {
     /// Ask for a hint about this subject.
     Hint(Subject),
-    /// Shrink the open prompt.
-    Shrink,
     /// Turn the open prompt into an agent-ready instruction.
     Plan,
 }
@@ -53,9 +53,23 @@ pub struct PlanProposal {
     pub diff: String,
 }
 
+/// What a shrink pass was asked to compress.
+///
+/// Captured when the pass starts rather than read back when it finishes: a shrink is
+/// seconds of local inference, and the selection that asked for it is usually gone by then.
+#[derive(Debug, Clone)]
+pub struct ShrinkSource {
+    /// The text handed to the model.
+    pub text: String,
+    /// The character range it came from, or `None` for the whole document.
+    pub range: Option<(usize, usize)>,
+}
+
 /// A pending shrink awaiting approval.
 #[derive(Debug, Clone)]
 pub struct ShrinkProposal {
+    /// What was compressed, and where it came from.
+    pub source: ShrinkSource,
     /// The proposed replacement text.
     pub after: String,
     /// Size comparison.
@@ -117,7 +131,7 @@ pub struct App {
     pub ranking: Option<Ranking>,
     /// What to do once the ranking this job is producing arrives.
     ///
-    /// Hints and shrinks both need a ranking to choose an agent, and getting one now means
+    /// Hints and plans both need a ranking to choose an agent, and getting one now means
     /// waiting on the model. Rather than make the user press "Score models" first, the
     /// request is remembered and dispatched when the ranking lands.
     pending: Option<Pending>,
@@ -132,6 +146,8 @@ pub struct App {
     pub shrink: Option<ShrinkProposal>,
     /// Job currently producing a shrink.
     pub shrink_job: Option<JobId>,
+    /// What that job was handed, captured when it started.
+    pub shrink_source: Option<ShrinkSource>,
     /// Pending plan awaiting approval.
     pub plan: Option<PlanProposal>,
     /// Job currently producing a plan.
@@ -144,6 +160,11 @@ pub struct App {
     pub models_open: bool,
     /// Job currently downloading or loading weights.
     pub models_job: Option<JobId>,
+    /// Job currently starting the background model server.
+    ///
+    /// Its own slot rather than sharing `models_job`: starting the server maps gigabytes and
+    /// waits on a health check, and it must not make the download buttons look busy.
+    pub serve_job: Option<JobId>,
     /// Handles for running jobs, so the user can stop them.
     running: Vec<Handle>,
 
@@ -186,12 +207,14 @@ impl App {
             hint_open: false,
             shrink: None,
             shrink_job: None,
+            shrink_source: None,
             plan: None,
             plan_job: None,
             pii: None,
             pii_job: None,
             models_open: false,
             models_job: None,
+            serve_job: None,
             running: Vec::new(),
             pinned_agent: None,
             status: "detecting agents…".into(),
@@ -401,7 +424,6 @@ impl App {
             .rank(text, agents, move |t, a| router::rank(t, a, &filter));
         self.status = match self.pending {
             Some(Pending::Hint(_)) => "ranking models for the hint…".into(),
-            Some(Pending::Shrink) => "ranking models for the shrink…".into(),
             Some(Pending::Plan) => "ranking models for the plan…".into(),
             None => "ranking models…".into(),
         };
@@ -446,6 +468,22 @@ impl App {
         let job = self.runner.load_models(downloaded);
         self.models_job = Some(job.id);
         self.running.push(job);
+    }
+
+    /// Start the selected build as a background service.
+    ///
+    /// Nothing here decides *whether* to serve — that is the button's job — but a second
+    /// start while one is already in flight would map the weights twice, which on the ternary
+    /// build is 14 GB before either finishes.
+    pub fn start_server(&mut self) {
+        if self.serve_job.is_some() {
+            self.status = "already starting the server".into();
+            return;
+        }
+        let job = self.runner.serve_model();
+        self.serve_job = Some(job.id);
+        self.running.push(job);
+        self.status = "starting the background model server…".into();
     }
 
     /// Stop a running download.
@@ -560,19 +598,49 @@ impl App {
         self.hint_input.clear();
     }
 
-    /// Send the whole prompt to be shrunk.
+    /// Compress the selection with the local model, or the whole prompt when nothing is
+    /// selected.
+    ///
+    /// Runs on a worker: a long prompt is several model calls in sequence, each of which
+    /// maps the weights.
     pub fn request_shrink(&mut self) {
         if self.buffer.text.trim().is_empty() {
             self.status = "nothing to shrink".into();
             return;
         }
-        if self.agents.is_empty() {
-            self.error = Some("no coding agents detected on PATH".into());
+        if self.shrink_job.is_some() {
+            self.status = "already shrinking".into();
             return;
         }
-        match self.ranking.clone() {
-            Some(ranking) => self.launch_shrink(&ranking),
-            None => self.rank_then(Some(Pending::Shrink)),
+
+        let source = self.shrink_target();
+        let scope = match source.range {
+            Some(_) => "the selection",
+            None => "the prompt",
+        };
+
+        let job = self.runner.shrink(source.text.clone());
+        self.shrink_job = Some(job.id);
+        self.shrink_source = Some(source);
+        self.running.push(job);
+        self.shrink = None;
+        self.status = format!("shrinking {scope}…");
+    }
+
+    /// What a shrink would compress right now: the selection, or the whole prompt.
+    ///
+    /// Separate from [`request_shrink`](Self::request_shrink) so the choice can be tested
+    /// without starting a model.
+    fn shrink_target(&self) -> ShrinkSource {
+        match self.buffer.selected_text() {
+            Some(text) => ShrinkSource {
+                text,
+                range: Some(self.buffer.selection.sorted()),
+            },
+            None => ShrinkSource {
+                text: self.buffer.text.clone(),
+                range: None,
+            },
         }
     }
 
@@ -636,31 +704,29 @@ impl App {
         }
     }
 
-    /// Start the shrink agent against an existing ranking.
-    fn launch_shrink(&mut self, ranking: &Ranking) {
-        let prompt = crate::shrink::compose(&self.buffer.text);
-        let job = self.runner.run_agent(
-            Kind::Shrink,
-            "shrink".into(),
-            prompt,
-            self.agents.clone(),
-            ranking.clone(),
-            self.config.dir.clone(),
-            self.config.dir.clone(),
-            DEFAULT_TIMEOUT,
-        );
-        self.shrink_job = Some(job.id);
-        self.running.push(job);
-        self.shrink = None;
-        self.status = "shrinking…".into();
-    }
-
     /// Apply a proposed shrink as one undo step and one snapshot.
+    ///
+    /// A shrink of a selection lands back in the range it came from — and only if that range
+    /// still holds what was compressed. Typing during the pass moves everything after the
+    /// caret, so an unchecked write would replace the wrong passage with a rewrite of a
+    /// different one.
     pub fn accept_shrink(&mut self) {
         let Some(proposal) = self.shrink.take() else {
             return;
         };
-        self.buffer.replace_all(proposal.after, "shrink");
+        match proposal.source.range {
+            Some((lo, hi)) => {
+                if self.buffer.range_text(lo, hi).as_deref() != Some(proposal.source.text.as_str())
+                {
+                    self.status =
+                        "the prompt changed while it was shrinking — select it and try again"
+                            .into();
+                    return;
+                }
+                self.buffer.replace_range(lo, hi, &proposal.after, "shrink");
+            }
+            None => self.buffer.replace_all(proposal.after, "shrink"),
+        }
         self.save(Note::Shrink);
         self.status = format!("shrunk — {}", proposal.savings.summary());
     }
@@ -789,13 +855,11 @@ impl App {
                 {
                     h.answer.push_str(&text);
                 }
-                // Shrink output is accumulated by the worker and delivered whole, so
-                // its chunks only drive the status line.
-                if self.shrink_job == Some(id) {
-                    self.status = format!("shrinking… {} chars", text.len());
-                }
             }
             Event::Done { id, kind, note } => {
+                if kind == Kind::Models && self.serve_job == Some(id) {
+                    self.serve_job = None;
+                }
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
                 }
@@ -818,6 +882,33 @@ impl App {
                     diff: version::diff(&self.buffer.text, &masked),
                     scan: *scan,
                 });
+            }
+            Event::Shrunk { id, text } => {
+                if self.shrink_job != Some(id) {
+                    return;
+                }
+                self.shrink_job = None;
+                let Some(source) = self.shrink_source.take() else {
+                    return;
+                };
+                let after = crate::shrink::clean(&text);
+                let savings = Savings::measure(&source.text, &after);
+                if after.trim().is_empty() {
+                    self.error = Some("the shrinker returned nothing".into());
+                } else if !savings.worthwhile() {
+                    // Not an error: an already-terse prompt has nothing to give, and a diff
+                    // that saves two characters is not worth reading.
+                    self.status = format!("no useful reduction ({})", savings.summary());
+                } else {
+                    self.shrink = Some(ShrinkProposal {
+                        diff: version::diff(&source.text, &after),
+                        warnings: crate::shrink::integrity_warnings(&source.text, &after),
+                        source,
+                        savings,
+                        after,
+                    });
+                    self.status = "shrink ready for review".into();
+                }
             }
             Event::Detected { agents, .. } => {
                 let n = agents.len();
@@ -847,7 +938,6 @@ impl App {
                 {
                     match pending {
                         Pending::Hint(subject) => self.launch_hint(subject, &ranking),
-                        Pending::Shrink => self.launch_shrink(&ranking),
                         Pending::Plan => self.launch_plan(&ranking),
                     }
                 }
@@ -888,32 +978,18 @@ impl App {
                         self.status = "plan ready for review".into();
                     }
                 }
-                Kind::Shrink if self.shrink_job == Some(id) => {
-                    self.shrink_job = None;
-                    let after = crate::shrink::clean(&result.text);
-                    let savings = Savings::measure(&self.buffer.text, &after);
-                    if after.trim().is_empty() {
-                        self.error = Some("the shrinker returned nothing".into());
-                    } else if !savings.worthwhile() {
-                        self.status = format!("no useful reduction ({})", savings.summary());
-                    } else {
-                        self.shrink = Some(ShrinkProposal {
-                            diff: version::diff(&self.buffer.text, &after),
-                            warnings: crate::shrink::integrity_warnings(&self.buffer.text, &after),
-                            savings,
-                            after,
-                        });
-                        self.status = "shrink ready for review".into();
-                    }
-                }
                 _ => {}
             },
             Event::Failed { id, kind, error } => {
                 if kind == Kind::Shrink && self.shrink_job == Some(id) {
                     self.shrink_job = None;
+                    self.shrink_source = None;
                 }
                 if kind == Kind::Plan && self.plan_job == Some(id) {
                     self.plan_job = None;
+                }
+                if kind == Kind::Models && self.serve_job == Some(id) {
+                    self.serve_job = None;
                 }
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
@@ -931,9 +1007,13 @@ impl App {
             Event::Cancelled { id, kind } => {
                 if kind == Kind::Shrink && self.shrink_job == Some(id) {
                     self.shrink_job = None;
+                    self.shrink_source = None;
                 }
                 if kind == Kind::Plan && self.plan_job == Some(id) {
                     self.plan_job = None;
+                }
+                if kind == Kind::Models && self.serve_job == Some(id) {
+                    self.serve_job = None;
                 }
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
@@ -1179,9 +1259,16 @@ mod tests {
                 .is_some_and(|e| e.contains("no coding agents"))
         );
 
+        // Plan and hint are the agent-backed actions, so they are the ones that have to
+        // refuse. Shrink is deliberately not tested here: it runs on the local model and
+        // works with no agent installed at all.
         app.error = None;
-        app.request_shrink();
-        assert!(app.error.is_some());
+        app.request_plan();
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|e| e.contains("no coding agents"))
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1291,6 +1378,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A whole-document source, as `request_shrink` would have captured it.
+    fn whole(text: &str) -> ShrinkSource {
+        ShrinkSource {
+            text: text.into(),
+            range: None,
+        }
+    }
+
     #[test]
     fn a_shrink_that_saves_nothing_is_not_offered() {
         let cfg = tmp_config("shrinknoop");
@@ -1299,18 +1394,11 @@ mod tests {
         app.create_prompt("doc");
         app.buffer.replace_all("keep this text exactly", "typing");
         app.shrink_job = Some(JobId(9));
+        app.shrink_source = Some(whole(&app.buffer.text));
 
-        app.handle(Event::Finished {
+        app.handle(Event::Shrunk {
             id: JobId(9),
-            kind: Kind::Shrink,
-            result: Box::new(crate::agents::failover::Completed {
-                agent_id: "claude",
-                model_id: "haiku",
-                effort: registry::Effort::Low,
-                text: "keep this text exactly".into(),
-                elapsed: Duration::from_millis(10),
-                attempts: Vec::new(),
-            }),
+            text: "keep this text exactly".into(),
         });
         assert!(
             app.shrink.is_none(),
@@ -1331,18 +1419,11 @@ mod tests {
         app.buffer.replace_all(original, "typing");
         app.save(Note::Manual);
         app.shrink_job = Some(JobId(4));
+        app.shrink_source = Some(whole(&app.buffer.text));
 
-        app.handle(Event::Finished {
+        app.handle(Event::Shrunk {
             id: JobId(4),
-            kind: Kind::Shrink,
-            result: Box::new(crate::agents::failover::Completed {
-                agent_id: "claude",
-                model_id: "sonnet",
-                effort: registry::Effort::Medium,
-                text: "Update src/main.rs, then run the tests.".into(),
-                elapsed: Duration::from_millis(10),
-                attempts: Vec::new(),
-            }),
+            text: "Update src/main.rs, run tests.".into(),
         });
 
         let proposal = app.shrink.clone().expect("shrink should be proposed");
@@ -1373,18 +1454,11 @@ mod tests {
             "typing",
         );
         app.shrink_job = Some(JobId(5));
+        app.shrink_source = Some(whole(&app.buffer.text));
 
-        app.handle(Event::Finished {
+        app.handle(Event::Shrunk {
             id: JobId(5),
-            kind: Kind::Shrink,
-            result: Box::new(crate::agents::failover::Completed {
-                agent_id: "claude",
-                model_id: "haiku",
-                effort: registry::Effort::Low,
-                text: "Update src/main.rs.".into(),
-                elapsed: Duration::from_millis(10),
-                attempts: Vec::new(),
-            }),
+            text: "Update src/main.rs.".into(),
         });
 
         let proposal = app.shrink.clone().expect("proposal expected");
@@ -1392,6 +1466,89 @@ mod tests {
             proposal.warnings.iter().any(|w| w.contains("src/lib.rs")),
             "dropped path must be flagged: {:?}",
             proposal.warnings
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Shrinking a selection must leave the rest of the prompt exactly as it was, including
+    /// the paragraph the user is still working on.
+    #[test]
+    fn shrinking_a_selection_replaces_only_the_selection() {
+        let cfg = tmp_config("shrinkselection");
+        let dir = cfg.dir.clone();
+        let mut app = App::new(cfg);
+        app.create_prompt("doc");
+        let original =
+            "Keep this line.\nPlease could you kindly update src/main.rs.\nKeep this too.";
+        app.buffer.replace_all(original, "typing");
+        app.save(Note::Manual);
+
+        let nothing_selected = app.shrink_target();
+        assert_eq!(nothing_selected.range, None, "no selection means the lot");
+        assert_eq!(nothing_selected.text, original);
+
+        // The middle line, as a drag would leave it.
+        let start = original.chars().position(|c| c == '\n').unwrap() + 1;
+        let end = start
+            + "Please could you kindly update src/main.rs."
+                .chars()
+                .count();
+        app.buffer.selection = crate::editor::Selection { start, end };
+
+        let source = app.shrink_target();
+        assert_eq!(source.range, Some((start, end)));
+        assert_eq!(source.text, "Please could you kindly update src/main.rs.");
+
+        // Straight to the result, so the test does not start a model.
+        app.shrink_job = Some(JobId(7));
+        app.shrink_source = Some(source);
+        app.handle(Event::Shrunk {
+            id: JobId(7),
+            text: "Update src/main.rs.".into(),
+        });
+        app.accept_shrink();
+
+        assert_eq!(
+            app.buffer.text,
+            "Keep this line.\nUpdate src/main.rs.\nKeep this too."
+        );
+        assert!(app.buffer.undo(), "one undo reverses the whole shrink");
+        assert_eq!(app.buffer.text, original);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bug this guards: the model takes seconds, and typing in the meantime moves every
+    /// character after the caret. Writing the rewrite back at the captured offsets would
+    /// then replace a passage that is no longer the one that was compressed.
+    #[test]
+    fn a_selection_shrink_refuses_to_apply_over_edited_text() {
+        let cfg = tmp_config("shrinkmoved");
+        let dir = cfg.dir.clone();
+        let mut app = App::new(cfg);
+        app.create_prompt("doc");
+        app.buffer
+            .replace_all("Alpha please.\nBeta please.", "typing");
+        let moved = "PREFIX Alpha please.\nBeta please.";
+
+        app.shrink = Some(ShrinkProposal {
+            source: ShrinkSource {
+                text: "Beta please.".into(),
+                range: Some((14, 26)),
+            },
+            after: "Beta.".into(),
+            savings: Savings::measure("Beta please.", "Beta."),
+            warnings: Vec::new(),
+            diff: String::new(),
+        });
+        // The user kept typing while the model ran.
+        app.buffer.replace_all(moved, "typing");
+
+        app.accept_shrink();
+        assert_eq!(app.buffer.text, moved, "the buffer must be left alone");
+        assert!(
+            app.status.contains("changed while it was shrinking"),
+            "got {}",
+            app.status
         );
         std::fs::remove_dir_all(&dir).ok();
     }
