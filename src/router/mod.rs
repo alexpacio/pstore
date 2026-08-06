@@ -180,7 +180,7 @@ pub fn candidates(
 /// Returns the reason on failure (model not downloaded, runtime not provisioned, malformed
 /// output) so the caller can disable the feature and say why. Nothing is downloaded here:
 /// weights and runtime both come from the Models window, so a first run reports "not
-/// downloaded" instead of stalling on a 3.8 GB transfer nobody asked for.
+/// downloaded" instead of stalling on a 7.17 GB transfer nobody asked for.
 pub fn rank(text: &str, detected: &[Detected], filter: &Filter) -> Result<Ranking, String> {
     let (candidates, excluded) = candidates(detected, filter);
     if candidates.is_empty() {
@@ -211,6 +211,16 @@ pub fn rank(text: &str, detected: &[Detected], filter: &Filter) -> Result<Rankin
 pub fn reset_classifiers() {
     #[cfg(feature = "local-llm")]
     llm::reset();
+}
+
+/// Stop the local model because the app is closing, so no `llama-completion` outlives the
+/// window with the weights still mapped. See [`llm::shutdown`].
+///
+/// Blocks until the processes are gone — milliseconds — and does nothing when none are
+/// running or when the build has no local inference.
+pub fn shutdown_model() {
+    #[cfg(feature = "local-llm")]
+    llm::shutdown();
 }
 
 /// Check the model and runtime are ready now rather than on the next ranking.

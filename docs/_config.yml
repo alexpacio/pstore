@@ -1,7 +1,0 @@
-# GitHub Pages configuration for pstore
-# This file is used by Jekyll but we deploy static HTML directly
-
-title: pstore — Prompt Store
-description: A native GUI that makes prompt authoring a first-class activity
-url: "https://alexpacio.github.io"
-baseurl: "/pstore"

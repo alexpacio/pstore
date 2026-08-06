@@ -1567,7 +1567,7 @@ mod tests {
         let mut app = App::new(cfg);
         app.config.prefs.allow_model_download = false;
 
-        app.fetch_models(vec![crate::models::LLM]);
+        app.fetch_models(vec![crate::models::LLM_TERNARY]);
         assert!(app.models_job.is_none(), "no job should start");
         assert!(
             app.error
@@ -1579,7 +1579,7 @@ mod tests {
 
         // Nothing to load either, since nothing is downloaded in a fresh cache probe.
         app.error = None;
-        app.load_models(vec![crate::models::LLM]);
+        app.load_models(vec![crate::models::LLM_TERNARY]);
         assert!(app.error.is_none(), "a missing checkpoint is not an error");
         std::fs::remove_dir_all(&dir).ok();
     }

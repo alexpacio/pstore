@@ -211,7 +211,7 @@ impl Runner {
     /// Rank the installed agents against `text` with the local model.
     ///
     /// `rank` is injected so this module does not depend on the router, and so tests can
-    /// drive the job machinery without a 3.8 GB checkpoint.
+    /// drive the job machinery without a 7.17 GB checkpoint.
     pub fn rank<R>(&self, text: String, agents: Vec<Detected>, rank: R) -> Handle
     where
         R: FnOnce(&str, &[Detected]) -> Result<Ranking, String> + Send + 'static,
@@ -273,7 +273,7 @@ impl Runner {
         self.spawn(Kind::Models, label, move |id, tx, cancel| {
             let mut failures = Vec::new();
 
-            // The runtime first: it is 11-17 MB against the checkpoint's 3.8 GB, and
+            // The runtime first: it is 11-17 MB against the checkpoint's 7.17 GB, and
             // weights with nothing to run them are of no use. Failing here before the long
             // transfer starts is the kind thing to do.
             if let Err(e) = provision_runtime(&tx, id, &cancel) {
@@ -483,12 +483,17 @@ fn provision_runtime(_tx: &Sender<Event>, _id: JobId, _cancel: &AtomicBool) -> R
 /// checkpoint that has since arrived, and that verdict is remembered on purpose so it is
 /// not retried on every keystroke.
 ///
-/// One checkpoint now serves every feature, so this is a single check rather than one per
+/// One checkpoint serves every feature, so this is a single check rather than one per
 /// subsystem — and "checking" is all it is. Nothing is held in memory between calls: each
 /// model call is a fresh `llama-cli` process, so there is no load step to watch, only a
 /// question of whether the weights and the runtime are both present.
+///
+/// Only the **selected** build is checked. Downloading the one that is not in use is a
+/// legitimate thing to do — fetch it now, switch to it later — and it should not provoke a
+/// readiness check, still less report a failure, for a file nothing is about to run.
 fn load_downloaded(targets: &[Checkpoint], tx: &Sender<Event>, id: JobId) -> Vec<String> {
-    if !targets.iter().any(|c| c.id == crate::models::LLM.id) {
+    let active = crate::models::active();
+    if !targets.iter().any(|c| c.id == active.id) {
         return Vec::new();
     }
     let _ = tx.send(Event::Note {
@@ -502,28 +507,23 @@ fn load_downloaded(targets: &[Checkpoint], tx: &Sender<Event>, id: JobId) -> Vec
     }
 }
 
-/// "2 of 3 models loaded", for the status bar.
+/// "Bonsai 27B (ternary) · loaded", for the status bar.
 pub fn describe_cache() -> String {
-    summarize_cache(&crate::models::snapshot())
+    let active = crate::models::active();
+    summarize_cache(active, crate::models::phase(active.id))
 }
 
-/// The wording, over a snapshot rather than the live board.
+/// The wording, over a given checkpoint and phase rather than the live board.
 ///
-/// Split out so it can be tested without racing the probe jobs that other tests start —
-/// the board is process-wide, and a test that asserts against it directly is a test that
+/// Split out so it can be tested without racing the probe jobs that other tests start — the
+/// board is process-wide, and a test that asserts against it directly is a test that
 /// occasionally loses.
-fn summarize_cache(snapshot: &[(crate::models::Checkpoint, crate::models::Phase)]) -> String {
-    let total = snapshot.len();
-    let ready = snapshot
-        .iter()
-        .filter(|(_, p)| *p == crate::models::Phase::Ready)
-        .count();
-    let downloaded = snapshot.iter().filter(|(_, p)| p.is_downloaded()).count();
-    if ready == total {
-        format!("{ready} of {total} local models loaded")
-    } else {
-        format!("{ready} of {total} local models loaded, {downloaded} downloaded")
-    }
+///
+/// It names the **selected** build rather than counting the catalogue. Two builds are offered
+/// but only one is ever run, so "1 of 2 local models loaded" would be arithmetic about a
+/// situation nobody is in: the second one being absent is the normal case, not a shortfall.
+fn summarize_cache(active: crate::models::Checkpoint, phase: crate::models::Phase) -> String {
+    format!("{} · {}", active.title, phase.label())
 }
 
 /// Whether an agent needs its prompt on stdin, for the UI's "how it will be invoked"
@@ -675,12 +675,16 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no Done event: {events:?}"));
-        assert!(note.contains("local models"), "got {note}");
+        assert!(
+            note.contains(crate::models::active().title),
+            "the readout should name the build in use, got {note}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(20),
             "a probe must not wait on downloads"
         );
-        // Every checkpoint now has a definite answer rather than "unknown".
+        // Every checkpoint now has a definite answer rather than "unknown" — including the
+        // one that is not selected, which the Models window still has to describe.
         for (c, phase) in crate::models::snapshot() {
             assert_ne!(
                 phase,
@@ -730,10 +734,10 @@ mod tests {
         // The label is what the status bar shows before any bytes move, so the user knows
         // what they just agreed to.
         let r = Runner::new();
-        let one = r.fetch_models(vec![crate::models::LLM]);
+        let one = r.fetch_models(vec![crate::models::LLM_TERNARY]);
         one.cancel();
         assert!(
-            one.label.contains("3.80 GB") && one.label.contains("Bonsai"),
+            one.label.contains("7.17 GB") && one.label.contains("Bonsai"),
             "got {}",
             one.label
         );
@@ -747,9 +751,9 @@ mod tests {
     fn a_raised_cancel_flag_stops_a_download_before_it_starts() {
         let cancel = Arc::new(AtomicBool::new(true));
         let started = std::time::Instant::now();
-        let err = crate::models::download(&crate::models::LLM, &cancel).unwrap_err();
+        let err = crate::models::download(&crate::models::LLM_TERNARY, &cancel).unwrap_err();
         assert!(err.contains("cancelled"), "got {err}");
-        // Generous on purpose: the point is that a 3.8 GB transfer did not start, not that
+        // Generous on purpose: the point is that a 7.17 GB transfer did not start, not that
         // the return was instant. A tight bound here only buys flakiness on a busy machine.
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -758,35 +762,30 @@ mod tests {
         );
     }
 
+    /// The summary names the build in use, so a user reading the status bar can tell which
+    /// of the two they are actually running. Two are offered and one is run; a count over the
+    /// catalogue would report the normal state of affairs as a shortfall.
     #[test]
-    fn the_cache_summary_counts_loaded_and_downloaded_separately() {
-        use crate::models::{ALL, Phase};
+    fn the_cache_summary_names_the_selected_build() {
+        use crate::models::{LLM_1BIT, LLM_TERNARY, Phase};
 
-        // Written against a synthetic board rather than `ALL`, so the wording stays under
-        // test whatever the catalogue happens to hold.
-        let c = ALL[0];
-        let mixed = [(c, Phase::Ready), (c, Phase::Cached), (c, Phase::Absent)];
-        let summary = summarize_cache(&mixed);
-        assert!(summary.contains("1 of 3"), "got {summary}");
-        assert!(summary.contains("2 downloaded"), "got {summary}");
+        // Written against given values rather than the process-wide board, which other tests
+        // are concurrently probing.
+        let loaded = summarize_cache(LLM_TERNARY, Phase::Ready);
+        assert!(loaded.contains("ternary"), "got {loaded}");
+        assert!(loaded.contains("loaded"), "got {loaded}");
 
-        let all_ready = [(c, Phase::Ready), (c, Phase::Ready)];
-        assert_eq!(
-            summarize_cache(&all_ready),
-            "2 of 2 local models loaded",
-            "with everything loaded there is nothing left to mention"
-        );
+        // The other build reads differently — otherwise the readout cannot do its one job.
+        let small = summarize_cache(LLM_1BIT, Phase::Ready);
+        assert_ne!(small, loaded);
+        assert!(small.contains("1-bit"), "got {small}");
 
-        // A failure counts as neither loaded nor downloaded.
-        let failed = [
-            (c, Phase::Failed("no network".into())),
-            (c, Phase::Absent),
-            (c, Phase::Absent),
-        ];
-        assert_eq!(
-            summarize_cache(&failed),
-            "0 of 3 local models loaded, 0 downloaded"
-        );
+        // A failure keeps its reason rather than becoming a count of zero.
+        let failed = summarize_cache(LLM_TERNARY, Phase::Failed("no network".into()));
+        assert!(failed.contains("no network"), "got {failed}");
+
+        let absent = summarize_cache(LLM_1BIT, Phase::Absent);
+        assert!(absent.contains("not downloaded"), "got {absent}");
     }
 
     #[test]

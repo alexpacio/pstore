@@ -139,11 +139,17 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let closed = eframe::run_native(
         "pstore",
         options,
         Box::new(move |_cc| Ok(Box::new(ui::Ui::new(state)))),
-    )
+    );
+
+    // `Ui::on_exit` handles the ordinary quit. This covers the paths that never reach it —
+    // a windowing error, or eframe returning without a clean shutdown — because the one
+    // thing that must not survive `main` is a `llama-completion` holding the weights.
+    router::shutdown_model();
+    closed
 }
 
 /// Write a starter config file for `scope`, and report what happened.

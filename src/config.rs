@@ -39,6 +39,36 @@ pub struct Config {
     pub warnings: Vec<String>,
 }
 
+/// Which build of the local checkpoint to run.
+///
+/// The two differ in quantisation, not in what they know: same 27B, same context, same
+/// template. What changes is how much of the full-precision model survives, and what it costs
+/// in memory and in seconds — see [`crate::models::LLM_1BIT`] and
+/// [`crate::models::LLM_TERNARY`], which state the trade in full.
+///
+/// Serialised as the strings a person would write in a config file, not as Rust variant
+/// names, because this is a setting people edit by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum LocalModel {
+    /// 3.8 GB. Choose it when memory is the binding constraint.
+    #[serde(rename = "1-bit")]
+    OneBit,
+    /// 7.17 GB. The default: measurably better at the judgement pstore asks for.
+    #[default]
+    #[serde(rename = "ternary")]
+    Ternary,
+}
+
+impl LocalModel {
+    /// The checkpoint this names.
+    pub fn checkpoint(self) -> crate::models::Checkpoint {
+        match self {
+            LocalModel::OneBit => crate::models::LLM_1BIT,
+            LocalModel::Ternary => crate::models::LLM_TERNARY,
+        }
+    }
+}
+
 /// User preferences persisted to `.pstore/config.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -72,6 +102,23 @@ pub struct Prefs {
     /// bounds memory on a small machine; raising it costs KV cache roughly linearly and is
     /// only needed for prompts larger than anything pstore currently sends.
     pub model_context_ceiling: usize,
+    /// Which build of the checkpoint to run — `"ternary"` or `"1-bit"`.
+    ///
+    /// Switching takes effect on the next model call, not the next launch: nothing is
+    /// resident between calls. Switching to a build that has not been downloaded is allowed,
+    /// and the features that need it say so until it arrives.
+    pub local_model: LocalModel,
+    /// How many characters of reasoning the local model may produce before it must answer.
+    ///
+    /// The checkpoint is a **thinking** model, and every number on its card was measured in
+    /// thinking mode. Left unbounded it does not converge — a measured routing call spent
+    /// 1 399 tokens re-litigating its own conclusion and never reached an answer. So the
+    /// reasoning block is bounded by the grammar rather than by hope: at the cap the model
+    /// is forced to close it and emit the JSON.
+    ///
+    /// Zero disables reasoning entirely, which is faster and measurably worse — see
+    /// [`crate::router::llm::rank`].
+    pub model_reasoning_budget: usize,
     /// Which models and effort levels pstore may pick from.
     pub filter: Filter,
 }
@@ -86,6 +133,10 @@ impl Default for Prefs {
             allow_model_download: true,
             llama_cli_path: None,
             model_context_ceiling: 8192,
+            local_model: LocalModel::default(),
+            // Measured: 1 400 characters is where the reasoning on a hard routing prompt
+            // has finished its analysis and started repeating itself.
+            model_reasoning_budget: 1400,
             filter: Filter::default(),
         }
     }
@@ -106,6 +157,8 @@ struct Layer {
     allow_model_download: Option<bool>,
     llama_cli_path: Option<String>,
     model_context_ceiling: Option<usize>,
+    local_model: Option<LocalModel>,
+    model_reasoning_budget: Option<usize>,
     filter: Option<Filter>,
 }
 
@@ -147,6 +200,12 @@ impl Layer {
         }
         if let Some(v) = self.model_context_ceiling {
             base.model_context_ceiling = v;
+        }
+        if let Some(v) = self.local_model {
+            base.local_model = v;
+        }
+        if let Some(v) = self.model_reasoning_budget {
+            base.model_reasoning_budget = v;
         }
         // Replaced wholesale rather than merged. A half-merged policy — this layer's allow
         // list against that layer's block list — is not something anyone can reason about

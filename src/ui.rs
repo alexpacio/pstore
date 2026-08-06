@@ -74,6 +74,9 @@ impl eframe::App for Ui {
     fn on_exit(&mut self) {
         self.app.save(Note::Manual);
         self.app.config.prefs.save(&self.app.config.dir);
+        // A model call still generating would otherwise keep 7.17 GB mapped after the window
+        // is gone: the child does not die with its parent.
+        crate::router::shutdown_model();
     }
 }
 
@@ -826,13 +829,39 @@ impl Ui {
 
                 let usable = crate::models::LOCAL_INFERENCE;
                 let snapshot = crate::models::snapshot();
+
+                ui.label(
+                    "Two builds of the same 27B model. Pick one — pstore runs only the \
+                     selected build, and having the other downloaded costs nothing but disk.",
+                );
+
+                let mut chosen = self.app.config.prefs.local_model;
                 for (c, phase) in &snapshot {
+                    let choice = crate::models::choice_for(c.id);
+                    let selected = Some(chosen) == choice;
+
                     ui.horizontal(|ui| {
-                        ui.strong(c.title);
+                        // The radio is the row's heading, so "which one am I running?" is
+                        // answered by the same glance that reads the name.
+                        if let Some(choice) = choice {
+                            ui.radio_value(
+                                &mut chosen,
+                                choice,
+                                egui::RichText::new(c.title).strong(),
+                            )
+                            .on_hover_text(if selected {
+                                "pstore runs this build"
+                            } else {
+                                "Run this build instead, from the next model call on"
+                            });
+                        } else {
+                            ui.strong(c.title);
+                        }
                         ui.weak(format!("· {}", c.size_label()));
                         ui.weak(format!("· {}", c.license));
                     });
                     ui.weak(c.purpose);
+                    ui.weak(crate::models::tradeoff(c.id));
                     ui.horizontal_wrapped(|ui| {
                         ui.monospace(c.repo);
                     });
@@ -886,25 +915,27 @@ impl Ui {
                     ui.separator();
                 }
 
-                let missing: Vec<_> = snapshot
+                // Scoped to the selected build, not to everything missing. The other build
+                // being absent is the ordinary state of affairs, and a button that quietly
+                // pulls 11 GB because both rows are empty is not a button anyone wants.
+                let selected = chosen.checkpoint();
+                let selected_missing = snapshot
                     .iter()
-                    .filter(|(_, p)| !p.is_downloaded())
-                    .map(|(c, _)| *c)
-                    .collect();
-                let missing_bytes: u64 = missing.iter().map(|c| c.bytes).sum();
+                    .any(|(c, p)| c.id == selected.id && !p.is_downloaded());
 
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
-                            usable && !busy && !missing.is_empty(),
+                            usable && !busy && selected_missing,
                             egui::Button::new(format!(
-                                "Download all missing ({})",
-                                crate::models::bytes_label(missing_bytes)
+                                "Download the selected build ({})",
+                                selected.size_label()
                             )),
                         )
+                        .on_hover_text(format!("Fetch {} from {}", selected.title, selected.repo))
                         .clicked()
                     {
-                        fetch.extend(missing.iter().copied());
+                        fetch.push(selected);
                     }
                     if busy {
                         ui.spinner();
@@ -923,6 +954,25 @@ impl Ui {
                 });
 
                 let mut prefs_changed = false;
+                if chosen != self.app.config.prefs.local_model {
+                    self.app.config.prefs.local_model = chosen;
+                    prefs_changed = true;
+                }
+
+                // Switching to a build that is not on disk is allowed — it is how you decide
+                // before you download — but the consequence has to be visible here rather
+                // than turning up as a failed ranking later.
+                if selected_missing {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 120, 40),
+                        format!(
+                            "⚠ {} is selected but not downloaded — ranking and the \
+                             personal-data scan are unavailable until it is.",
+                            selected.title
+                        ),
+                    );
+                }
+
                 prefs_changed |= ui
                     .checkbox(
                         &mut self.app.config.prefs.allow_model_download,
@@ -962,6 +1012,33 @@ impl Ui {
                             prefs_changed = true;
                         }
                         ui.weak("tokens");
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Reasoning budget");
+                        let mut budget = self.app.config.prefs.model_reasoning_budget as u32;
+                        if ui
+                            .add(egui::DragValue::new(&mut budget).range(0..=8000).speed(50))
+                            .on_hover_text(
+                                "How far the model may think before it must answer. This is \
+                                 the speed-against-quality dial: generation runs at roughly \
+                                 41 ms per token, so every 100 characters here is about a \
+                                 second and a half added to a ranking. Zero skips reasoning \
+                                 entirely — noticeably faster, and noticeably coarser.",
+                            )
+                            .changed()
+                        {
+                            self.app.config.prefs.model_reasoning_budget = budget as usize;
+                            prefs_changed = true;
+                        }
+                        ui.weak(if self.app.config.prefs.model_reasoning_budget == 0 {
+                            "characters · reasoning off".to_string()
+                        } else {
+                            format!(
+                                "characters · about {:.0}s of thinking",
+                                self.app.config.prefs.model_reasoning_budget as f32 / 3.0 * 0.041
+                            )
+                        });
                     });
 
                     ui.horizontal(|ui| {

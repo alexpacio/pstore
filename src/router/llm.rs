@@ -5,20 +5,75 @@
 //! knows the command line, so the flags that bound memory (see [`fit_context`]) cannot be
 //! forgotten at one call site and applied at another.
 //!
-//! **One process per call.** There is no resident server: `llama-cli` starts, maps the
-//! weights, generates, and exits. That costs seconds of startup on every call, which is
-//! affordable because each call is a button press the user already expects to wait for,
-//! and it buys a great deal — no port to bind, no health-check, no orphaned process
-//! outliving the app, no HTTP client. The rule that keeps it affordable is **one
-//! invocation per user action**; anything that needs more should be one prompt instead.
+//! **One process per call.** There is no resident server: `llama-completion` starts, maps
+//! the weights, generates, and exits.
 //!
-//! **Output is grammar-constrained.** `--json-schema` compiles the schema into the
-//! sampler, so the model cannot emit anything that does not parse. Parsing is therefore a
-//! `serde_json` call rather than a best-effort scrape, and a malformed reply is a bug in
-//! the schema rather than a Tuesday.
+//! **What a call actually costs.** Measured warm on an M4-Pro-class laptop against a
+//! fifteen-candidate ranking prompt, on the 1-bit checkpoint this module was first written
+//! for:
+//!
+//! | Phase | Cost |
+//! | --- | --- |
+//! | process start, mmap and the `-fit` probe | ~1.1 s |
+//! | prompt evaluation | ~10 ms/token (~100 tok/s) |
+//! | generation | ~41 ms/token (~24 tok/s) |
+//!
+//! Those rates are the checkpoint's own, not a misconfiguration: PrismML publish 26 tok/s
+//! generation and 133 tok/s prompt evaluation for this class of machine, and the numbers
+//! here sit right on that. A ranking call lands at **~13 s** with reasoning off and **~26 s**
+//! with it, and the ternary weights move roughly twice the bytes per token. This module used
+//! to claim ~1.4 s per call and ~27 tok/s of *prompt* evaluation; the first was out by an
+//! order of magnitude and the second had the two phases the wrong way round.
+//!
+//! So both halves are worth minding. Generation costs 4× more per token than prompt
+//! evaluation, which is why [`rank_grammar`] permits no whitespace and no long strings;
+//! prompt evaluation is linear with no fixed floor, which is why [`rank_prompt`] stays
+//! terse. The rule that keeps this affordable is **one invocation per user action**;
+//! anything needing more should be one prompt instead.
+//!
+//! A resident server would buy back the ~1.1 s of startup and, more usefully, let the
+//! unchanging head of the prompt — the rules and the candidate list — stay in the KV cache
+//! instead of being re-evaluated every call. That is seconds, not milliseconds, and it is
+//! the one structural argument for a port to bind and a health check to write. It is not
+//! taken here.
+//!
+//! **Nothing outlives the window.** One process per call is only half of that promise:
+//! closing a window does not kill its children, so a generation still in flight would keep
+//! 7.17 GB of weights resident with nobody left to show the answer to. Every child is
+//! therefore registered while it runs and killed by [`shutdown`], which the app calls on its
+//! way out.
+//!
+//! **The chat template is the model's own** — `--jinja`. This is not a detail. Without that
+//! flag llama.cpp silently falls back to a legacy ChatML template, and the checkpoint — a
+//! thinking model whose own template opens a `<think>` block — is prompted in a shape it was
+//! never trained on. Asked to rank fifteen (model, effort) pairs for a hard three-file
+//! refactor it answered `Haiku 4.5, effort medium`, followed by indices 2, 3, 4 and 5 in
+//! order, scoring every one of them `fit: 85` with a copy-pasted reason: it was not
+//! discriminating at all, it was counting. With `--jinja` and nothing else changed it
+//! answered Opus 5 at high effort, then Opus at medium and low, then Sonnet — with fits that
+//! descend. One flag.
+//!
+//! **Reasoning is bounded by the grammar.** Given room to think, the model thinks well: it
+//! identifies the task as a hard refactor, rules out the light models by name, and weighs
+//! effort against latency. What it does not do is stop — unbounded, one routing call spent
+//! 1 399 tokens re-litigating its own conclusion and never reached an answer. So the grammar
+//! allows a reasoning block of at most `model_reasoning_budget` characters and then
+//! *requires* `</think>`: the budget is enforced by the sampler rather than hoped for. Set it
+//! to zero to skip reasoning, which is ~20 s faster and measurably worse.
+//!
+//! **Output is grammar-constrained.** The sampler cannot emit anything that does not parse,
+//! so parsing is a `serde_json` call rather than a best-effort scrape, and a malformed reply
+//! is a bug in the grammar rather than a Tuesday. One trap, learned the hard way: never give
+//! a JSON grammar an unbounded whitespace rule. `ws ::= [ \t\n]*` between two tokens is a
+//! legal place to emit spaces forever, and the model did exactly that — hundreds of tokens
+//! of blanks, then the generation limit, and no answer. Every rule here is bounded.
 
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -45,7 +100,7 @@ const CONTEXT_STEP: usize = 256;
 /// The checkpoint natively supports 262 144 tokens. Running there would cost ~12 GB of KV
 /// cache for prompts that are, in every one of pstore's uses, a few hundred tokens. So the
 /// window is fitted per call: at the sizes pstore asks for, the cache is tens of megabytes
-/// and the 3.8 GB of weights is essentially the entire footprint.
+/// and the 7.17 GB of weights is essentially the entire footprint.
 ///
 /// The estimate errs high on purpose. `llama-cli` silently truncates a prompt that does not
 /// fit, which would mean PII spans pointing into text the model never saw — a wrong answer
@@ -62,62 +117,110 @@ pub fn fit_context(prompt: &str, max_output_tokens: usize, ceiling: usize) -> us
 
 /// What the runtime and the weights add up to: either a way to run the model, or the
 /// reason there isn't one.
-fn ready() -> Result<(PathBuf, PathBuf), String> {
+///
+/// Returns the selected checkpoint alongside the paths, because everything downstream reports
+/// progress against *its* row on the status board. Reading [`models::active`] once here and
+/// passing it along is what stops a mid-call preference change from marking one build's row
+/// `Ready` on the strength of the other build's run.
+fn ready() -> Result<(PathBuf, PathBuf, models::Checkpoint), String> {
     let prefs = crate::config::prefs_snapshot();
 
     let rt = runtime::locate(prefs.llama_cli_path.as_deref())
         .ok_or_else(|| runtime::missing_reason(prefs.llama_cli_path.as_deref()))?;
 
-    if !models::is_cached(&models::LLM) {
-        models::set(models::LLM.id, models::Phase::Absent);
+    let checkpoint = prefs.local_model.checkpoint();
+    if !models::is_cached(&checkpoint) {
+        models::set(checkpoint.id, models::Phase::Absent);
         return Err(format!(
-            "{} not downloaded — open the Models window to fetch it ({})",
-            models::LLM.title,
-            models::LLM.size_label()
+            "{} not downloaded — open the Models window to fetch it ({}), or switch to the \
+             other build there",
+            checkpoint.title,
+            checkpoint.size_label()
         ));
     }
-    let weights = hub_path()?;
-    Ok((rt.path, weights))
+    let weights = hub_path(&checkpoint)?;
+    Ok((rt.path, weights, checkpoint))
 }
 
-/// Resolve the checkpoint's path in the shared Hugging Face cache.
-fn hub_path() -> Result<PathBuf, String> {
-    let file = models::LLM
+/// Resolve a checkpoint's path in the shared Hugging Face cache.
+fn hub_path(checkpoint: &models::Checkpoint) -> Result<PathBuf, String> {
+    let file = checkpoint
         .files
         .last()
         .expect("the checkpoint lists its weights");
-    super::hub::cached(models::LLM.repo, file)
+    super::hub::cached(checkpoint.repo, file)
 }
 
-/// Run the model once and return its (schema-constrained) JSON reply.
+/// How the sampler is to be constrained — and, with it, how it should sample.
 ///
-/// Blocking, and slow by design — the weights are mapped on every call. `max_output_tokens`
-/// bounds both generation and the context window, so it should reflect what the schema can
-/// actually produce rather than a round number.
+/// Two mechanisms because two jobs. A JSON Schema is the better thing to write and maintain,
+/// and it is what the extraction path wants; but it constrains the very first sampled token,
+/// which leaves no room for a reasoning block. Where reasoning earns its seconds — ranking —
+/// the grammar is written out by hand instead.
+pub enum Constrain<'a> {
+    /// Compile a JSON Schema into the sampler. No reasoning is possible.
+    Schema(&'a Value),
+    /// A GBNF grammar, which may allow a `<think>` block before the JSON.
+    Grammar(String),
+}
+
+impl Constrain<'_> {
+    /// Whether this call is asking the model to reason before answering.
+    ///
+    /// It decides the sampling settings, and the difference is not cosmetic. The
+    /// checkpoint's published `temp 0.7 / top-p 0.95 / top-k 20` are the settings **its
+    /// thinking-mode benchmarks were run at**, and reasoning at temperature zero collapses
+    /// into repetition — the same `reason` string on all five picks, every time.
+    ///
+    /// Extraction is the opposite case and wants greedy decoding. Finding an address in a
+    /// paragraph has one right answer, and there is no deliberation for temperature to
+    /// diversify — only a copy to get exactly right. Running the personal-data scan at 0.7
+    /// cost it a live finding: asked for the personal data in
+    /// `Contact Mario Rossi at mario@example.com`, it returned the name and dropped the
+    /// address. Sampling settings are not a global taste; they belong to the task.
+    fn reasons(&self) -> bool {
+        matches!(self, Constrain::Grammar(g) if g.contains(END_OF_THOUGHT))
+    }
+}
+
+/// Run the model once and return its (grammar-constrained) JSON reply.
+///
+/// Blocking, and slow in units of seconds rather than milliseconds — see the module header
+/// for the breakdown. Call it from a worker thread. `max_output_tokens` bounds both
+/// generation and the context window, so it has to cover the reasoning block as well as the
+/// JSON, or the grammar will still be waiting for `</think>` when the token budget runs out.
+///
+/// Ends early, with the reason, if [`shutdown`] runs while the model is generating.
 pub fn complete_json(
     prompt: &str,
-    schema: &Value,
+    constrain: Constrain<'_>,
     max_output_tokens: usize,
 ) -> Result<Value, String> {
-    let (binary, weights) = ready()?;
+    let (binary, weights, checkpoint) = ready()?;
     let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
     let ctx = fit_context(prompt, max_output_tokens, ceiling);
 
-    models::set(models::LLM.id, models::Phase::Loading);
-    let output = Command::new(&binary)
-        .arg("-m")
+    let mut cmd = Command::new(&binary);
+    let reasons = constrain.reasons();
+    match constrain {
+        Constrain::Schema(schema) => cmd.arg("--json-schema").arg(schema.to_string()),
+        Constrain::Grammar(gbnf) => cmd.arg("--grammar").arg(gbnf),
+    };
+    cmd.arg("-m")
         .arg(&weights)
-        .arg("--json-schema")
-        .arg(schema.to_string())
         .arg("-p")
         .arg(prompt)
+        // The model's own chat template, not llama.cpp's legacy ChatML guess. Without this
+        // the checkpoint is prompted in a shape it was not trained on and ranks visibly
+        // worse — see the module header, where the before and after are written out.
+        .arg("--jinja")
         // Echoing the prompt back would double the output for nothing.
         .arg("--no-display-prompt")
         // Closed stdin is what makes it exit. Even `llama-completion` drops into a prompt
         // after generating; with no stdin it takes the EOF and leaves. `--log-disable` is
         // deliberately *not* used — it silences the load errors on stderr too, which are
         // the only diagnostic when a run fails.
-        .stdin(std::process::Stdio::null())
+        .stdin(Stdio::null())
         .args(["-n", &max_output_tokens.to_string()])
         .args(["-c", &ctx.to_string()])
         // Memory: 4-bit KV cache and flash attention. Small at these context sizes, but
@@ -126,34 +229,173 @@ pub fn complete_json(
         .args(["--flash-attn", "on"])
         // Nothing warms up or gets pinned: this process exists for one generation.
         .args(["--no-warmup", "-ngl", "999"])
-        // Deterministic: the same prompt should rank the same way twice.
-        .args(["--temp", "0", "--seed", "1"])
-        .output()
-        .map_err(|e| {
-            models::set(models::LLM.id, models::Phase::Failed(e.to_string()));
-            format!("running {}: {e}", binary.display())
-        })?;
+        // Pinned either way, so a call is reproducible whichever branch it takes.
+        .args(["--seed", "1"]);
 
-    if !output.status.success() {
-        let why = String::from_utf8_lossy(&output.stderr);
-        let why = why.trim();
+    // Sampling belongs to the task, not to the module — see `Constrain::reasons`.
+    if reasons {
+        cmd.args(["--temp", "0.7", "--top-p", "0.95", "--top-k", "20"]);
+    } else {
+        cmd.args(["--temp", "0"]);
+    }
+
+    models::set(checkpoint.id, models::Phase::Loading);
+    let run = supervise(cmd).map_err(|e| {
+        models::set(checkpoint.id, models::Phase::Failed(e.clone()));
+        format!("running {}: {e}", binary.display())
+    })?;
+
+    if run.stopped {
+        // Nothing is wrong with the model or the machine, so this is not a `Failed` phase:
+        // the app is closing and took the process with it.
+        models::set(checkpoint.id, models::Phase::Cached);
+        return Err("the model was stopped because pstore is closing".into());
+    }
+
+    if !run.ok {
+        let why = run.stderr.trim();
         // The tail is the useful part; the head is load-time chatter about tensors.
         let tail: String = why.lines().rev().take(4).collect::<Vec<_>>().join(" / ");
-        models::set(models::LLM.id, models::Phase::Failed(tail.clone()));
+        models::set(checkpoint.id, models::Phase::Failed(tail.clone()));
         return Err(format!("llama-cli failed: {tail}"));
     }
 
-    models::set(models::LLM.id, models::Phase::Ready);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_reply(&stdout)
+    models::set(checkpoint.id, models::Phase::Ready);
+    parse_reply(&run.stdout)
 }
+
+/// How often a run looks to see whether its child has finished.
+///
+/// The child is polled rather than waited on: a blocking `wait` would hold its lock for the
+/// whole generation, leaving [`shutdown`] queued behind the very thing it is trying to kill.
+/// 20 ms against a call measured in seconds is noise.
+const POLL: Duration = Duration::from_millis(20);
+
+/// Every model process alive right now, keyed by pid.
+static LIVE: Mutex<Vec<(u32, Arc<Mutex<Child>>)>> = Mutex::new(Vec::new());
+
+/// Raised once the app is on its way out, so no further weights are mapped.
+static CLOSING: AtomicBool = AtomicBool::new(false);
+
+/// A poisoned lock means a thread panicked mid-update. Recovering the guard is better than
+/// refusing to kill the process it was holding.
+fn recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// One finished — or killed — model process.
+struct Run {
+    /// Whether it exited successfully.
+    ok: bool,
+    stdout: String,
+    stderr: String,
+    /// Whether it was killed on the way out rather than left to finish.
+    stopped: bool,
+}
+
+/// Run `cmd` to completion, killing it if the app closes first.
+///
+/// The child is registered in [`LIVE`] for the whole of its life, which is what makes
+/// [`shutdown`] possible. Both pipes are drained on their own threads: `llama-completion`
+/// writes kilobytes of load-time chatter to stderr, and an unread pipe would stall the
+/// generation rather than fail it.
+fn supervise(mut cmd: Command) -> Result<Run, String> {
+    // Refused rather than started: a worker that reached here between resolving the weights
+    // and spawning must not map 7.17 GB as the window disappears.
+    if CLOSING.load(Ordering::Relaxed) {
+        return Ok(Run {
+            ok: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            stopped: true,
+        });
+    }
+
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+
+    let mut out_pipe = child.stdout.take();
+    let mut err_pipe = child.stderr.take();
+    let out = std::thread::spawn(move || drain(out_pipe.as_mut()));
+    let err = std::thread::spawn(move || drain(err_pipe.as_mut()));
+
+    let pid = child.id();
+    let child = Arc::new(Mutex::new(child));
+    recover(&LIVE).push((pid, Arc::clone(&child)));
+
+    // The lock is only ever held across a non-blocking `try_wait`, so `shutdown` can take
+    // it at any point during the generation.
+    let status = loop {
+        match recover(&child).try_wait() {
+            Ok(Some(s)) => break Some(s),
+            // Already reaped by `shutdown`, or the child is gone. Either way it is over.
+            Err(_) => break None,
+            Ok(None) => {}
+        }
+        std::thread::sleep(POLL);
+    };
+    recover(&LIVE).retain(|(p, _)| *p != pid);
+
+    let ok = status.is_some_and(|s| s.success());
+    Ok(Run {
+        ok,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+        // A run that finished cleanly as the app closed still counts as finished — its
+        // answer is good, even if nothing is left to display it.
+        stopped: !ok && CLOSING.load(Ordering::Relaxed),
+    })
+}
+
+fn drain<R: Read>(pipe: Option<&mut R>) -> String {
+    let mut s = String::new();
+    if let Some(p) = pipe {
+        let _ = p.read_to_string(&mut s);
+    }
+    s
+}
+
+/// Kill and reap every model process running now. Returns how many there were.
+fn stop_live() -> usize {
+    // Taken rather than iterated, so a run that finishes by itself in the meantime cannot be
+    // waited on from two places.
+    let live: Vec<(u32, Arc<Mutex<Child>>)> = std::mem::take(&mut *recover(&LIVE));
+    for (_, child) in &live {
+        let mut c = recover(child);
+        // Both calls fail on a child that has just exited on its own, which is the state
+        // this function exists to reach.
+        let _ = c.kill();
+        // Reaped here rather than left to the supervising thread: a zombie holds its slot,
+        // and the parent is about to leave.
+        let _ = c.wait();
+    }
+    live.len()
+}
+
+/// Where the model's reasoning stops and its answer starts.
+const END_OF_THOUGHT: &str = "</think>";
 
 /// Pull the JSON object out of `llama-cli`'s stdout.
 ///
 /// The grammar guarantees the *model's* output parses, but the process still prints its own
 /// framing around it, and which framing depends on build flags. Rather than depend on that,
 /// take the outermost braces.
+///
+/// The reasoning block is dropped first, and that ordering matters: reasoning about a routing
+/// decision quotes JSON, braces and all, so scanning for the first `{` across the whole reply
+/// would parse the model's rough notes instead of its answer. Everything up to the *last*
+/// `</think>` goes.
 fn parse_reply(stdout: &str) -> Result<Value, String> {
+    let stdout = match stdout.rfind(END_OF_THOUGHT) {
+        Some(i) => &stdout[i + END_OF_THOUGHT.len()..],
+        None => stdout,
+    };
     let start = stdout
         .find('{')
         .ok_or_else(|| format!("no JSON in the model's reply: {:?}", truncate(stdout, 200)))?;
@@ -184,14 +426,22 @@ fn truncate(s: &str, n: usize) -> &str {
 // Ranking
 // ---------------------------------------------------------------------------
 
-/// Ranking asks for five objects of three small fields. 64 tokens each is generous.
-const RANK_OUTPUT_TOKENS: usize = 400;
+/// Longest `reason` the grammar will allow, in characters.
+///
+/// Every one of these is a token the model spends at ~41 ms, five times over, so the cap is
+/// tight and the prompt asks for twelve words. A reason cut off mid-word reads as a bug, so
+/// the prompt's instruction and this number have to stay in agreement.
+const REASON_CHARS: usize = 90;
 
 /// Rank `candidates` against `text`.
 ///
 /// The model chooses **by index** into the list it was given, never by naming an agent or a
 /// model string. An index either maps onto a real launch configuration or is rejected; a
 /// name could be plausible and wrong, and pstore would then try to launch it.
+///
+/// Expect **seconds**: ~13 s with reasoning off and ~30–40 s with it, scaling with the
+/// candidate list. This is the call the whole "one invocation per user action" rule exists to
+/// ration.
 pub fn rank(
     text: &str,
     candidates: &[super::Candidate],
@@ -199,38 +449,12 @@ pub fn rank(
 ) -> Result<super::Ranking, String> {
     let started = std::time::Instant::now();
     let want = super::SHORTLIST.min(candidates.len());
-
-    let schema = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["choices"],
-        "properties": {
-            "choices": {
-                "type": "array",
-                "minItems": want,
-                "maxItems": want,
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["index", "fit", "reason"],
-                    "properties": {
-                        "index": {
-                            "type": "integer",
-                            "minimum": 0,
-                            "maximum": candidates.len() - 1
-                        },
-                        "fit": {"type": "integer", "minimum": 0, "maximum": 100},
-                        "reason": {"type": "string", "maxLength": 90}
-                    }
-                }
-            }
-        }
-    });
+    let budget = crate::config::prefs_snapshot().model_reasoning_budget;
 
     let reply = complete_json(
         &rank_prompt(text, candidates, want),
-        &schema,
-        RANK_OUTPUT_TOKENS,
+        Constrain::Grammar(rank_grammar(candidates.len(), want, budget)),
+        rank_output_tokens(want, budget),
     )?;
     let mut choices = build_choices(&reply, candidates)?;
     normalise_latency(&mut choices);
@@ -243,6 +467,70 @@ pub fn rank(
     })
 }
 
+/// Generation budget for a ranking call: the reasoning block plus the JSON.
+///
+/// Undersizing this is not a slow answer but no answer — the grammar is still waiting for
+/// `</think>` when the tokens run out, and the reply has no JSON in it at all. So the
+/// reasoning allowance is converted at the pessimistic [`CHARS_PER_TOKEN`] and then given
+/// room to spare.
+fn rank_output_tokens(want: usize, reasoning_budget: usize) -> usize {
+    // ~35 tokens covers one `{"index":12,"fit":95,"reason":"..."}` with a full-length reason.
+    let json = 16 + want * 40;
+    let thought = if reasoning_budget == 0 {
+        0
+    } else {
+        (reasoning_budget as f32 / CHARS_PER_TOKEN).ceil() as usize + 16
+    };
+    json + thought
+}
+
+/// The grammar for a ranking reply: an optional bounded reasoning block, then the JSON.
+///
+/// Written by hand rather than compiled from a JSON Schema, because a schema constrains the
+/// first sampled token and the whole point here is to leave room for `<think>` first. Three
+/// things are deliberate:
+///
+/// * **No whitespace rule at all.** The JSON is emitted dense. An unbounded `ws` rule between
+///   tokens is somewhere the sampler can legally sit forever, and it does.
+/// * **`index` is an alternation of the literal indices**, not a digit pattern with a range
+///   check afterwards. The list is short and this way an out-of-range pick is unrepresentable
+///   rather than merely rejected — [`build_choices`] still drops what does not map, but it
+///   should never have to.
+/// * **Every repetition is bounded.** `{0,n}` throughout, so a run cannot become unbounded by
+///   any path through the grammar.
+fn rank_grammar(candidates: usize, want: usize, reasoning_budget: usize) -> String {
+    use std::fmt::Write;
+
+    // The template has already opened the block, so the grammar only has to close it.
+    let root = if reasoning_budget == 0 {
+        "root ::= answer".to_string()
+    } else {
+        format!(
+            "root ::= thought \"{END_OF_THOUGHT}\" answer\nthought ::= [^<]{{0,{reasoning_budget}}}"
+        )
+    };
+
+    let mut index = String::new();
+    for i in 0..candidates.max(1) {
+        if i > 0 {
+            index.push_str(" | ");
+        }
+        let _ = write!(index, "\"{i}\"");
+    }
+
+    // `want - 1` repetitions after the first, so the array is exactly `want` long the way
+    // `minItems`/`maxItems` used to make it.
+    let more = want.saturating_sub(1);
+    format!(
+        "{root}\n\
+         answer ::= \"{{\\\"choices\\\":[\" choice (\",\" choice){{{more}}} \"]}}\"\n\
+         choice ::= \"{{\\\"index\\\":\" index \",\\\"fit\\\":\" fit \",\\\"reason\\\":\" reason \"}}\"\n\
+         index ::= {index}\n\
+         fit ::= [0-9] | [1-9] [0-9] | \"100\"\n\
+         reason ::= \"\\\"\" [^\"\\\\\\n]{{0,{REASON_CHARS}}} \"\\\"\"\n"
+    )
+}
+
 /// Build the ranking prompt.
 ///
 /// The candidate list carries price and metering because the model is being asked to make
@@ -253,47 +541,41 @@ fn rank_prompt(text: &str, candidates: &[super::Candidate], want: usize) -> Stri
     let mut list = String::new();
     for (i, c) in candidates.iter().enumerate() {
         use std::fmt::Write;
+        // Terse on purpose. Prompt evaluation runs at ~27 tokens/second on this checkpoint,
+        // so the candidate list — thirty lines on a machine with several agents installed —
+        // dominates the cost of a ranking call. Everything here earns its tokens: the two
+        // words that changed a routing decision in testing are the tier and the effort.
+        // "included in subscription" was dropped because it is the default and saying so
+        // thirty times cost more than the one line that flags the exception.
         let _ = write!(
             list,
-            "\n{i}: {} via {} · {} tier · effort={}{} · relative price {:.1}x{}",
+            "\n{i}: {} via {} [{}, effort {}{}]{}",
             c.model_display,
             c.agent_display,
             c.tier,
             c.effort,
-            if c.effort_selectable {
-                ""
-            } else {
-                " (predicted)"
-            },
-            c.relative_price,
-            if c.metered {
-                " · BILLED PER TOKEN"
-            } else {
-                " · included in subscription"
-            },
+            if c.effort_selectable { "" } else { "?" },
+            if c.metered { " PAID-PER-TOKEN" } else { "" },
         );
     }
 
     format!(
-        "You are choosing which coding-agent model should answer a prompt.\n\
+        "Pick the {want} best options for the prompt below, best first.\n\
          \n\
-         Rank the {want} best options from the numbered list below. Judge how well each \
-         option's capability matches what the prompt actually demands.\n\
-         \n\
-         Guidance:\n\
-         - Match capability to demand. Do not reach for a frontier model on simple work, \
-         and do not send a hard multi-file refactor to a light one.\n\
-         - Higher effort buys depth at the cost of latency. Prefer lower effort unless the \
-         prompt needs the reasoning.\n\
-         - Options marked BILLED PER TOKEN cost real money on top of the subscription. \
-         Rank one highly only if it is clearly better than every included option for this \
-         prompt, not merely equal.\n\
-         - `fit` is 0-100: how well that option suits THIS prompt.\n\
-         - `reason` is at most 12 words, concrete, and about this prompt.\n\
+         Rules:\n\
+         - Match capability to demand: no frontier model for simple work, no light model \
+         for a hard multi-file refactor.\n\
+         - Higher effort costs latency. Prefer lower unless the prompt needs the reasoning.\n\
+         - PAID-PER-TOKEN costs extra money; rank one high only if clearly better than \
+         every other option here.\n\
+         - `?` after the effort means it cannot be set, only predicted.\n\
+         - `fit` is 0-100 for THIS prompt, and the five must differ.\n\
+         - `reason`: under 10 words, about THIS option. A different reason for each — \
+         say what distinguishes it from the pick above.\n\
          \n\
          Options:{list}\n\
          \n\
-         The prompt to route:\n\
+         Prompt to route:\n\
          <prompt>\n{text}\n</prompt>\n"
     )
 }
@@ -392,6 +674,16 @@ const PII_OUTPUT_TOKENS: usize = 1200;
 ///
 /// Returns spans with byte offsets into `text`. The model is asked for the matched text
 /// rather than trusted with offsets — see [`locate_spans`].
+///
+/// **One process per chunk, and they run in sequence.** At [`crate::pii::CHUNK_CHARS`] a
+/// six-thousand-character prompt is four calls, so a scan is four times a ranking call's
+/// worth of seconds. That is the one place in pstore where the "one invocation per user
+/// action" rule is broken, and it is broken on purpose: a single call would have to hold the
+/// whole document, and the context ceiling exists to keep the KV cache small.
+///
+/// Reasoning is deliberately **not** enabled here, unlike [`rank`]. Finding an address in a
+/// paragraph is extraction, not judgement — there is no deliberation to be had — and the cost
+/// would be paid once per chunk.
 pub fn detect_pii(text: &str) -> Result<Vec<crate::pii::Finding>, String> {
     let schema = json!({
         "type": "object",
@@ -417,7 +709,11 @@ pub fn detect_pii(text: &str) -> Result<Vec<crate::pii::Finding>, String> {
     // Long prompts are chunked so no single call approaches the context ceiling. Offsets
     // are translated back to the whole document by `locate_spans`.
     for (offset, chunk) in crate::pii::segments(text, crate::pii::CHUNK_CHARS) {
-        let reply = complete_json(&pii_prompt(chunk), &schema, PII_OUTPUT_TOKENS)?;
+        let reply = complete_json(
+            &pii_prompt(chunk),
+            Constrain::Schema(&schema),
+            PII_OUTPUT_TOKENS,
+        )?;
         let findings = reply
             .get("findings")
             .and_then(Value::as_array)
@@ -520,8 +816,8 @@ fn pii_prompt(chunk: &str) -> String {
 /// Called from the Models window so a missing runtime or checkpoint is something the user
 /// can see and fix, rather than a failure that first appears when they press a button.
 pub fn preload() -> Result<(), String> {
-    ready().map(|_| {
-        models::set(models::LLM.id, models::Phase::Cached);
+    ready().map(|(_, _, checkpoint)| {
+        models::set(checkpoint.id, models::Phase::Cached);
     })
 }
 
@@ -531,6 +827,28 @@ pub fn preload() -> Result<(), String> {
 /// has to correct the status board, which may be showing a stale failure.
 pub fn reset() {
     models::probe_cache();
+}
+
+/// Let go of the model, because pstore is closing.
+///
+/// The weights live in the child's address space, not this one, so "unloading" the model is
+/// exactly this: end the process holding it. Killing the GUI does not kill its children — a
+/// ranking or a PII scan still generating would go on holding 7.17 GB of resident pages, with
+/// no window left to show the answer to — so every live run is killed and reaped here, and
+/// further runs are refused so nothing maps the weights again on the way out.
+///
+/// Idempotent, quick, and safe to call when nothing is running. Returns once the processes
+/// are gone, which is the point: returning early would leave the very orphan it exists to
+/// prevent.
+pub fn shutdown() {
+    CLOSING.store(true, Ordering::Relaxed);
+    if stop_live() > 0 {
+        // Weights on disk, nothing running: what is true a moment before the app exits. Set
+        // on whichever build was selected — the run that was killed can only have been that
+        // one, and marking the other build's row would be a claim about a file that may not
+        // even be downloaded.
+        models::set(models::active().id, models::Phase::Cached);
+    }
 }
 
 #[cfg(test)]
@@ -744,13 +1062,218 @@ mod tests {
         assert_eq!(found[0].end, 1_006 + "mario@example.com".len());
     }
 
-    /// End-to-end against the real checkpoint and the real runtime. Ignored by default —
-    /// it needs the 3.8 GB download and takes ~10s per call.
+    // -----------------------------------------------------------------------
+    // Process lifetime
+    // -----------------------------------------------------------------------
+
+    /// `CLOSING` is process-wide and refuses *every* run, so the test that raises it has to
+    /// keep other tests out of `supervise` while it does. Held by every test here.
+    ///
+    /// The registry itself is deliberately **not** guarded: other tests reach the real model
+    /// through `complete_json`, so their children appear in `LIVE` alongside these ones.
+    /// That is exactly the situation a closing app faces, so the tests below identify their
+    /// own child by pid rather than assuming the registry is theirs.
+    static PROCESSES: Mutex<()> = Mutex::new(());
+
+    /// Pids currently registered as live.
+    fn live_pids() -> Vec<u32> {
+        recover(&LIVE).iter().map(|(p, _)| *p).collect()
+    }
+
+    /// Wait for `f`, up to `secs`, rather than sleeping a fixed amount.
+    fn until(secs: u64, mut f: impl FnMut() -> bool) -> bool {
+        for _ in 0..(secs * 100) {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    fn sh(script: &str) -> Command {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(script).stdin(Stdio::null());
+        cmd
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_supervised_run_captures_both_streams() {
+        let _guard = recover(&PROCESSES);
+        let run = supervise(sh("echo out; echo err >&2")).expect("the child should start");
+
+        assert!(run.ok, "a clean exit should be reported as success");
+        assert!(!run.stopped);
+        assert!(run.stdout.contains("out"));
+        // stderr matters: it is the only diagnostic when a real run fails to load.
+        assert!(run.stderr.contains("err"));
+
+        let failed = supervise(sh("exit 3")).expect("the child should start");
+        assert!(!failed.ok);
+        assert!(!failed.stopped, "a failure is not a shutdown");
+    }
+
+    /// The whole point of the registry: a generation in flight when the window closes has to
+    /// die with it, or 7.17 GB of weights stays resident with nothing to show for it.
+    #[test]
+    #[cfg(unix)]
+    fn closing_kills_a_run_in_flight() {
+        let _guard = recover(&PROCESSES);
+        let before = live_pids();
+        let started = std::time::Instant::now();
+        // A child that would far outlive the test, so only being killed can end it.
+        let worker = std::thread::spawn(|| supervise(sh("sleep 30")));
+
+        // Its own pid, not merely "something is registered": another test may be running the
+        // real model at the same time.
+        let mut mine = None;
+        assert!(
+            until(5, || {
+                mine = live_pids().into_iter().find(|p| !before.contains(p));
+                mine.is_some()
+            }),
+            "the child was never registered, so nothing could have killed it"
+        );
+        let mine = mine.expect("just checked");
+        assert!(stop_live() >= 1, "the live run should have been found");
+
+        let run = worker.join().expect("the supervising thread").unwrap();
+        assert!(!run.ok, "a killed child must not report success");
+        assert!(
+            !live_pids().contains(&mine),
+            "a finished run must not stay in the registry"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?} — the child was waited for, not killed",
+            started.elapsed()
+        );
+        // Nothing of ours left running, and an empty sweep is harmless.
+        stop_live();
+    }
+
+    /// Shutdown also has to close the door behind it: a worker that reaches the spawn a
+    /// moment later must not map the weights again on the way out.
+    #[test]
+    #[cfg(unix)]
+    fn a_closing_app_refuses_to_start_the_model() {
+        let _guard = recover(&PROCESSES);
+        CLOSING.store(true, Ordering::Relaxed);
+
+        let run = supervise(sh("echo should not run"));
+        // Restored before any assertion, so a failure here cannot leave the flag raised and
+        // break every later test in the binary.
+        CLOSING.store(false, Ordering::Relaxed);
+        let run = run.expect("refusal is not an error");
+
+        assert!(run.stopped, "the run should report that it never started");
+        assert!(!run.ok);
+        assert!(
+            run.stdout.is_empty(),
+            "nothing should have run: {:?}",
+            run.stdout
+        );
+    }
+
+    /// Whether the OS still knows about `pid`. A reaped child is gone from `ps` entirely; a
+    /// zombie would still be listed, which is why [`stop_live`] waits on what it kills.
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        Command::new("ps")
+            .args(["-p", &pid.to_string()])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The claim this whole section exists to make, checked against the real weights: quit
+    /// mid-generation and the process holding 7.17 GB is gone, not orphaned.
+    ///
+    /// Ignored by default — it needs the download and the runtime.
+    ///
+    /// `cargo test -- --ignored live_model_is_killed --nocapture`
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "needs the downloaded checkpoint and a provisioned runtime"]
+    fn live_model_is_killed_when_the_app_closes() {
+        let _guard = recover(&PROCESSES);
+        let before = live_pids();
+        let started = std::time::Instant::now();
+        // Long enough to chunk, so the scan is certain to still be generating.
+        let text = "Contact Mario Rossi at mario@example.com about invoice 42. ".repeat(60);
+        let worker = std::thread::spawn(move || detect_pii(&text));
+
+        let mut pid = None;
+        assert!(
+            until(60, || {
+                pid = live_pids().into_iter().find(|p| !before.contains(p));
+                pid.is_some()
+            }),
+            "the model never started, so this test proves nothing"
+        );
+        let pid = pid.expect("just checked");
+
+        shutdown();
+        let err = worker
+            .join()
+            .expect("the scanning thread")
+            .expect_err("a scan cannot finish once its model is gone");
+        // Restored so the rest of the binary can still run the model.
+        CLOSING.store(false, Ordering::Relaxed);
+
+        eprintln!("  killed pid {pid} after {:?}: {err}", started.elapsed());
+        assert!(
+            err.contains("closing"),
+            "the reason should say the app is closing, got {err:?}"
+        );
+        assert!(
+            !alive(pid),
+            "pid {pid} outlived the shutdown — the weights are still resident"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "shutdown waited for the generation instead of killing it"
+        );
+    }
+
+    /// End-to-end against the real checkpoint and the real runtime. Ignored by default — it
+    /// needs one of the builds downloaded, and takes tens of seconds per call.
     ///
     /// `cargo test -- --ignored live_model --nocapture`
+    ///
+    /// Runs against whichever build is actually on disk rather than insisting on the default
+    /// one: this is the test that proves the grammar, the template and the reply parser work
+    /// against real weights, and it should not be un-runnable on a machine that has the other
+    /// 3.8 GB sitting right there.
     #[test]
-    #[ignore = "needs the downloaded checkpoint and a provisioned runtime"]
+    #[ignore = "needs a downloaded checkpoint and a provisioned runtime"]
     fn live_model_ranks_and_finds_personal_data() {
+        use crate::config::LocalModel;
+
+        let downloaded = [LocalModel::Ternary, LocalModel::OneBit]
+            .into_iter()
+            .find(|m| models::is_cached(&m.checkpoint()));
+        let Some(choice) = downloaded else {
+            eprintln!("neither build is downloaded — nothing to run against");
+            return;
+        };
+        // Every build that is on disk must resolve to a real file through the same path the
+        // app uses. Selecting a build that pstore then cannot locate is the one way this
+        // switch can fail silently, and it costs nothing to check both here.
+        for m in [LocalModel::Ternary, LocalModel::OneBit] {
+            let c = m.checkpoint();
+            if models::is_cached(&c) {
+                let path = hub_path(&c).unwrap_or_else(|e| panic!("{} cached but {e}", c.title));
+                assert!(path.exists(), "{} resolved to {path:?}", c.title);
+            }
+        }
+
+        let mut prefs = crate::config::prefs_snapshot();
+        prefs.local_model = choice;
+        crate::config::publish(&prefs);
+        eprintln!("running against {}", choice.checkpoint().title);
+
         let cands = [
             candidate("claude", "haiku-4.5", Effort::Low),
             candidate("claude", "opus-5", Effort::High),
@@ -789,6 +1312,113 @@ mod tests {
         );
     }
 
+    /// Every repetition in the grammar has to be bounded. An unbounded rule is a place the
+    /// sampler can legally sit forever, and it has: a `ws ::= [ \t\n]*` between two JSON
+    /// tokens once cost a whole generation budget in spaces, and the call returned no answer
+    /// at all. This is cheaper to assert than to rediscover.
+    #[test]
+    fn the_grammar_has_no_unbounded_repetition() {
+        let g = rank_grammar(15, 5, 1400);
+        for (n, line) in g.lines().enumerate() {
+            assert!(
+                !line.contains('*') && !line.contains('+'),
+                "line {n} can repeat without bound: {line}"
+            );
+        }
+        // And no whitespace rule at all: the JSON is emitted dense, because every space is a
+        // token at ~41 ms.
+        assert!(!g.contains("ws"), "{g}");
+    }
+
+    /// The model picks by index, and the grammar is what makes an impossible index
+    /// impossible. A digit pattern would let it emit `29` against a fifteen-item list and
+    /// leave `build_choices` to drop a pick the user then cannot account for.
+    #[test]
+    fn the_grammar_admits_exactly_the_real_indices() {
+        let g = rank_grammar(3, 2, 0);
+        let index = g
+            .lines()
+            .find(|l| l.starts_with("index ::="))
+            .expect("an index rule");
+        assert_eq!(index, "index ::= \"0\" | \"1\" | \"2\"");
+
+        // Reasoning off means no think block to close, and the answer starts immediately.
+        assert!(g.starts_with("root ::= answer"), "{g}");
+        assert!(!g.contains(END_OF_THOUGHT), "{g}");
+
+        // One candidate is still a valid list, and must not produce an empty alternation.
+        assert!(rank_grammar(1, 1, 0).contains("index ::= \"0\""));
+    }
+
+    /// With a budget the reasoning block is *permitted* up to the cap and `</think>` is then
+    /// *required* — that requirement is the whole mechanism. If the close became optional the
+    /// model would think until the token budget ran out, which is the failure this replaced.
+    #[test]
+    fn a_reasoning_budget_is_a_cap_and_a_forced_close() {
+        let g = rank_grammar(15, 5, 900);
+        assert!(
+            g.starts_with(&format!("root ::= thought \"{END_OF_THOUGHT}\" answer")),
+            "{g}"
+        );
+        assert!(g.contains("thought ::= [^<]{0,900}"), "{g}");
+    }
+
+    /// The array has to come out exactly `want` long, the way `minItems`/`maxItems` used to
+    /// guarantee. Off by one here is a shortlist that is quietly the wrong length.
+    #[test]
+    fn the_grammar_asks_for_exactly_the_shortlist_length() {
+        assert!(rank_grammar(15, 5, 0).contains("choice (\",\" choice){4}"));
+        assert!(rank_grammar(15, 1, 0).contains("choice (\",\" choice){0}"));
+    }
+
+    /// Sampling follows the task. Reasoning wants the checkpoint's published thinking-mode
+    /// settings; extraction wants greedy decoding, and running it at 0.7 measurably lost a
+    /// personal-data finding.
+    #[test]
+    fn only_the_reasoning_path_samples_at_temperature() {
+        let schema = json!({"type": "object"});
+        assert!(
+            !Constrain::Schema(&schema).reasons(),
+            "extraction is greedy"
+        );
+
+        assert!(Constrain::Grammar(rank_grammar(3, 2, 900)).reasons());
+        assert!(
+            !Constrain::Grammar(rank_grammar(3, 2, 0)).reasons(),
+            "a zero budget means no reasoning, so no temperature either"
+        );
+    }
+
+    /// The generation budget has to cover the reasoning block as well as the JSON. Undersized,
+    /// the grammar is still waiting for `</think>` when the tokens run out and the reply
+    /// contains no JSON whatsoever — a failure that reads like a broken model.
+    #[test]
+    fn the_token_budget_covers_the_reasoning_block() {
+        let with = rank_output_tokens(5, 1400);
+        let without = rank_output_tokens(5, 0);
+        assert!(
+            with >= without + (1400.0 / CHARS_PER_TOKEN) as usize,
+            "{with} leaves no room for 1400 characters of reasoning"
+        );
+        // Reasoning off should not pay for a block it will not produce.
+        assert!(without < 250, "{without} tokens for JSON alone");
+    }
+
+    /// Reasoning about a routing decision quotes JSON — braces and all — so the answer has to
+    /// be taken from *after* the reasoning, never by scanning the whole reply for a `{`.
+    #[test]
+    fn the_reasoning_block_is_not_mistaken_for_the_answer() {
+        let reply = "The schema wants {\"choices\":[...]} so I will emit\n\
+                     </think>{\"choices\":[{\"index\":3,\"fit\":90,\"reason\":\"ok\"}]}";
+        let v = parse_reply(reply).expect("the answer follows the reasoning");
+        let choices = v.get("choices").and_then(Value::as_array).unwrap();
+        assert_eq!(choices.len(), 1, "parsed the notes instead of the answer");
+        assert_eq!(choices[0]["index"], 3);
+
+        // A reply with no reasoning at all still parses.
+        assert!(parse_reply("{\"choices\":[]}").is_ok());
+    }
+
     /// The ranking prompt has to carry the facts the model is being asked to weigh —
     /// especially metering, which is the one judgement pstore used to hard-code.
     #[test]
@@ -802,10 +1432,26 @@ mod tests {
             p.contains("fix a typo"),
             "the prompt itself must be in there"
         );
-        assert!(p.contains("BILLED PER TOKEN"));
-        assert!(p.contains("included in subscription"));
+        assert!(p.contains("PAID-PER-TOKEN"), "metering must be flagged");
         assert!(p.contains("0: sonnet"), "options must be indexed from zero");
         assert!(p.contains("1: fable"));
-        assert!(p.contains("Rank the 2 best"));
+        assert!(p.contains("2 best"));
+    }
+
+    /// Prompt evaluation is the dominant cost of a ranking call, and it scales with the
+    /// candidate list. A machine with several agents installed offers ~30 combinations, so
+    /// a few wasted words per line is a real number of seconds.
+    #[test]
+    fn the_candidate_list_stays_compact() {
+        let cands: Vec<_> = (0..30)
+            .map(|_| candidate("claude", "claude-sonnet-5", Effort::Medium))
+            .collect();
+        let list_bytes =
+            rank_prompt("do a thing", &cands, 5).len() - rank_prompt("do a thing", &[], 5).len();
+        let per_line = list_bytes / 30;
+        assert!(
+            per_line < 60,
+            "{per_line} bytes per candidate line is too verbose for a 30-line list"
+        );
     }
 }

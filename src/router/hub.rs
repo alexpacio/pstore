@@ -3,7 +3,7 @@
 //! This used to delegate to the `hf-hub` crate. It does not any more: hf-hub 1.0.0 stalls
 //! **deterministically** at 11,021,778 bytes into `Bonsai-27B-Q1_0.gguf` — from a clean
 //! cache, every time, while `curl` and `ureq` both stream the same URL at full speed. A
-//! 3.8 GB download that stops 0.3% in and never resumes is not something the app can work
+//! 7.17 GB download that stops 0.3% in and never resumes is not something the app can work
 //! around, so the transfer is done here instead.
 //!
 //! What is *not* reinvented is the cache **layout**. Weights land in the same
@@ -55,7 +55,7 @@ pub fn cache_root() -> Option<PathBuf> {
 /// Resolve `filename` from the local cache only.
 ///
 /// `Err` means "not downloaded" rather than "broken": this is how the Models window answers
-/// whether the checkpoint is present without starting a 3.8 GB transfer.
+/// whether the checkpoint is present without starting a 7.17 GB transfer.
 pub fn cached(repo_id: &str, filename: &str) -> Result<PathBuf, String> {
     let dir = cache_root()
         .ok_or("no home directory to hold the Hugging Face cache")?
@@ -250,7 +250,7 @@ mod real {
         loop {
             if cancel.load(Ordering::Relaxed) {
                 // The partial file stays: the next attempt resumes from here rather than
-                // starting the 3.8 GB again.
+                // starting the 7.17 GB again.
                 let _ = file.flush();
                 return Err("cancelled".into());
             }
@@ -401,7 +401,7 @@ mod tests {
     }
 
     /// The folder name is how pstore's cache entries line up with everyone else's. Getting
-    /// it wrong would not fail — it would quietly download a second copy of 3.8 GB beside
+    /// it wrong would not fail — it would quietly download a second copy of 7.17 GB beside
     /// the one another tool already has.
     #[test]
     fn repo_folders_match_the_hub_convention() {

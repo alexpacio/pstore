@@ -24,7 +24,7 @@ pstore treats prompt authoring as a first-class workflow:
 | **Plan** | Rewrites a rough request into a structured instruction for a coding agent: objective, ordered steps, constraints, acceptance criteria. The output *is* the next prompt, not a document to read. |
 | **Smart routing** | Every (agent, model, effort) combination your machine can run is handed to a local 27B model along with your prompt; it returns a ranked shortlist with a reason for each pick. |
 | **PII sanitizer** | Finds names, addresses, IBANs, tax codes and card numbers and swaps them for placeholders — before the prompt reaches an agent. |
-| **One local model** | A single 3.8 GB checkpoint runs everything pstore infers, as a subprocess on your machine. Nothing about your prompt leaves it. |
+| **One local model** | A single checkpoint — your pick of two sizes — runs everything pstore infers, as a subprocess on your machine. Nothing about your prompt leaves it. |
 | **Model policy** | Block models by pattern, or whitelist the only ones you are allowed to use. Per-token models are blocked by default so nothing bills you by accident. Configurable machine-wide, per-user, or per-project. |
 | **One-key handoff** | `Ctrl+Enter` launches the selected agent with your prompt. Supports 12+ agents. |
 | **Copy anything** | Every produced artefact — hint, shrink, plan, masked prompt — has a copy button. The workflow ends in a paste. |
@@ -34,39 +34,99 @@ pstore treats prompt authoring as a first-class workflow:
 
 ## The local model
 
-pstore uses **one** checkpoint for everything it infers itself — which agent and model
-should answer a prompt, and where the personal data in it is:
+pstore runs **one** checkpoint for everything it infers itself — which agent and model
+should answer a prompt, and where the personal data in it is. You choose which of two builds
+of it to run, in the Models window:
 
-| Checkpoint | What it does | Download |
-| --- | --- | --- |
-| [`prism-ml/Bonsai-27B-gguf`](https://huggingface.co/prism-ml/Bonsai-27B-gguf) (`Q1_0`) | Ranks the installed (agent, model, effort) combinations against your prompt, and finds personal data in it | 3.8 GB |
+| Build | Quality | Peak memory | Download |
+| --- | --- | --- | --- |
+| [`Ternary-Bonsai-27B`](https://huggingface.co/prism-ml/Ternary-Bonsai-27B-gguf) (`Q2_0`) — **default** | 94.6% of FP16 | ~8.4 GB | 7.17 GB |
+| [`Bonsai-27B`](https://huggingface.co/prism-ml/Bonsai-27B-gguf) (`Q1_0`) | 89.5% of FP16 | ~5 GB | 3.8 GB |
 
-It is PrismML's 1-bit build of Qwen3.6-27B: a 27B model in 3.8 GB of weights, retaining
-~89.5% of FP16 quality. The ternary build of the same model scores higher (94.6%) but costs
-7.17 GB — twice the memory for tasks that sit far below what a 27B can do.
+Same 27B model, same 262K context, same template — PrismML's ternary `{-1, 0, +1}` build at a
+true 1.71 bits, or their binary `{-1, +1}` build at 1.125. What changes is how much of the
+full-precision model survives, and what it costs you in memory and in seconds. Both can sit on
+disk at once; only the selected one is ever run.
 
-Weights go to the shared Hugging Face cache (`~/.cache/huggingface`), so other tools reuse
-them.
+**Pick the ternary build unless memory is your binding constraint.** The aggregate gap looks
+small, but routing is an instruction-following and judgement task, and those are the two
+categories the binary build gives up most on: IFBench 52.4 and τ²-Bench 61.3, against FP16's
+68.0 and 82.9. Asked to rank fifteen (model, effort) pairs for a hard three-file refactor, it
+answered `Haiku 4.5, effort medium`, then indices 2, 3, 4 and 5 in order, scoring all five
+`fit: 85` with the same reason copy-pasted on each. It was not ranking; it was counting. The
+ternary build, same prompt, returns Opus 5 at high effort down to Sonnet, with scores that
+descend. The binary build is roughly twice as fast per token, and worth it on a machine that
+cannot hold the other.
+
+Set it in the Models window, or by hand:
+
+```json
+{ "local_model": "ternary" }   // or "1-bit"
+```
+
+Switching takes effect on the next model call, not the next launch — nothing is resident
+between calls. Weights go to the shared Hugging Face cache (`~/.cache/huggingface`), so other
+tools reuse them.
 
 ### How it runs
 
 pstore does not link an inference engine. It runs the model the way it runs a coding agent:
-as a one-shot `llama-cli` subprocess, prompt in, JSON out, process exits. No server, no
-port, no HTTP client, nothing left running when pstore closes.
+as a one-shot `llama-completion` subprocess, prompt in, JSON out, process exits. No server,
+no port, no HTTP client, nothing left running when pstore closes.
+
+That last part is enforced rather than assumed: closing a window does not kill its children,
+so every model process is tracked while it runs and killed when the app quits. Quit
+mid-generation and the 7.17 GB goes with it — the call you were waiting on reports that pstore
+is closing instead of finishing into a window that no longer exists.
+
+(It has to be `llama-completion`, not `llama-cli` — the latter rejects `--no-conversation`
+at runtime, despite listing it in `--help`, and says to use `llama-completion` instead.)
 
 That binary has to be [PrismML's fork of llama.cpp](https://github.com/PrismML-Eng/llama.cpp)
-— the `Q1_0_g128` quantisation has kernels that exist nowhere else, and stock llama.cpp
+— the `Q2_0_g128` quantisation has kernels that exist nowhere else, and stock llama.cpp
 fails to load the file. **pstore downloads it for you** (~11 MB, checked against its
 published SHA256 before it is installed) into `~/Library/Application Support/pstore/bin`,
 `~/.local/share/pstore/bin`, or `%LOCALAPPDATA%\pstore\bin`. A machine-wide install is used
 if an administrator has provisioned one; pstore never asks for privileges to create it.
 
-Output is **grammar-constrained**: the JSON schema is compiled into the sampler with
-`--json-schema`, so the model cannot emit anything that fails to parse.
+The prompt is rendered with the **model's own chat template** (`--jinja`). This is not a
+detail: without it llama.cpp falls back to a legacy ChatML template, and a thinking model
+whose template opens a `<think>` block gets prompted in a shape it was never trained on.
+Adding that one flag is what turned the `Haiku 4.5, effort medium` answer above into
+Opus 5 at high effort, then Opus at medium and low, then Sonnet — with scores that descend.
 
-The cost of one process per call is that the weights are mapped every time — expect seconds,
-not milliseconds. That is affordable because every one of these is a button press you were
-already waiting on, and it buys the whole simplification above.
+Output is **grammar-constrained**, so the model cannot emit anything that fails to parse.
+The ranking grammar allows a bounded **reasoning block** before the JSON and then *requires*
+`</think>`: given room to think the model reasons well, but it does not stop on its own —
+unbounded, one routing call spent 1,399 tokens re-litigating its own conclusion and never
+answered. `model_reasoning_budget` caps it (default 1,400 characters; `0` disables it).
+
+**Measured cost**, warm, on an M4-Pro-class laptop against a fifteen-candidate prompt:
+
+| Phase | Cost |
+| --- | --- |
+| process start, mmap, `-fit` probe | ~1.1 s |
+| prompt evaluation | ~10 ms/token (~100 tok/s) |
+| generation | ~41 ms/token (~24 tok/s) |
+| **a ranking call** | **~13 s** without reasoning, **~26 s** with |
+
+Those are the checkpoint's own rates — PrismML publish 26 tok/s generation and 133 tok/s
+prompt evaluation for this class of machine — and the ternary weights move about twice the
+bytes per token, so budget accordingly. Earlier versions of this file claimed ~1.4 s per call
+and ~27 tok/s of *prompt* evaluation; the first was out by an order of magnitude and the
+second had the two phases the wrong way round.
+
+Generation costs 4× more per token than prompt evaluation, so the reply grammar permits no
+whitespace at all; prompt evaluation is linear with no fixed floor, so the candidate list is
+terse. A **resident server** would buy back the startup and, more usefully, keep the
+unchanging head of the prompt in the KV cache instead of re-evaluating it every call — that
+is the one real argument against one-process-per-call, and it is seconds, not milliseconds.
+
+**Speculative decoding is not the answer here.** The repository ships a DSpark drafter, and
+it is lossless — verification preserves the target distribution exactly, so it can only cost
+speed, never quality. But its measured 1.34× is on the CUDA serving path, PrismML do not
+enable it on Apple Silicon at all (a batch-1 verification pass does not amortise there), and
+it accelerates only generation — under half of a ranking call.
 
 ### Memory footprint
 
@@ -78,14 +138,14 @@ ctx = round_up(prompt_tokens + max_output_tokens + margin, 256), clamped to the 
 
 A routing call runs at ~512–1024 tokens of context instead of the checkpoint's native
 262,144. At those sizes the KV cache is tens of megabytes, so the weights are essentially
-the entire footprint: **expect ~5 GB peak** (3.8 GB weights + ~1.3 GB runtime), against the
-model card's 5.9 GB at 4K context and 12.2 GB at 100K.
+the entire footprint: **expect ~8.4 GB peak** (7.17 GB weights + ~1.3 GB runtime), against the
+model card's 8.4 GB at 4K context and 14.7 GB at 100K.
 
 | Technique | How | Effect |
 | --- | --- | --- |
-| 1-bit checkpoint | `Bonsai-27B-Q1_0.gguf` | **The dominant lever** — 3.8 GB vs 7.17 GB for the ternary build |
+| Choice of checkpoint | `local_model` | 7.17 GB ternary by default; `"1-bit"` drops it to 3.8 GB and ~5 GB peak, at coarser rankings |
 | No vision tower | `mmproj` never fetched | 0.63–0.93 GB never downloaded or loaded; pstore sends no images |
-| No drafter | `dspark` never fetched | Speculative decoding buys throughput with memory — the wrong trade for one-shot calls |
+| No drafter | `dspark` never fetched | 1.95 GB for a generation speedup PrismML do not enable on Apple Silicon |
 | Fitted context | `--ctx-size <computed>` | KV cache is linear in context; most calls need a fraction of the ceiling |
 | 4-bit KV cache | `--cache-type-k q4_0 --cache-type-v q4_0` | ~4× smaller cache than f16 |
 | Flash attention | `--flash-attn on` | Removes the attention scratch buffer |
@@ -144,8 +204,8 @@ cargo build --release
 ./target/release/pstore
 ```
 
-**No other prerequisites.** pstore downloads the model and the `llama-cli` that runs it on
-first use, from the Models window. To build without local inference at all:
+**No other prerequisites.** pstore downloads the model and the `llama-completion` binary that
+runs it on first use, from the Models window. To build without local inference at all:
 
 ```bash
 cargo build --release --no-default-features
@@ -213,7 +273,7 @@ pstore/
 │   ├── config.rs            # Layered config (system → user → local) & preferences
 │   ├── filter.rs            # Which models policy permits: glob patterns, allow/block
 │   ├── models.rs            # Checkpoint catalogue + download status board
-│   ├── runtime.rs           # Finding/fetching/verifying the llama-cli that runs it
+│   ├── runtime.rs           # Finding/fetching/verifying the binary that runs it
 │   ├── plan.rs              # Planning instruction + structural checks on the result
 │   ├── shrink.rs            # Compression instruction + integrity checks
 │   ├── hints.rs             # Hint subjects (selection, question, or both) + composition
@@ -240,7 +300,7 @@ pstore/
 - **Snapshot-based undo** — Coalesces typing into word/line granules. Programmatic edits are single atomic steps.
 - **Static agent registry** — All agent CLIs and model specs in one file. One-line updates for flag changes.
 - **The model does the judging** — Ranking is a prompt, not a formula. No hand-maintained skill vectors to go stale.
-- **Subprocess inference** — The model runs as a `llama-cli` child process, the same way agents do. Nothing is linked in, nothing stays resident.
+- **Subprocess inference** — The model runs as a `llama-completion` child process, the same way agents do. Nothing is linked in, nothing stays resident, and a run still generating is killed when the app quits rather than orphaned with the weights mapped.
 - **No silent degradation** — Model-dependent features are disabled with a reason when the model is unavailable, never quietly replaced by something worse.
 - **Nothing applied unreviewed** — Shrink, plan and sanitize all propose a diff. Accepting is one undo step, and the previous text is already in version history.
 - **egui/eframe** — Native GUI, no Electron. Small binary, fast startup, cross-platform.

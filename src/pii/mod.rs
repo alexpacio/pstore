@@ -273,7 +273,7 @@ pub fn segments(text: &str, max_chars: usize) -> Vec<(usize, &str)> {
 
 /// Find personal data in `text`.
 ///
-/// Blocking — the model is a subprocess that maps 3.8 GB of weights before it answers, so
+/// Blocking — the model is a subprocess that maps 7.17 GB of weights before it answers, so
 /// call this from a worker thread.
 ///
 /// Returns the reason on failure rather than an empty plan. An empty plan means "nothing
@@ -474,7 +474,7 @@ mod tests {
         assert!(!segments("abc", 0).is_empty());
     }
 
-    /// An empty prompt must not cost a model invocation: `llama-cli` would map 3.8 GB of
+    /// An empty prompt must not cost a model invocation: `llama-cli` would map 7.17 GB of
     /// weights to find nothing in nothing.
     #[test]
     fn nothing_to_scan_is_not_a_model_call() {

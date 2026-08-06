@@ -14,7 +14,7 @@
 //! * the **status board** ([`phase`], [`set`], [`snapshot`]) — a small shared table the
 //!   worker threads write and the UI polls once per frame. Fetching weights happens deep
 //!   inside a worker thread; without somewhere neutral to record "downloading, 40% of
-//!   3.8 GB" the GUI could only show a spinner.
+//!   7.17 GB" the GUI could only show a spinner.
 //!
 //! The `llama-cli` binary that runs these weights is provisioned separately — see
 //! [`crate::runtime`], which reports into this same board.
@@ -50,30 +50,102 @@ impl Checkpoint {
     }
 }
 
-/// Bonsai 27B, 1-bit: the one model behind routing, difficulty and PII.
+/// 1-bit Bonsai 27B — the small operating point.
 ///
-/// PrismML's binary-weight build of Qwen3.6-27B. 3.8 GB of weights holding a 27B model,
-/// which is why it replaced three purpose-built encoders totalling 2.8 GB and still costs
-/// less memory than the ternary build of the same model (7.17 GB). The trade is ~89.5% of
-/// FP16 quality against the ternary build's 94.6% — worth it here, where every task
-/// (rating six dimensions 0–1, extracting typed spans) sits far below what a 27B can do.
+/// Binary `{−1, +1}` weights at a true 1.125 bits: a 27B model in 3.8 GB, which is what makes
+/// it fit machines the ternary build does not. It retains 89.5% of FP16 on the card's
+/// aggregate.
 ///
-/// Only the language weights are listed. The repository also ships an `mmproj` vision
-/// tower and a `dspark` speculative-decoding drafter; pstore sends no images and gains
-/// nothing from a drafter on one-shot invocations, so fetching either would be paying
-/// gigabytes for capacity that never loads.
-pub const LLM: Checkpoint = Checkpoint {
-    id: "llm",
+/// It is **not** the default, and the reason is specific rather than a benchmark table.
+/// Routing is instruction-following and judgement, which are the two categories this build
+/// gives up most on — IFBench 52.4 and τ²-Bench 61.3, against FP16's 68.0 and 82.9. Asked to
+/// rank fifteen (model, effort) pairs for a hard three-file refactor it answered
+/// `Haiku 4.5, effort medium` and then indices 2, 3, 4 and 5 in order, scoring all five
+/// `fit: 85` with a copy-pasted reason. Choose it when memory is the binding constraint, and
+/// expect the ranking to be coarser.
+pub const LLM_1BIT: Checkpoint = Checkpoint {
+    id: "llm-1bit",
     title: "Bonsai 27B (1-bit)",
-    purpose: "scores capability and difficulty, and finds personal data",
+    purpose: "ranks the installed models against a prompt, and finds personal data",
     repo: "prism-ml/Bonsai-27B-gguf",
     files: &["Bonsai-27B-Q1_0.gguf"],
     bytes: 3_800_000_000,
     license: "Apache-2.0",
 };
 
+/// Ternary Bonsai 27B — the quality operating point, and the default.
+///
+/// Ternary `{−1, 0, +1}` weights at a true 1.71 bits, 7.17 GB deployed, 94.6% of FP16. The
+/// extra zero state is a more expressive alphabet, and on the judgement-shaped work pstore
+/// asks for it is the difference between a ranking and a list.
+///
+/// It costs 3.4 GB more on disk and in memory, and roughly twice the bytes moved per decoded
+/// token — see [`crate::router::llm`] for what that means in seconds.
+pub const LLM_TERNARY: Checkpoint = Checkpoint {
+    id: "llm-ternary",
+    title: "Bonsai 27B (ternary)",
+    purpose: "ranks the installed models against a prompt, and finds personal data",
+    repo: "prism-ml/Ternary-Bonsai-27B-gguf",
+    files: &["Ternary-Bonsai-27B-Q2_0.gguf"],
+    bytes: 7_170_000_000,
+    license: "Apache-2.0",
+};
+
 /// Every checkpoint, in the order the Models window lists them.
-pub const ALL: [Checkpoint; 1] = [LLM];
+///
+/// Two entries, and pstore runs exactly one of them — whichever
+/// [`crate::config::Prefs::local_model`] names. They are offered side by side rather than
+/// decided here because the trade is a judgement about *this* machine: a laptop with 16 GB
+/// and one with 64 GB should not be given the same answer. Both may sit on disk at once; only
+/// the selected one is ever run, and only its absence blocks anything.
+///
+/// Neither entry lists the `mmproj` vision tower or the `dspark` drafter their repositories
+/// also ship. pstore sends no images; and the drafter — lossless though it is, since
+/// verification preserves the target distribution exactly — measures 1.34× on the CUDA
+/// serving path, is not enabled by PrismML on Apple Silicon at all because a batch-1
+/// verification pass does not amortise there, and would only touch generation, which is under
+/// half of a ranking call.
+pub const ALL: [Checkpoint; 2] = [LLM_TERNARY, LLM_1BIT];
+
+/// Which preference value selects the checkpoint with this id, if any.
+///
+/// Returns `None` for a catalogue entry that is not one of the two selectable builds, so the
+/// Models window can render such a row without a radio button rather than having to know
+/// which ids are special.
+pub fn choice_for(id: &str) -> Option<crate::config::LocalModel> {
+    match id {
+        _ if id == LLM_1BIT.id => Some(crate::config::LocalModel::OneBit),
+        _ if id == LLM_TERNARY.id => Some(crate::config::LocalModel::Ternary),
+        _ => None,
+    }
+}
+
+/// The one line that decides the choice, for the row in the Models window.
+///
+/// Kept here beside the checkpoints rather than in the UI: it is a claim about the weights,
+/// and it should change when they do.
+pub fn tradeoff(id: &str) -> &'static str {
+    match id {
+        _ if id == LLM_1BIT.id => {
+            "89.5% of FP16 · ~5 GB peak · faster per token, and coarser — it ranked a hard \
+             three-file refactor to the cheapest model at medium effort"
+        }
+        _ if id == LLM_TERNARY.id => {
+            "94.6% of FP16 · ~8.4 GB peak · about half the tokens per second, and the one \
+             that separates a shortlist instead of listing it"
+        }
+        _ => "",
+    }
+}
+
+/// The checkpoint pstore will actually run right now.
+///
+/// Read at every use rather than cached, so switching build in the Models window takes effect
+/// on the next call instead of the next launch. Nothing is resident between calls anyway —
+/// each one is a fresh subprocess — so there is no loaded model to invalidate.
+pub fn active() -> Checkpoint {
+    crate::config::prefs_snapshot().local_model.checkpoint()
+}
 
 /// Where a checkpoint currently is.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -279,7 +351,7 @@ pub fn is_cached(_c: &Checkpoint) -> bool {
 /// Reuses anything already cached, so calling it on a complete checkpoint is quick and
 /// harmless. Returns the reason on failure, which the Models window shows verbatim.
 ///
-/// `cancel` is honoured **mid-transfer**, between one-megabyte chunks, so stopping a 3.8 GB
+/// `cancel` is honoured **mid-transfer**, between one-megabyte chunks, so stopping a 7.17 GB
 /// download is immediate. The partial file is kept and the next attempt resumes from it.
 #[cfg(feature = "local-llm")]
 pub fn download(c: &Checkpoint, cancel: &std::sync::atomic::AtomicBool) -> Result<(), String> {
@@ -427,11 +499,17 @@ mod tests {
     /// on. Tests run in parallel; shared state has to be shared carefully.
     #[test]
     fn board_round_trips_and_ignores_unknown_ids() {
-        set(LLM.id, Phase::Loading);
-        assert_eq!(phase(LLM.id), Phase::Loading);
+        set(LLM_TERNARY.id, Phase::Loading);
+        assert_eq!(phase(LLM_TERNARY.id), Phase::Loading);
         assert!(any_busy());
-        set(LLM.id, Phase::Ready);
-        assert_eq!(phase(LLM.id), Phase::Ready);
+        set(LLM_TERNARY.id, Phase::Ready);
+        assert_eq!(phase(LLM_TERNARY.id), Phase::Ready);
+
+        // Each build has its own row: marking one must say nothing about the other, or
+        // downloading the spare would read as the selected one being ready.
+        assert_ne!(LLM_1BIT.id, LLM_TERNARY.id);
+        set(LLM_1BIT.id, Phase::Absent);
+        assert_eq!(phase(LLM_TERNARY.id), Phase::Ready);
 
         // An unknown id is dropped rather than added, so a typo cannot invent a row.
         set("not-a-checkpoint", Phase::Ready);
@@ -439,18 +517,57 @@ mod tests {
 
         let snap = snapshot();
         assert_eq!(snap.len(), ALL.len());
-        assert_eq!(snap[0].0.id, LLM.id);
+        assert_eq!(snap[0].0.id, LLM_TERNARY.id);
 
-        // Hand the row back to the cache's own answer.
-        set(LLM.id, Phase::Absent);
+        // Hand the rows back to the cache's own answer.
+        set(LLM_TERNARY.id, Phase::Absent);
         probe_cache();
-        assert_ne!(phase(LLM.id), Phase::Unknown);
+        assert_ne!(phase(LLM_TERNARY.id), Phase::Unknown);
     }
 
     #[test]
     fn sizes_read_in_familiar_units() {
         assert_eq!(bytes_label(500), "500 B");
         assert_eq!(bytes_label(795_276_408), "795 MB");
-        assert_eq!(bytes_label(LLM.bytes), "3.80 GB");
+        assert_eq!(bytes_label(LLM_TERNARY.bytes), "7.17 GB");
+        assert_eq!(bytes_label(LLM_1BIT.bytes), "3.80 GB");
+    }
+
+    /// Every selectable build must be reachable from a preference value and back, or the
+    /// Models window can offer a radio button that selects nothing.
+    #[test]
+    fn every_build_round_trips_through_its_preference() {
+        use crate::config::LocalModel;
+
+        for c in ALL.iter() {
+            let choice =
+                choice_for(c.id).unwrap_or_else(|| panic!("{} has no preference value", c.id));
+            assert_eq!(choice.checkpoint().id, c.id);
+            assert!(!tradeoff(c.id).is_empty(), "{} has no stated trade", c.id);
+        }
+        assert_eq!(choice_for("not-a-checkpoint"), None);
+
+        // The default has to be one of the two, and it is the quality one.
+        assert_eq!(LocalModel::default().checkpoint().id, LLM_TERNARY.id);
+    }
+
+    /// The preference is written by hand into a config file, so it serialises as the words a
+    /// person would type — not as Rust variant names.
+    #[test]
+    fn the_preference_serialises_as_readable_names() {
+        use crate::config::LocalModel;
+
+        assert_eq!(
+            serde_json::to_string(&LocalModel::OneBit).unwrap(),
+            "\"1-bit\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LocalModel::Ternary).unwrap(),
+            "\"ternary\""
+        );
+        assert_eq!(
+            serde_json::from_str::<LocalModel>("\"1-bit\"").unwrap(),
+            LocalModel::OneBit
+        );
     }
 }
