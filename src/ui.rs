@@ -51,6 +51,7 @@ impl eframe::App for Ui {
         egui::CentralPanel::default().show(ui, |ui| self.editor_pane(ui));
 
         self.shrink_window(&ctx);
+        self.plan_window(&ctx);
         self.pii_window(&ctx);
         self.models_window(&ctx);
         self.error_window(&ctx);
@@ -58,6 +59,7 @@ impl eframe::App for Ui {
         // A job may be streaming output or a download may be moving, so keep repainting
         // while anything runs.
         if self.app.shrink_job.is_some()
+            || self.app.plan_job.is_some()
             || self.app.pii_job.is_some()
             || self.app.hint.as_ref().is_some_and(|h| h.job.is_some())
             || crate::models::any_busy()
@@ -150,6 +152,28 @@ impl Ui {
                 self.app.request_shrink();
             }
 
+            let planning = self.app.plan_job.is_some();
+            if planning {
+                ui.spinner();
+                if ui
+                    .button("Stop plan")
+                    .on_hover_text("Kill the agent process and keep the prompt as it is")
+                    .clicked()
+                {
+                    self.app.cancel_plan();
+                }
+            } else if ui
+                .button("Plan")
+                .on_hover_text(
+                    "Rewrite this into a structured instruction for a coding agent — \
+                     objective, ordered steps, constraints and acceptance criteria. The \
+                     result is the next prompt, not a document to read.",
+                )
+                .clicked()
+            {
+                self.app.request_plan();
+            }
+
             let scanning = self.app.pii_job.is_some();
             if scanning {
                 ui.spinner();
@@ -187,7 +211,13 @@ impl Ui {
                 .app
                 .pinned_agent
                 .clone()
-                .or_else(|| self.app.ranking.best().map(|c| c.agent_id.to_string()))
+                .or_else(|| {
+                    self.app
+                        .ranking
+                        .as_ref()
+                        .and_then(|r| r.best())
+                        .map(|c| c.agent_id.to_string())
+                })
                 .unwrap_or_else(|| "—".into());
             egui::ComboBox::from_label("target")
                 .selected_text(current)
@@ -225,7 +255,7 @@ impl Ui {
 
             if ui
                 .button("Models…")
-                .on_hover_text("Download and load the local classifiers and the PII tagger")
+                .on_hover_text("Download the local model and the llama-cli that runs it")
                 .clicked()
             {
                 self.app.models_open = true;
@@ -454,6 +484,9 @@ impl Ui {
             ui.separator();
             ui.horizontal_wrapped(|ui| {
                 let ready = !hint.answer.trim().is_empty();
+                if ready {
+                    copy_button(ui, &hint.answer, "Copy");
+                }
                 if ui
                     .add_enabled(ready, egui::Button::new("Insert at caret"))
                     .clicked()
@@ -482,11 +515,9 @@ impl Ui {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.weak(&self.app.status);
-            ui.separator();
-            ui.weak(format!("classifier: {}", self.app.backend));
 
-            // The model board, as a button: the commonest reason a reading is a fallback
-            // is a checkpoint that was never downloaded, and this is where that is fixed.
+            // The model board, as a button: the commonest reason ranking is unavailable is
+            // a checkpoint or a runtime that was never downloaded, fixed from here.
             ui.separator();
             let busy = crate::models::any_busy();
             if busy {
@@ -500,78 +531,38 @@ impl Ui {
                 self.app.models_open = true;
             }
 
-            if let Some(reading) = &self.app.reading {
-                ui.separator();
-                let (dim, score) = reading.capability.dominant();
-                let mut text = format!(
-                    "{} · mostly {dim} ({:.2}) · via {}",
-                    reading.complexity, score, reading.source
-                );
-                if let Some(c) = reading.confidence {
-                    text.push_str(&format!(" ({:.0}% sure)", c * 100.0));
-                }
-                let label = ui.weak(text);
-                let mut tooltip = String::new();
-                if let Some(s) = reading.difficulty_score {
-                    tooltip.push_str(&format!("complexity score {s:.3}\n"));
-                }
-                if let Some((task, p)) = reading.task {
-                    tooltip.push_str(&format!("task: {task} ({:.0}%)\n", p * 100.0));
-                }
-                if let Some(d) = &reading.difficulty_detail {
-                    let detail = d
-                        .notable(0.15)
-                        .iter()
-                        .map(|(n, v)| format!("{n} {v:.2}"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    if !detail.is_empty() {
-                        tooltip.push_str(&format!("drivers: {detail}\n"));
-                    }
-                }
-                if let Some(why) = &reading.fallback_reason {
-                    tooltip.push_str(&format!("degraded to the built-in estimate: {why}"));
-                }
-                if !tooltip.is_empty() {
-                    label.on_hover_text(tooltip.trim_end().to_string());
-                }
-                // A reading with no model behind it is a working answer, not an error —
-                // but it should be one click from being a better one.
-                if !reading.source.uses_a_model()
-                    && ui
-                        .small_button("use the classifiers")
-                        .on_hover_text(
-                            "This reading came from the built-in estimate. Download the \
-                             classifiers to score with the trained models instead.",
-                        )
-                        .clicked()
-                {
-                    self.app.models_open = true;
-                }
-            }
             if let Some(inv) = self.app.invocation_hint() {
                 ui.separator();
                 ui.weak(inv);
             }
         });
 
-        if !self.app.ranking.candidates.is_empty() {
+        if self
+            .app
+            .ranking
+            .as_ref()
+            .is_some_and(|r| !r.choices.is_empty())
+        {
             ui.separator();
             self.ranking_table(ui);
         }
     }
 
-    /// The scored field. Every model and effort combination, with its score — the
-    /// point being that the developer sees the whole picture rather than a single
-    /// automatic pick.
+    /// The model's shortlist: its best few (agent, model, effort) combinations, each with
+    /// its own reason for being there.
     fn ranking_table(&mut self, ui: &mut egui::Ui) {
+        let Some(ranking) = self.app.ranking.clone() else {
+            return;
+        };
         ui.horizontal(|ui| {
-            ui.strong(format!("{} candidates", self.app.ranking.candidates.len()));
+            ui.strong(format!(
+                "top {} of {} combinations",
+                ranking.choices.len(),
+                ranking.considered
+            ));
             ui.checkbox(&mut self.show_all_candidates, "show all");
-            if !self.app.ranking.excluded.is_empty() {
-                let text = self
-                    .app
-                    .ranking
+            if !ranking.excluded.is_empty() {
+                let text = ranking
                     .excluded
                     .iter()
                     .map(|(id, why)| format!("{id}: {why}"))
@@ -594,7 +585,7 @@ impl Ui {
                     .num_columns(6)
                     .striped(true)
                     .show(ui, |ui| {
-                        ui.strong("score");
+                        ui.strong("fit");
                         ui.strong("agent");
                         ui.strong("model");
                         ui.strong("effort");
@@ -602,8 +593,8 @@ impl Ui {
                         ui.strong("why");
                         ui.end_row();
 
-                        for c in self.app.ranking.candidates.iter().take(limit) {
-                            ui.label(format!("{:.0}", c.score));
+                        for c in ranking.choices.iter().take(limit) {
+                            ui.label(format!("{:.0}", c.fit));
                             ui.label(c.agent_display);
                             ui.label(c.model_display);
                             let effort = if c.effort_selectable {
@@ -617,26 +608,88 @@ impl Ui {
                                 "this agent has no effort flag — shown as a prediction"
                             });
                             ui.label(format!("{:.1}×", c.relative_latency))
-                                .on_hover_text("time to answer, relative to the fastest candidate");
-                            let mut why = format!(
-                                "relative token price {:.1}× — shown for information; \
-                                 it is not part of the score",
-                                c.relative_price
-                            );
+                                .on_hover_text("time to answer, relative to the fastest choice");
+                            let mut why = format!("relative token price {:.1}×", c.relative_price);
                             if c.metered {
                                 why.push_str(
-                                    "\n\nThis model is billed per token rather than covered \
-                                     by the subscription. Its score is its real fit, but it \
-                                     is only picked automatically when it fits better than \
-                                     every included model by a clear margin — pick it from \
-                                     the target list to use it anyway.",
+                                    "\n\nBilled per token rather than covered by the \
+                                     subscription — the model was told this when ranking.",
                                 );
                             }
-                            ui.label(c.rationale()).on_hover_text(why);
+                            let reason = if c.rationale.is_empty() {
+                                "—".to_string()
+                            } else {
+                                c.rationale.clone()
+                            };
+                            ui.label(reason).on_hover_text(why);
                             ui.end_row();
                         }
                     });
             });
+    }
+
+    fn plan_window(&mut self, ctx: &egui::Context) {
+        let Some(proposal) = self.app.plan.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut accept = false;
+        let mut reject = false;
+
+        egui::Window::new("Review plan")
+            .open(&mut open)
+            .default_width(760.0)
+            .default_height(560.0)
+            .show(ctx, |ui| {
+                ui.strong("An instruction to paste into a coding agent");
+                ui.weak(
+                    "Not a document to read — it is the next prompt. Copy it straight out, \
+                     or accept it to replace the one you are editing.",
+                );
+                for w in &proposal.warnings {
+                    ui.colored_label(egui::Color32::from_rgb(200, 120, 40), format!("⚠ {w}"));
+                }
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    copy_button(ui, &proposal.after, "Copy plan");
+                    ui.weak(format!("{} characters", proposal.after.len()));
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("plan-text")
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        ui.monospace(&proposal.after);
+                    });
+
+                ui.separator();
+                ui.collapsing("Diff against the current prompt", |ui| {
+                    diff_view(ui, &proposal.diff, "plan-diff");
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Replace prompt")
+                        .on_hover_text("Overwrite the open prompt with this plan")
+                        .clicked()
+                    {
+                        accept = true;
+                    }
+                    if ui.button("Discard").clicked() {
+                        reject = true;
+                    }
+                    ui.weak("Accepting is a single undo step.");
+                });
+            });
+
+        if accept {
+            self.app.accept_plan();
+        } else if reject || !open {
+            self.app.reject_plan();
+        }
     }
 
     fn shrink_window(&mut self, ctx: &egui::Context) {
@@ -663,6 +716,9 @@ impl Ui {
                     );
                 }
                 ui.separator();
+                ui.horizontal(|ui| {
+                    copy_button(ui, &proposal.after, "Copy shortened prompt");
+                });
                 diff_view(ui, &proposal.diff, "shrink-diff");
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -689,6 +745,47 @@ impl Ui {
     /// back: the size is stated before the download starts, the progress is visible while
     /// it runs, and a failure is shown here with its reason rather than swallowed into a
     /// heuristic fallback.
+    /// The `llama-cli` that executes the checkpoint, and where it came from.
+    ///
+    /// Shown as its own row because it is a separate thing that can independently be
+    /// missing: weights with nothing to run them fail exactly as visibly as no weights,
+    /// and "which binary is this?" is the first question when inference misbehaves.
+    fn runtime_row(&mut self, ui: &mut egui::Ui, busy: bool) {
+        ui.horizontal(|ui| {
+            ui.strong("llama-cli runtime");
+            ui.weak(format!("· {}", crate::runtime::RELEASE_TAG));
+        });
+        ui.weak("runs the checkpoint as a subprocess; PrismML's fork of llama.cpp");
+
+        let prefs_path = self.app.config.prefs.llama_cli_path.clone();
+        match crate::runtime::locate(prefs_path.as_deref()) {
+            Some(rt) => {
+                ui.weak(format!("{} · {}", rt.path.display(), rt.origin));
+            }
+            None => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(200, 120, 40),
+                    format!(
+                        "⚠ {}",
+                        crate::runtime::missing_reason(prefs_path.as_deref())
+                    ),
+                );
+                if let Ok(asset) = crate::runtime::asset() {
+                    ui.weak(format!(
+                        "pstore will fetch {} with the model, and check it against its \
+                         published SHA256 before installing it.",
+                        crate::models::bytes_label(asset.bytes)
+                    ));
+                }
+            }
+        }
+
+        if let Some(fraction) = crate::runtime::progress().fraction() {
+            ui.add(egui::ProgressBar::new(fraction).show_percentage());
+        }
+        let _ = busy;
+    }
+
     fn models_window(&mut self, ctx: &egui::Context) {
         if !self.app.models_open {
             return;
@@ -704,13 +801,12 @@ impl Ui {
             .default_width(680.0)
             .show(ctx, |ui| {
                 ui.label(
-                    "pstore runs these itself, in this process, on this machine. They are \
-                     downloaded once from Hugging Face and then never contacted again — \
-                     no prompt text is sent anywhere by scoring or sanitising.",
+                    "pstore runs this itself, on this machine. It is downloaded once from \
+                     Hugging Face and then never contacted again — no prompt text is sent \
+                     anywhere by ranking or sanitising.",
                 );
-                ui.weak(format!("compute backend: {}", self.app.backend));
 
-                // Said once, up front: without Candle compiled in, no download can help,
+                // Said once, up front: without local inference compiled in, no download can help,
                 // and every row below would otherwise imply one could.
                 if !crate::models::LOCAL_INFERENCE {
                     ui.colored_label(
@@ -719,11 +815,13 @@ impl Ui {
                     );
                     ui.label(
                         "Rebuild with the default features — `cargo build --release` — to \
-                         enable the classifiers and the PII tagger. Until then routing uses \
-                         the built-in estimate and sanitising uses the checksum-backed \
-                         patterns; everything else works as normal.",
+                         enable ranking and the personal-data scan. Until then those two \
+                         actions are unavailable; everything else works as normal.",
                     );
                 }
+                ui.separator();
+
+                self.runtime_row(ui, busy);
                 ui.separator();
 
                 let usable = crate::models::LOCAL_INFERENCE;
@@ -824,18 +922,82 @@ impl Ui {
                     }
                 });
 
-                ui.checkbox(
-                    &mut self.app.config.prefs.allow_model_download,
-                    "Allow downloading weights from Hugging Face",
-                )
-                .on_hover_text(
-                    "Off means pstore never reaches the network: scoring falls back to the \
-                     built-in estimate and sanitising to the checksum-backed patterns.",
-                );
+                let mut prefs_changed = false;
+                prefs_changed |= ui
+                    .checkbox(
+                        &mut self.app.config.prefs.allow_model_download,
+                        "Allow downloading the model and its runtime",
+                    )
+                    .on_hover_text(
+                        "Off means pstore never reaches the network. Ranking and the \
+                         personal-data scan are then unavailable rather than degraded — \
+                         there is no second implementation behind them.",
+                    )
+                    .changed();
                 ui.weak(
                     "Weights land in the shared Hugging Face cache (~/.cache/huggingface), \
-                     so other tools reuse them and pstore stores nothing of its own.",
+                     so other tools reuse them. Only the llama-cli binary is stored by \
+                     pstore itself.",
                 );
+
+                ui.collapsing("Advanced", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Context ceiling");
+                        let mut ceiling = self.app.config.prefs.model_context_ceiling as u32;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut ceiling)
+                                    .range(512..=131_072)
+                                    .speed(64),
+                            )
+                            .on_hover_text(
+                                "An upper bound, not a setting: each call asks for only as \
+                                 much context as its prompt needs, normally far below this. \
+                                 Lower it to cap memory on a small machine; raising it costs \
+                                 KV cache roughly linearly.",
+                            )
+                            .changed()
+                        {
+                            self.app.config.prefs.model_context_ceiling = ceiling as usize;
+                            prefs_changed = true;
+                        }
+                        ui.weak("tokens");
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("llama-cli path");
+                        let mut path = self
+                            .app
+                            .config
+                            .prefs
+                            .llama_cli_path
+                            .clone()
+                            .unwrap_or_default();
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut path)
+                                    .hint_text("leave blank to use the downloaded one")
+                                    .desired_width(320.0),
+                            )
+                            .on_hover_text(
+                                "Point at your own build. It must be PrismML's fork — stock \
+                                 llama.cpp cannot load this checkpoint's quantisation.",
+                            )
+                            .changed()
+                        {
+                            self.app.config.prefs.llama_cli_path =
+                                (!path.trim().is_empty()).then_some(path);
+                            prefs_changed = true;
+                        }
+                    });
+                });
+
+                if prefs_changed {
+                    // The model runs on a worker thread and reads these from the shared
+                    // snapshot, so a change that is not published never takes effect.
+                    crate::config::publish(&self.app.config.prefs);
+                    self.app.config.prefs.save(&self.app.config.dir);
+                }
             });
 
         if cancel {
@@ -873,29 +1035,6 @@ impl Ui {
                     ui.separator();
                     ui.weak(format!("via {}", review.scan.source_label()));
                 });
-                if let Some(why) = &review.scan.fallback_reason {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 120, 40),
-                        format!("⚠ the tagger did not run — {why}"),
-                    );
-                    ui.weak(
-                        "Checksum-backed identifiers (IBAN, cards, codice fiscale, VAT, \
-                         email) were still checked, but names, addresses and \
-                         organisations need the tagger.",
-                    );
-                    // Which remedy applies depends on why: a missing download is a click
-                    // away, a missing feature needs a rebuild.
-                    if crate::models::LOCAL_INFERENCE {
-                        if ui.button("Open Models…").clicked() {
-                            self.app.models_open = true;
-                        }
-                    } else {
-                        ui.weak(
-                            "Rebuild with the default features — `cargo build --release` — \
-                             to enable it.",
-                        );
-                    }
-                }
                 ui.weak(
                     "Nothing here has left this machine, and the values below are not \
                      written to disk. The text you replace stays recoverable from version \
@@ -942,7 +1081,7 @@ impl Ui {
                     .max_height(220.0)
                     .show(ui, |ui| {
                         egui::Grid::new("pii-grid")
-                            .num_columns(6)
+                            .num_columns(5)
                             .striped(true)
                             .show(ui, |ui| {
                                 ui.strong("mask");
@@ -950,7 +1089,6 @@ impl Ui {
                                 ui.strong("found");
                                 ui.strong("becomes");
                                 ui.strong("sure");
-                                ui.strong("how");
                                 ui.end_row();
 
                                 for (i, item) in review.scan.plan.items.iter().enumerate() {
@@ -966,11 +1104,6 @@ impl Ui {
                                     // Shown rather than hidden in a tooltip: a hesitant
                                     // finding is exactly the one worth unticking.
                                     ui.label(format!("{:.0}%", item.finding.score * 100.0));
-                                    ui.label(item.finder_label()).on_hover_text(
-                                        "\"checked pattern\" means the value satisfied its \
-                                         own check digit, so it is certain; \"tagger\" is \
-                                         the model's read of the surrounding text.",
-                                    );
                                     ui.end_row();
                                 }
                             });
@@ -992,6 +1125,12 @@ impl Ui {
                         .clicked()
                     {
                         accept = true;
+                    }
+                    // Copying the masked text without applying it is the safer habit: the
+                    // prompt stays as written, and what leaves the machine is sanitised.
+                    if review.scan.plan.enabled() > 0 {
+                        let masked = review.scan.plan.apply(&self.app.buffer.text);
+                        copy_button(ui, &masked, "Copy masked prompt");
                     }
                     if ui.button("Discard").clicked() {
                         reject = true;
@@ -1053,6 +1192,22 @@ impl Ui {
 }
 
 /// Render a unified diff with per-line colouring.
+/// A button that puts `text` on the system clipboard.
+///
+/// Every produced artefact gets one. The whole workflow ends in pasting something into an
+/// agent, a terminal or a chat window, and selecting a monospace block inside a scroll area
+/// with the mouse is both fiddly and easy to get subtly wrong — a missing first character
+/// in a prompt is not obvious until the agent misbehaves.
+fn copy_button(ui: &mut egui::Ui, text: &str, label: &str) {
+    if ui
+        .button(format!("⧉ {label}"))
+        .on_hover_text("Copy to the clipboard")
+        .clicked()
+    {
+        ui.ctx().copy_text(text.to_string());
+    }
+}
+
 fn diff_view(ui: &mut egui::Ui, diff: &str, salt: &str) {
     egui::ScrollArea::both()
         .id_salt(salt)

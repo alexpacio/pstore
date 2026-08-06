@@ -9,28 +9,40 @@
 //! explicit second step, and one undo step when taken.
 
 /// What the developer is asking about.
+///
+/// Three cases rather than two. Selecting a passage *and* typing a question about it is the
+/// normal way to use this — "is this constraint specific enough?" only means anything
+/// alongside the constraint — so it gets its own variant instead of being flattened into a
+/// question with the selection glued on. The distinction survives into [`compose`], which
+/// can then tell the agent which part is the subject and which part is the ask.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Subject {
-    /// Text selected in the editor.
+    /// Text selected in the editor, with no question typed.
     Selection(String),
-    /// A question typed into the hint box.
+    /// A question typed into the hint box, with nothing selected.
     Question(String),
+    /// A question about a specific selection.
+    About {
+        /// The selected passage.
+        selection: String,
+        /// What they want to know about it.
+        question: String,
+    },
 }
 
 impl Subject {
     /// Build a subject from the current selection and question box.
     ///
-    /// A selection wins when present; otherwise the typed question is used. Returns
-    /// `None` when there is nothing to ask about.
+    /// Returns `None` only when both are empty — a selection does not suppress the
+    /// question box, and typing one does not discard the selection.
     pub fn resolve(selection: Option<&str>, question: &str) -> Option<Self> {
         let q = question.trim();
         match selection.map(str::trim).filter(|s| !s.is_empty()) {
             Some(sel) if q.is_empty() => Some(Subject::Selection(sel.to_string())),
-            // Both present: the question is what they actually want to know, and the
-            // selection rides along as the thing it's about.
-            Some(sel) => Some(Subject::Question(format!(
-                "About this part of my prompt:\n\n{sel}\n\n{q}"
-            ))),
+            Some(sel) => Some(Subject::About {
+                selection: sel.to_string(),
+                question: q.to_string(),
+            }),
             None if !q.is_empty() => Some(Subject::Question(q.to_string())),
             None => None,
         }
@@ -41,6 +53,7 @@ impl Subject {
         match self {
             Subject::Selection(_) => "selection",
             Subject::Question(_) => "question",
+            Subject::About { .. } => "question about the selection",
         }
     }
 
@@ -48,6 +61,7 @@ impl Subject {
     pub fn text(&self) -> &str {
         match self {
             Subject::Selection(s) | Subject::Question(s) => s,
+            Subject::About { question, .. } => question,
         }
     }
 }
@@ -83,6 +97,17 @@ pub fn compose(subject: &Subject, document: &str) -> String {
         Subject::Question(q) => {
             out.push_str("\n\nTheir question:\n\n");
             out.push_str(q);
+        }
+        // Kept apart so the agent can tell the passage from the ask. Concatenating them
+        // reads as one long question and the answer drifts off the selection.
+        Subject::About {
+            selection,
+            question,
+        } => {
+            out.push_str("\n\nThey selected this part of the prompt:\n\n");
+            out.push_str(selection);
+            out.push_str("\n\nand asked about it:\n\n");
+            out.push_str(question);
         }
     }
     out
@@ -123,15 +148,37 @@ mod tests {
         assert_eq!(s.text(), "how do I phrase the constraint?");
     }
 
+    /// The case the hint panel is actually for: highlight something, ask about it. Neither
+    /// input suppresses the other, and both reach the agent as distinct things.
     #[test]
-    fn both_present_keeps_the_question_and_quotes_the_selection() {
+    fn a_selection_and_a_question_are_both_kept() {
         let s = Subject::resolve(Some("retry three times"), "is this specific enough?").unwrap();
-        assert_eq!(s.label(), "question");
-        assert!(
-            s.text().contains("retry three times"),
-            "selection must ride along"
+        assert_eq!(
+            s,
+            Subject::About {
+                selection: "retry three times".into(),
+                question: "is this specific enough?".into(),
+            }
         );
-        assert!(s.text().contains("is this specific enough?"));
+        assert_eq!(s.label(), "question about the selection");
+        assert_eq!(
+            s.text(),
+            "is this specific enough?",
+            "the ask, not the passage"
+        );
+
+        // What the agent receives has to distinguish them, or the answer drifts off the
+        // selection and onto the prompt as a whole.
+        let composed = compose(&s, "Write a retry policy. retry three times. Log failures.");
+        assert!(composed.contains("retry three times"));
+        assert!(composed.contains("is this specific enough?"));
+        let sel_at = composed
+            .find("They selected this part")
+            .expect("selection framing");
+        let q_at = composed
+            .find("and asked about it")
+            .expect("question framing");
+        assert!(sel_at < q_at, "the passage should come before the ask");
     }
 
     #[test]

@@ -128,6 +128,50 @@ impl Savings {
     }
 }
 
+/// Whether a token looks like a file path or filename.
+///
+/// Deliberately stricter than "contains a dot": a sentence-final `README.` or an `e.g.`
+/// must not read as a file reference, or the integrity check reports paths that were
+/// never there.
+pub fn looks_like_path(token: &str) -> bool {
+    let t = token.trim_matches(|c: char| {
+        !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+    });
+    if t.len() < 3 || t.starts_with("http") {
+        return false;
+    }
+    if t.contains('/') && t.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return true;
+    }
+    // `name.ext` with a plausible extension.
+    match t.rsplit_once('.') {
+        Some((stem, ext)) => {
+            !stem.is_empty()
+                && (1..=5).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// The path a token refers to, with surrounding punctuation removed.
+///
+/// `looks_like_path` tolerates a trailing `.` because `retry.rs.` at the end of a sentence
+/// is still a path. Comparing the two texts needs the *same* string on both sides, though,
+/// and the rewrite will not have kept the sentence — so the trailing dot has to go before
+/// anything is compared, or every path that ended a sentence reads as dropped.
+pub fn path_token(token: &str) -> Option<String> {
+    if !looks_like_path(token) {
+        return None;
+    }
+    let trimmed = token
+        .trim_matches(|c: char| {
+            !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+        })
+        .trim_end_matches('.');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// Things that must appear in the rewrite as often as in the original.
 ///
 /// A cheap structural check before showing the diff: if a code fence or a file path
@@ -144,17 +188,7 @@ pub fn integrity_warnings(before: &str, after: &str) -> Vec<String> {
         ));
     }
 
-    let paths = |s: &str| -> Vec<String> {
-        s.split_whitespace()
-            .filter(|t| crate::router::heuristic::looks_like_path(t))
-            .map(|t| {
-                t.trim_matches(|c: char| {
-                    !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
-                })
-                .to_string()
-            })
-            .collect()
-    };
+    let paths = |s: &str| -> Vec<String> { s.split_whitespace().filter_map(path_token).collect() };
     let before_paths = paths(before);
     let after_paths = paths(after);
     let missing: Vec<_> = before_paths
@@ -172,6 +206,38 @@ pub fn integrity_warnings(before: &str, after: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this guards: a path that ended a sentence in the original but not in the
+    /// rewrite would otherwise be reported as dropped on every single shrink.
+    #[test]
+    fn path_tokens_normalise_trailing_punctuation() {
+        assert_eq!(path_token("src/main.rs"), Some("src/main.rs".into()));
+        assert_eq!(path_token("src/main.rs."), Some("src/main.rs".into()));
+        assert_eq!(path_token("`src/main.rs`,"), Some("src/main.rs".into()));
+        assert_eq!(path_token("word"), None);
+        assert_eq!(path_token("e.g."), None);
+    }
+
+    #[test]
+    fn path_detection_ignores_ordinary_punctuation() {
+        assert!(looks_like_path("src/main.rs"));
+        assert!(looks_like_path("config.rs"));
+        assert!(
+            looks_like_path("src/store/version.rs,"),
+            "trailing comma is stripped"
+        );
+        assert!(looks_like_path("`src/lib.rs`"), "backticks are stripped");
+
+        // The bug this guards: prose that merely ends a sentence.
+        assert!(!looks_like_path("README."));
+        assert!(!looks_like_path("e.g."));
+        assert!(!looks_like_path("word"));
+        assert!(!looks_like_path("it."));
+        assert!(
+            !looks_like_path("https://example.com/a.rs"),
+            "URLs are not local files"
+        );
+    }
 
     #[test]
     fn instruction_names_what_must_survive() {

@@ -12,7 +12,7 @@ use std::time::Duration;
 use super::detect::{self, Detected, Unavailable};
 use super::launch::{self, Cancel, Line, Output};
 use super::registry::Effort;
-use crate::router::scoring::{Candidate, Ranking};
+use crate::router::{Choice, Ranking};
 
 /// Time budget for one headless call.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
@@ -147,10 +147,10 @@ impl AllFailed {
 /// same agent's other 19 model/effort pairs after a login failure only wastes time.
 /// The exception is [`Unavailable::might_work_with_another_model`], handled by the
 /// caller keeping the next entry for that agent.
-fn one_per_agent(ranking: &Ranking) -> Vec<&Candidate> {
+fn one_per_agent(ranking: &Ranking) -> Vec<&Choice> {
     let mut seen = Vec::new();
     let mut out = Vec::new();
-    for c in &ranking.candidates {
+    for c in &ranking.choices {
         if !seen.contains(&c.agent_id) {
             seen.push(c.agent_id);
             out.push(c);
@@ -377,7 +377,7 @@ mod tests {
     fn one_per_agent_keeps_rank_order_and_dedups() {
         use crate::agents::registry::Tier;
 
-        let mk = |agent: &'static str, model: &'static str, score: f32| Candidate {
+        let mk = |agent: &'static str, model: &'static str, fit: f32| Choice {
             agent_id: agent,
             agent_display: agent,
             model_id: model,
@@ -385,24 +385,21 @@ mod tests {
             tier: Tier::Mid,
             effort: Effort::High,
             effort_selectable: true,
-            score,
-            shortfall: [0.0; 6],
+            metered: false,
             relative_latency: 1.0,
             relative_price: 1.0,
-            metered: false,
-            held_back: false,
+            fit,
+            rationale: String::new(),
         };
         let ranking = Ranking {
-            candidates: vec![
+            choices: vec![
                 mk("claude", "opus", 99.0),
                 mk("claude", "sonnet", 95.0),
                 mk("codex", "gpt", 90.0),
                 mk("claude", "haiku", 70.0),
                 mk("crush", "", 60.0),
             ],
-            excluded: Vec::new(),
-            demand: [0.0; 6],
-            complexity: crate::router::Complexity::Medium,
+            ..Ranking::default()
         };
         let picked: Vec<_> = one_per_agent(&ranking)
             .iter()

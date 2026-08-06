@@ -10,9 +10,7 @@ use crate::config::Config;
 use crate::editor::Buffer;
 use crate::hints::Subject;
 use crate::jobs::{self, Event, Handle, JobId, Kind, Runner};
-use crate::router::device::Backend;
-use crate::router::scoring::Ranking;
-use crate::router::{self, Reading};
+use crate::router::{self, Ranking};
 use crate::shrink::Savings;
 use crate::store::version::{self, Note, VersionMeta};
 use crate::store::{Prompt, PromptStore};
@@ -26,6 +24,32 @@ pub struct PiiReview {
     /// What was found, and with what.
     pub scan: crate::pii::Scan,
     /// Unified diff of the masked text against the buffer.
+    pub diff: String,
+}
+
+/// An action waiting on a ranking before it can start.
+///
+/// Both hint and shrink have to pick an agent to run, and picking one now means asking the
+/// model — seconds, not microseconds. Rather than refuse until the user has ranked
+/// manually, the request is parked here and dispatched when the ranking arrives.
+#[derive(Debug, Clone)]
+enum Pending {
+    /// Ask for a hint about this subject.
+    Hint(Subject),
+    /// Shrink the open prompt.
+    Shrink,
+    /// Turn the open prompt into an agent-ready instruction.
+    Plan,
+}
+
+/// A pending plan awaiting approval.
+#[derive(Debug, Clone)]
+pub struct PlanProposal {
+    /// The proposed instruction text.
+    pub after: String,
+    /// Structural problems detected in the plan.
+    pub warnings: Vec<String>,
+    /// Unified diff for display.
     pub diff: String,
 }
 
@@ -85,12 +109,18 @@ pub struct App {
     pub runner: Runner,
     /// Detected agents.
     pub agents: Vec<Detected>,
-    /// Latest classification of the open prompt.
-    pub reading: Option<Reading>,
-    /// Latest scored field.
-    pub ranking: Ranking,
-    /// Compute backend the classifiers would use.
-    pub backend: Backend,
+    /// Latest ranking of the open prompt, once the model has produced one.
+    ///
+    /// `None` until it has. There is no cheap estimate to show in the meantime: ranking
+    /// costs a model invocation, and inventing a placeholder ranking would be presenting a
+    /// guess as an answer.
+    pub ranking: Option<Ranking>,
+    /// What to do once the ranking this job is producing arrives.
+    ///
+    /// Hints and shrinks both need a ranking to choose an agent, and getting one now means
+    /// waiting on the model. Rather than make the user press "Score models" first, the
+    /// request is remembered and dispatched when the ranking lands.
+    pending: Option<Pending>,
 
     /// Hint panel state.
     pub hint: Option<HintState>,
@@ -102,6 +132,10 @@ pub struct App {
     pub shrink: Option<ShrinkProposal>,
     /// Job currently producing a shrink.
     pub shrink_job: Option<JobId>,
+    /// Pending plan awaiting approval.
+    pub plan: Option<PlanProposal>,
+    /// Job currently producing a plan.
+    pub plan_job: Option<JobId>,
     /// Pending PII masking awaiting approval.
     pub pii: Option<PiiReview>,
     /// Job currently scanning for personal data.
@@ -130,7 +164,6 @@ impl App {
     pub fn new(config: Config) -> Self {
         let store = PromptStore::new(config.dir.clone());
         let prompts = store.list();
-        let backend = router::device::probe();
         let runner = Runner::new();
         runner.detect(config.dir.clone());
         // Ask the model cache what is already there, so the Models window and the status
@@ -146,14 +179,15 @@ impl App {
             history: HistoryView::default(),
             runner,
             agents: Vec::new(),
-            reading: None,
-            ranking: Ranking::default(),
-            backend,
+            ranking: None,
+            pending: None,
             hint: None,
             hint_input: String::new(),
             hint_open: false,
             shrink: None,
             shrink_job: None,
+            plan: None,
+            plan_job: None,
             pii: None,
             pii_job: None,
             models_open: false,
@@ -167,6 +201,12 @@ impl App {
         };
         if !app.prompts.is_empty() {
             app.open_prompt(0);
+        }
+        // A config layer that failed to parse is shown at startup rather than swallowed.
+        // The layer most likely to be malformed is a hand-edited policy file, and the
+        // symptom — a model filter that stopped applying — is otherwise invisible.
+        if !app.config.warnings.is_empty() {
+            app.error = Some(app.config.warnings.join("\n"));
         }
         app
     }
@@ -189,9 +229,10 @@ impl App {
             Ok(text) => {
                 self.buffer.load(text);
                 self.open = Some(index);
-                self.reading = None;
-                self.ranking = Ranking::default();
+                self.ranking = None;
+                self.pending = None;
                 self.shrink = None;
+                self.plan = None;
                 self.refresh_history();
                 self.status = format!("opened {}", prompt.name);
             }
@@ -333,10 +374,19 @@ impl App {
         self.status = format!("deleted {}", prompt.name);
     }
 
-    /// Classify the open prompt and score the field.
+    /// Rank the field for the open prompt.
     pub fn rank(&mut self) {
+        self.rank_then(None);
+    }
+
+    /// Rank the field, then optionally act on the result.
+    ///
+    /// The table is left as it was until the model answers. It used to be filled instantly
+    /// with a surface-feature estimate and then overwritten, which meant the ranking a user
+    /// read might be the guess or might be the answer, with nothing on screen to say which.
+    fn rank_then(&mut self, next: Option<Pending>) {
         if self.buffer.text.trim().is_empty() {
-            self.status = "nothing to score yet".into();
+            self.status = "nothing to rank yet".into();
             return;
         }
         if self.agents.is_empty() {
@@ -345,15 +395,16 @@ impl App {
         }
         let text = self.buffer.text.clone();
         let agents = self.agents.clone();
-        // Score immediately with the heuristic so the table is never empty, then run the
-        // local classifiers on a worker — loading them takes a moment, and the result
-        // supersedes the heuristic when it lands.
-        let quick = router::read_heuristic(&text);
-        self.ranking = router::scoring::rank(&agents, &quick.capability, quick.complexity);
-        self.reading = Some(quick);
-
-        self.runner.rank(text, agents, router::read_best);
-        self.status = "scoring models…".into();
+        self.pending = next;
+        let filter = self.config.prefs.filter.clone();
+        self.runner
+            .rank(text, agents, move |t, a| router::rank(t, a, &filter));
+        self.status = match self.pending {
+            Some(Pending::Hint(_)) => "ranking models for the hint…".into(),
+            Some(Pending::Shrink) => "ranking models for the shrink…".into(),
+            Some(Pending::Plan) => "ranking models for the plan…".into(),
+            None => "ranking models…".into(),
+        };
     }
 
     /// Download `targets` and load them, unless the user has turned downloads off.
@@ -471,13 +522,20 @@ impl App {
             return;
         }
 
+        match self.ranking.clone() {
+            Some(ranking) => self.launch_hint(subject, &ranking),
+            // No ranking yet: get one, then come back here.
+            None => self.rank_then(Some(Pending::Hint(subject))),
+        }
+    }
+
+    /// Start the hint agent against an existing ranking.
+    fn launch_hint(&mut self, subject: Subject, ranking: &Ranking) {
         let prompt = crate::hints::compose(&subject, &self.buffer.text);
-        // Hints are latency-sensitive, so bias to the quickest candidate that still
-        // scores close to the best.
-        let reading = router::read_heuristic(&prompt);
-        let full = router::scoring::rank(&self.agents, &reading.capability, reading.complexity);
-        let ranking = narrow_to_fastest(&full, self.config.prefs.hint_score_tolerance);
-        let picked = ranking
+        // Hints are latency-sensitive, so bias to the quickest choice that still fits
+        // close to the best.
+        let narrowed = narrow_to_fastest(ranking, self.config.prefs.hint_score_tolerance);
+        let picked = narrowed
             .best()
             .map(|c| format!("{} · {} · {}", c.agent_display, c.model_display, c.effort));
 
@@ -486,7 +544,7 @@ impl App {
             "hint".into(),
             prompt,
             self.agents.clone(),
-            ranking,
+            narrowed,
             self.config.dir.clone(),
             self.config.dir.clone(),
             Duration::from_secs(90),
@@ -512,15 +570,81 @@ impl App {
             self.error = Some("no coding agents detected on PATH".into());
             return;
         }
+        match self.ranking.clone() {
+            Some(ranking) => self.launch_shrink(&ranking),
+            None => self.rank_then(Some(Pending::Shrink)),
+        }
+    }
+
+    /// Turn the open prompt into an instruction a coding agent can execute.
+    pub fn request_plan(&mut self) {
+        if self.buffer.text.trim().is_empty() {
+            self.status = "nothing to plan".into();
+            return;
+        }
+        if self.agents.is_empty() {
+            self.error = Some("no coding agents detected on PATH".into());
+            return;
+        }
+        match self.ranking.clone() {
+            Some(ranking) => self.launch_plan(&ranking),
+            None => self.rank_then(Some(Pending::Plan)),
+        }
+    }
+
+    /// Start the planning agent against an existing ranking.
+    fn launch_plan(&mut self, ranking: &Ranking) {
+        let prompt = crate::plan::compose(&self.buffer.text);
+        let job = self.runner.run_agent(
+            Kind::Plan,
+            "plan".into(),
+            prompt,
+            self.agents.clone(),
+            ranking.clone(),
+            self.config.dir.clone(),
+            self.config.dir.clone(),
+            DEFAULT_TIMEOUT,
+        );
+        self.plan_job = Some(job.id);
+        self.running.push(job);
+        self.plan = None;
+        self.status = "planning…".into();
+    }
+
+    /// Accept the proposed plan, replacing the buffer with it.
+    pub fn accept_plan(&mut self) {
+        let Some(proposal) = self.plan.take() else {
+            return;
+        };
+        self.buffer.replace_all(&proposal.after, "plan");
+        self.save(Note::Plan);
+        self.status = "plan applied".into();
+    }
+
+    /// Discard the proposed plan.
+    pub fn reject_plan(&mut self) {
+        self.plan = None;
+        self.status = "plan discarded".into();
+    }
+
+    /// Stop a running plan job.
+    pub fn cancel_plan(&mut self) {
+        if let Some(id) = self.plan_job
+            && let Some(h) = self.running.iter().find(|h| h.id == id)
+        {
+            h.cancel();
+        }
+    }
+
+    /// Start the shrink agent against an existing ranking.
+    fn launch_shrink(&mut self, ranking: &Ranking) {
         let prompt = crate::shrink::compose(&self.buffer.text);
-        let reading = router::read_heuristic(&self.buffer.text);
-        let ranking = router::scoring::rank(&self.agents, &reading.capability, reading.complexity);
         let job = self.runner.run_agent(
             Kind::Shrink,
             "shrink".into(),
             prompt,
             self.agents.clone(),
-            ranking,
+            ranking.clone(),
             self.config.dir.clone(),
             self.config.dir.clone(),
             DEFAULT_TIMEOUT,
@@ -571,7 +695,12 @@ impl App {
             .pinned_agent
             .as_deref()
             .and_then(registry::find)
-            .or_else(|| self.ranking.best().and_then(|c| registry::find(c.agent_id)))
+            .or_else(|| {
+                self.ranking
+                    .as_ref()
+                    .and_then(|r| r.best())
+                    .and_then(|c| registry::find(c.agent_id))
+            })
             .or_else(|| self.agents.first().map(|d| d.spec));
 
         let Some(spec) = chosen else {
@@ -677,16 +806,13 @@ impl App {
                     return;
                 }
                 self.pii_job = None;
-                self.status = scan.plan.summary();
                 if scan.plan.items.is_empty() {
-                    // Still worth saying which detectors looked, so "nothing found" is
-                    // not mistaken for "nothing ran".
+                    // Say what looked, so "nothing found" is not mistaken for "nothing
+                    // ran". A scan that could not run arrives as `Failed`, never here.
                     self.status = format!("{} · {}", scan.plan.summary(), scan.source_label());
-                    if let Some(why) = &scan.fallback_reason {
-                        self.status.push_str(&format!(" — {why}"));
-                    }
                     return;
                 }
+                self.status = scan.plan.summary();
                 let masked = scan.plan.apply(&self.buffer.text);
                 self.pii = Some(PiiReview {
                     diff: version::diff(&self.buffer.text, &masked),
@@ -703,25 +829,28 @@ impl App {
                     format!("{usable} of {n} detected agents usable")
                 };
             }
-            Event::Ranked {
-                reading, ranking, ..
-            } => {
-                // Say what actually happened, in that order: the verdict, how many
-                // candidates it ranked, what produced it, and only then what was missing.
-                // A partial degrade is not "using the built-in scorer".
-                let mut text = format!(
-                    "{} · {} candidates scored via {} in {} ms",
-                    reading.complexity,
-                    ranking.candidates.len(),
-                    reading.source,
-                    reading.elapsed.as_millis(),
-                );
-                if let Some(why) = &reading.fallback_reason {
-                    text.push_str(&format!(" — {why}"));
+            Event::Ranked { ranking, .. } => {
+                self.status = match ranking.best() {
+                    Some(best) => format!(
+                        "{} · {} — picked from {} combinations in {:.1}s",
+                        best.agent_display,
+                        best.model_display,
+                        ranking.considered,
+                        ranking.elapsed.as_secs_f32(),
+                    ),
+                    None => "the model returned no usable ranking".into(),
+                };
+                self.ranking = Some(*ranking);
+
+                // Whatever was waiting on this ranking can now run.
+                if let (Some(pending), Some(ranking)) = (self.pending.take(), self.ranking.clone())
+                {
+                    match pending {
+                        Pending::Hint(subject) => self.launch_hint(subject, &ranking),
+                        Pending::Shrink => self.launch_shrink(&ranking),
+                        Pending::Plan => self.launch_plan(&ranking),
+                    }
                 }
-                self.status = text;
-                self.reading = Some(*reading);
-                self.ranking = *ranking;
             }
             Event::Finished { id, kind, result } => match kind {
                 Kind::Hint => {
@@ -742,6 +871,22 @@ impl App {
                         ));
                     }
                     self.status = "hint ready".into();
+                }
+                Kind::Plan if self.plan_job == Some(id) => {
+                    self.plan_job = None;
+                    // Same cleanup as shrink: agents ignore "no preamble" the same way
+                    // whatever they were asked to produce.
+                    let after = crate::shrink::clean(&result.text);
+                    if after.trim().is_empty() {
+                        self.error = Some("the planner returned nothing".into());
+                    } else {
+                        self.plan = Some(PlanProposal {
+                            diff: version::diff(&self.buffer.text, &after),
+                            warnings: crate::plan::warnings(&after, &self.buffer.text),
+                            after,
+                        });
+                        self.status = "plan ready for review".into();
+                    }
                 }
                 Kind::Shrink if self.shrink_job == Some(id) => {
                     self.shrink_job = None;
@@ -767,6 +912,9 @@ impl App {
                 if kind == Kind::Shrink && self.shrink_job == Some(id) {
                     self.shrink_job = None;
                 }
+                if kind == Kind::Plan && self.plan_job == Some(id) {
+                    self.plan_job = None;
+                }
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
                 }
@@ -783,6 +931,9 @@ impl App {
             Event::Cancelled { id, kind } => {
                 if kind == Kind::Shrink && self.shrink_job == Some(id) {
                     self.shrink_job = None;
+                }
+                if kind == Kind::Plan && self.plan_job == Some(id) {
+                    self.plan_job = None;
                 }
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
@@ -802,7 +953,7 @@ impl App {
 
     /// Human description of how the top candidate would be invoked.
     pub fn invocation_hint(&self) -> Option<String> {
-        let best = self.ranking.best()?;
+        let best = self.ranking.as_ref()?.best()?;
         let spec = registry::find(best.agent_id)?;
         Some(format!(
             "{} · {} · {} · prompt {}",
@@ -822,15 +973,15 @@ fn narrow_to_fastest(full: &Ranking, tolerance: f32) -> Ranking {
     let Some(quick) = full.fastest_within(tolerance) else {
         return full.clone();
     };
-    let mut candidates = vec![quick.clone()];
-    candidates.extend(
-        full.candidates
+    let mut choices = vec![quick.clone()];
+    choices.extend(
+        full.choices
             .iter()
             .filter(|c| c.agent_id != quick.agent_id)
             .cloned(),
     );
     Ranking {
-        candidates,
+        choices,
         ..full.clone()
     }
 }
@@ -847,8 +998,6 @@ mod tests {
     use super::*;
     use crate::agents::detect::Status;
     use crate::config::Prefs;
-    use crate::router::Complexity;
-    use crate::router::scoring::Candidate;
     use std::path::PathBuf;
 
     fn tmp_config(tag: &str) -> Config {
@@ -862,11 +1011,12 @@ mod tests {
         Config {
             dir,
             prefs: Prefs::default(),
+            warnings: Vec::new(),
         }
     }
 
-    fn candidate(agent: &'static str, effort: registry::Effort, score: f32) -> Candidate {
-        Candidate {
+    fn choice(agent: &'static str, effort: registry::Effort, fit: f32) -> router::Choice {
+        router::Choice {
             agent_id: agent,
             agent_display: agent,
             model_id: "m",
@@ -874,12 +1024,11 @@ mod tests {
             tier: registry::Tier::Mid,
             effort,
             effort_selectable: true,
-            score,
-            shortfall: [0.0; 6],
+            metered: false,
             relative_latency: effort.latency_factor(),
             relative_price: 1.0,
-            metered: false,
-            held_back: false,
+            fit,
+            rationale: String::new(),
         }
     }
 
@@ -1046,7 +1195,7 @@ mod tests {
 
         app.rank();
         assert!(app.error.is_none(), "an empty prompt is not an error");
-        assert!(app.status.contains("nothing to score"));
+        assert!(app.status.contains("nothing to rank"));
 
         app.request_shrink();
         assert!(app.status.contains("nothing to shrink"));
@@ -1071,23 +1220,21 @@ mod tests {
     #[test]
     fn narrow_to_fastest_puts_the_quick_candidate_first_and_keeps_failover() {
         let full = Ranking {
-            candidates: vec![
-                candidate("claude", registry::Effort::Max, 100.0),
-                candidate("claude", registry::Effort::Low, 98.0),
-                candidate("codex", registry::Effort::High, 97.0),
+            choices: vec![
+                choice("claude", registry::Effort::Max, 100.0),
+                choice("claude", registry::Effort::Low, 98.0),
+                choice("codex", registry::Effort::High, 97.0),
             ],
-            excluded: Vec::new(),
-            demand: [0.0; 6],
-            complexity: Complexity::Easy,
+            ..Ranking::default()
         };
         let narrowed = narrow_to_fastest(&full, 5.0);
         assert_eq!(
-            narrowed.candidates[0].effort,
+            narrowed.choices[0].effort,
             registry::Effort::Low,
             "fastest first"
         );
         assert!(
-            narrowed.candidates.iter().any(|c| c.agent_id == "codex"),
+            narrowed.choices.iter().any(|c| c.agent_id == "codex"),
             "other agents must remain for failover"
         );
     }
@@ -1095,17 +1242,15 @@ mod tests {
     #[test]
     fn narrow_to_fastest_respects_a_zero_tolerance() {
         let full = Ranking {
-            candidates: vec![
-                candidate("claude", registry::Effort::Max, 100.0),
-                candidate("claude", registry::Effort::Low, 80.0),
+            choices: vec![
+                choice("claude", registry::Effort::Max, 100.0),
+                choice("claude", registry::Effort::Low, 80.0),
             ],
-            excluded: Vec::new(),
-            demand: [0.0; 6],
-            complexity: Complexity::Hard,
+            ..Ranking::default()
         };
         let narrowed = narrow_to_fastest(&full, 0.0);
         assert_eq!(
-            narrowed.candidates[0].effort,
+            narrowed.choices[0].effort,
             registry::Effort::Max,
             "with no tolerance the best score wins outright"
         );
@@ -1292,23 +1437,34 @@ mod tests {
         app.save(Note::Manual);
         app.pii_job = Some(JobId(11));
 
-        // The checksum detectors alone find the address; DATE is found but starts off.
-        let mut scan = crate::pii::sanitize(original);
-        scan.plan.items.push(crate::pii::Masked {
-            finding: crate::pii::Finding {
-                tag: "FULLNAME".into(),
-                start: 11,
-                end: 16,
-                text: "Mario".into(),
-                score: 0.97,
-                finder: crate::pii::Finder::Model,
-            },
-            placeholder: "[FULLNAME_1]".into(),
-            masked: true,
-        });
-        scan.plan
-            .items
-            .sort_by_key(|i| (i.finding.start, i.finding.end));
+        // Built directly rather than by scanning: `sanitize` now needs the model, and this
+        // test is about what the app does with a scan, not about producing one.
+        let scan = crate::pii::Scan {
+            plan: crate::pii::Plan::build(vec![
+                crate::pii::Finding {
+                    tag: "FULLNAME".into(),
+                    start: 11,
+                    end: 16,
+                    text: "Mario".into(),
+                    score: 0.97,
+                },
+                crate::pii::Finding {
+                    tag: "EMAIL".into(),
+                    start: 34,
+                    end: 51,
+                    text: "mario@example.com".into(),
+                    score: 0.99,
+                },
+                crate::pii::Finding {
+                    tag: "DATE".into(),
+                    start: 55,
+                    end: 65,
+                    text: "2024-01-01".into(),
+                    score: 0.95,
+                },
+            ]),
+            elapsed: std::time::Duration::from_millis(1),
+        };
 
         app.handle(Event::Scanned {
             id: JobId(11),
@@ -1376,7 +1532,10 @@ mod tests {
 
         app.handle(Event::Scanned {
             id: JobId(12),
-            scan: Box::new(crate::pii::sanitize(&app.buffer.text)),
+            scan: Box::new(crate::pii::Scan {
+                plan: crate::pii::Plan::default(),
+                elapsed: std::time::Duration::from_millis(1),
+            }),
         });
         assert!(app.pii.is_none(), "nothing to review");
         assert!(app.pii_job.is_none());
@@ -1408,7 +1567,7 @@ mod tests {
         let mut app = App::new(cfg);
         app.config.prefs.allow_model_download = false;
 
-        app.fetch_models(vec![crate::models::CAPABILITY]);
+        app.fetch_models(vec![crate::models::LLM]);
         assert!(app.models_job.is_none(), "no job should start");
         assert!(
             app.error
@@ -1420,36 +1579,51 @@ mod tests {
 
         // Nothing to load either, since nothing is downloaded in a fresh cache probe.
         app.error = None;
-        app.load_models(vec![crate::models::CAPABILITY]);
+        app.load_models(vec![crate::models::LLM]);
         assert!(app.error.is_none(), "a missing checkpoint is not an error");
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The status line after a ranking should name the pick and how wide a field it came
+    /// from — "picked from 30" is what tells the user the shortlist is a selection rather
+    /// than everything installed.
     #[test]
-    fn a_ranked_event_names_its_source_and_any_shortfall() {
+    fn a_ranked_event_names_the_pick_and_the_field() {
         let cfg = tmp_config("rankstatus");
         let dir = cfg.dir.clone();
         let mut app = App::new(cfg);
 
-        let mut reading = router::read_heuristic("do a thing");
-        reading.source = router::Source::CapabilityOnly;
-        reading.fallback_reason = Some("difficulty: not downloaded".into());
         app.handle(Event::Ranked {
             id: JobId(1),
-            reading: Box::new(reading),
-            ranking: Box::new(Ranking::default()),
+            ranking: Box::new(Ranking {
+                choices: vec![choice("claude", registry::Effort::High, 91.0)],
+                considered: 30,
+                ..Ranking::default()
+            }),
         });
 
-        // The old message claimed the built-in scorer had been used whenever anything
-        // degraded, which was wrong and unactionable.
+        assert!(app.status.contains("claude"), "got {}", app.status);
+        assert!(app.status.contains("30"), "got {}", app.status);
+        assert!(app.ranking.is_some(), "the ranking should be kept");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A ranking that produced nothing must not read as a successful ranking of nothing.
+    #[test]
+    fn an_empty_ranking_says_so() {
+        let cfg = tmp_config("rankempty");
+        let dir = cfg.dir.clone();
+        let mut app = App::new(cfg);
+
+        app.handle(Event::Ranked {
+            id: JobId(1),
+            ranking: Box::new(Ranking::default()),
+        });
         assert!(
-            app.status
-                .contains("local capability + built-in difficulty"),
+            app.status.contains("no usable ranking"),
             "got {}",
             app.status
         );
-        assert!(app.status.contains("not downloaded"), "got {}", app.status);
-        assert!(!app.status.contains("using the built-in scorer"));
         std::fs::remove_dir_all(&dir).ok();
     }
 

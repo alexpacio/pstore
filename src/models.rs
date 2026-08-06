@@ -1,19 +1,23 @@
-//! The local checkpoints pstore runs, and their live download/load state.
+//! The local checkpoint pstore runs, and its live download/load state.
 //!
-//! Every model pstore uses itself — the two classifiers behind the ranking, and the PII
-//! tagger behind the sanitiser — runs **in this process, on this machine**. Nothing here
-//! calls an inference API; the only network traffic is a one-off weight download from
-//! Hugging Face, which the user starts by hand from the Models window.
+//! Everything pstore infers for itself — the capability and difficulty reads behind the
+//! ranking, and the PII scan behind the sanitiser — comes from **one** model, run on this
+//! machine by a `llama-cli` subprocess. Nothing here calls an inference API; the only
+//! network traffic is a one-off weight download from Hugging Face, which the user starts
+//! from the Models window.
 //!
 //! Two things live here:
 //!
-//! * [`ALL`] — the catalogue: which repository each checkpoint comes from, which files it
+//! * [`ALL`] — the catalogue: which repository the checkpoint comes from, which files it
 //!   needs, and how big it is, so the UI can say what a download will cost *before* it
 //!   starts, and
 //! * the **status board** ([`phase`], [`set`], [`snapshot`]) — a small shared table the
-//!   worker threads write and the UI polls once per frame. Loading a checkpoint happens
-//!   deep inside a classifier on a worker thread; without somewhere neutral to record
-//!   "downloading, 40% of 795 MB" the GUI could only show a spinner.
+//!   worker threads write and the UI polls once per frame. Fetching weights happens deep
+//!   inside a worker thread; without somewhere neutral to record "downloading, 40% of
+//!   3.8 GB" the GUI could only show a spinner.
+//!
+//! The `llama-cli` binary that runs these weights is provisioned separately — see
+//! [`crate::runtime`], which reports into this same board.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -46,41 +50,30 @@ impl Checkpoint {
     }
 }
 
-/// Brick's capability classifier: which of the six dimensions a prompt draws on.
-pub const CAPABILITY: Checkpoint = Checkpoint {
-    id: "capability",
-    title: "Capability classifier",
-    purpose: "scores the six capability dimensions a prompt draws on",
-    repo: "regolo/brick-modernbert-capability-classifier",
-    files: &["config.json", "tokenizer.json", "model.safetensors"],
-    bytes: 795_276_408,
-    license: "Apache-2.0",
-};
-
-/// NVIDIA's prompt task-and-complexity classifier: how hard the prompt is.
-pub const DIFFICULTY: Checkpoint = Checkpoint {
-    id: "difficulty",
-    title: "Difficulty classifier",
-    purpose: "rates prompt complexity, which sets the model tier and effort",
-    repo: "nvidia/prompt-task-and-complexity-classifier",
-    files: &["tokenizer.json", "model.safetensors"],
-    bytes: 744_107_008,
-    license: "NVIDIA Open Model License",
-};
-
-/// The rizzo-pii tagger: finds personal data in the prompt.
-pub const PII: Checkpoint = Checkpoint {
-    id: "pii",
-    title: "PII tagger",
-    purpose: "finds names, addresses and identifiers so they can be masked",
-    repo: "rizzoaiacademy/rizzo-pii-0.3B",
-    files: &["config.json", "tokenizer.json", "model.safetensors"],
-    bytes: 1_264_633_910,
+/// Bonsai 27B, 1-bit: the one model behind routing, difficulty and PII.
+///
+/// PrismML's binary-weight build of Qwen3.6-27B. 3.8 GB of weights holding a 27B model,
+/// which is why it replaced three purpose-built encoders totalling 2.8 GB and still costs
+/// less memory than the ternary build of the same model (7.17 GB). The trade is ~89.5% of
+/// FP16 quality against the ternary build's 94.6% — worth it here, where every task
+/// (rating six dimensions 0–1, extracting typed spans) sits far below what a 27B can do.
+///
+/// Only the language weights are listed. The repository also ships an `mmproj` vision
+/// tower and a `dspark` speculative-decoding drafter; pstore sends no images and gains
+/// nothing from a drafter on one-shot invocations, so fetching either would be paying
+/// gigabytes for capacity that never loads.
+pub const LLM: Checkpoint = Checkpoint {
+    id: "llm",
+    title: "Bonsai 27B (1-bit)",
+    purpose: "scores capability and difficulty, and finds personal data",
+    repo: "prism-ml/Bonsai-27B-gguf",
+    files: &["Bonsai-27B-Q1_0.gguf"],
+    bytes: 3_800_000_000,
     license: "Apache-2.0",
 };
 
 /// Every checkpoint, in the order the Models window lists them.
-pub const ALL: [Checkpoint; 3] = [CAPABILITY, DIFFICULTY, PII];
+pub const ALL: [Checkpoint; 1] = [LLM];
 
 /// Where a checkpoint currently is.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -236,21 +229,21 @@ pub fn probe_cache() {
     }
 }
 
-/// Whether this build can run the checkpoints at all.
+/// Whether this build can run the checkpoint at all.
 ///
-/// False in a `--no-default-features` build, which compiles out Candle, the tokenizers and
-/// the Hub client. Everything still works — routing uses the built-in estimate and
-/// sanitising the checksum-backed patterns — but the local models are not merely missing,
-/// they are absent from the binary, and the UI should say that rather than imply a download
-/// would help.
-pub const LOCAL_INFERENCE: bool = cfg!(feature = "candle");
+/// False in a `--no-default-features` build, which compiles out the Hub client and the
+/// runtime provisioner. The features that need the model — scoring, sanitising, shrink —
+/// are then disabled rather than degraded: there is no second implementation behind them.
+/// The distinction matters to the UI, which should say the support is absent from the
+/// binary rather than imply a download would help.
+pub const LOCAL_INFERENCE: bool = cfg!(feature = "local-llm");
 
 /// What to say when there is nothing to run the weights with.
 pub const NO_LOCAL_INFERENCE: &str =
-    "this build has no local inference support (compiled without the `candle` feature)";
+    "this build has no local inference support (compiled without the `local-llm` feature)";
 
 /// What the cache says about `c`.
-#[cfg(feature = "candle")]
+#[cfg(feature = "local-llm")]
 fn cache_phase(c: &Checkpoint) -> Phase {
     if is_cached(c) {
         Phase::Cached
@@ -259,16 +252,16 @@ fn cache_phase(c: &Checkpoint) -> Phase {
     }
 }
 
-/// Without Candle there is no Hub client to ask, so "not downloaded" would be a claim this
-/// build cannot make — the weights may well be on disk from another build. Report the thing
-/// that is actually true.
-#[cfg(not(feature = "candle"))]
+/// Without the Hub client there is nothing to ask, so "not downloaded" would be a claim
+/// this build cannot make — the weights may well be on disk from another build. Report the
+/// thing that is actually true.
+#[cfg(not(feature = "local-llm"))]
 fn cache_phase(_c: &Checkpoint) -> Phase {
     Phase::Failed(NO_LOCAL_INFERENCE.to_string())
 }
 
 /// Whether every file of `c` is already in the Hugging Face cache.
-#[cfg(feature = "candle")]
+#[cfg(feature = "local-llm")]
 pub fn is_cached(c: &Checkpoint) -> bool {
     c.files
         .iter()
@@ -276,7 +269,7 @@ pub fn is_cached(c: &Checkpoint) -> bool {
 }
 
 /// No Hub client, so nothing can be confirmed present.
-#[cfg(not(feature = "candle"))]
+#[cfg(not(feature = "local-llm"))]
 pub fn is_cached(_c: &Checkpoint) -> bool {
     false
 }
@@ -286,11 +279,9 @@ pub fn is_cached(_c: &Checkpoint) -> bool {
 /// Reuses anything already cached, so calling it on a complete checkpoint is quick and
 /// harmless. Returns the reason on failure, which the Models window shows verbatim.
 ///
-/// `cancel` is honoured **between files**, not mid-transfer: the Hub client has no abort
-/// hook, so asking to stop during the weights file waits for that file to land. Nothing is
-/// wasted when it does — the cache keys on content, so the next attempt reuses it — but the
-/// button cannot be instant, and the UI says so rather than appearing to hang.
-#[cfg(feature = "candle")]
+/// `cancel` is honoured **mid-transfer**, between one-megabyte chunks, so stopping a 3.8 GB
+/// download is immediate. The partial file is kept and the next attempt resumes from it.
+#[cfg(feature = "local-llm")]
 pub fn download(c: &Checkpoint, cancel: &std::sync::atomic::AtomicBool) -> Result<(), String> {
     use std::sync::atomic::Ordering;
 
@@ -327,7 +318,7 @@ pub fn download(c: &Checkpoint, cancel: &std::sync::atomic::AtomicBool) -> Resul
                 },
             );
         });
-        if let Err(e) = crate::router::hub::fetch_reporting(c.repo, file, progress) {
+        if let Err(e) = crate::router::hub::fetch_reporting(c.repo, file, progress, cancel) {
             set(c.id, Phase::Failed(e.clone()));
             return Err(e);
         }
@@ -338,7 +329,7 @@ pub fn download(c: &Checkpoint, cancel: &std::sync::atomic::AtomicBool) -> Resul
 
 /// Without the `candle` feature there is nothing to run the weights with, so there is
 /// nothing worth downloading either.
-#[cfg(not(feature = "candle"))]
+#[cfg(not(feature = "local-llm"))]
 pub fn download(c: &Checkpoint, _cancel: &std::sync::atomic::AtomicBool) -> Result<(), String> {
     set(c.id, Phase::Failed(NO_LOCAL_INFERENCE.to_string()));
     Err(NO_LOCAL_INFERENCE.to_string())
@@ -348,20 +339,16 @@ pub fn download(c: &Checkpoint, _cancel: &std::sync::atomic::AtomicBool) -> Resu
 mod tests {
     use super::*;
 
+    /// Deliberately shape-agnostic about *which* files a checkpoint needs. It used to
+    /// require the transformers trio (`config.json`/`tokenizer.json`/`model.safetensors`);
+    /// a GGUF checkpoint is one self-contained file, and a future one may be neither. What
+    /// has to hold is that the catalogue can be acted on: a real repo, some files, a size
+    /// to show before the download starts.
     #[test]
     fn catalogue_is_complete_and_distinct() {
         for c in ALL.iter() {
             assert!(c.repo.contains('/'), "{} needs an owner/name repo", c.id);
-            assert!(
-                c.files.contains(&"model.safetensors"),
-                "{} must list its weights",
-                c.id
-            );
-            assert!(
-                c.files.contains(&"tokenizer.json"),
-                "{} must list its tokenizer",
-                c.id
-            );
+            assert!(!c.files.is_empty(), "{} must list the files it needs", c.id);
             assert!(c.bytes > 1_000_000, "{} size looks wrong", c.id);
             assert!(!c.purpose.is_empty() && !c.license.is_empty());
         }
@@ -372,15 +359,27 @@ mod tests {
         assert_eq!(sorted.len(), ids.len(), "checkpoint ids must be unique");
     }
 
+    /// A wrong repo id should cost a few KB, not most of a gigabyte, so [`download`]
+    /// fetches metadata first and weights last. Checked by extension rather than by an
+    /// exact filename: the weights used to be `model.safetensors` and are now a `.gguf`.
     #[test]
     fn weights_are_fetched_last() {
-        // A wrong repo id should cost a few KB, not most of a gigabyte.
+        const WEIGHTS: [&str; 2] = [".gguf", ".safetensors"];
+        let is_weights = |f: &str| WEIGHTS.iter().any(|ext| f.ends_with(ext));
+
         for c in ALL.iter() {
-            assert_eq!(
-                c.files.last(),
-                Some(&"model.safetensors"),
-                "{} downloads its weights before its metadata",
+            let last = c.files.last().expect("checked non-empty above");
+            assert!(
+                is_weights(last),
+                "{}: last file should be the weights, got {last:?}",
                 c.id
+            );
+            let earlier = &c.files[..c.files.len() - 1];
+            assert!(
+                !earlier.iter().copied().any(is_weights),
+                "{}: downloads weights before its metadata — {:?}",
+                c.id,
+                c.files
             );
         }
     }
@@ -428,11 +427,11 @@ mod tests {
     /// on. Tests run in parallel; shared state has to be shared carefully.
     #[test]
     fn board_round_trips_and_ignores_unknown_ids() {
-        set(CAPABILITY.id, Phase::Loading);
-        assert_eq!(phase(CAPABILITY.id), Phase::Loading);
+        set(LLM.id, Phase::Loading);
+        assert_eq!(phase(LLM.id), Phase::Loading);
         assert!(any_busy());
-        set(CAPABILITY.id, Phase::Ready);
-        assert_eq!(phase(CAPABILITY.id), Phase::Ready);
+        set(LLM.id, Phase::Ready);
+        assert_eq!(phase(LLM.id), Phase::Ready);
 
         // An unknown id is dropped rather than added, so a typo cannot invent a row.
         set("not-a-checkpoint", Phase::Ready);
@@ -440,18 +439,18 @@ mod tests {
 
         let snap = snapshot();
         assert_eq!(snap.len(), ALL.len());
-        assert_eq!(snap[0].0.id, CAPABILITY.id);
+        assert_eq!(snap[0].0.id, LLM.id);
 
         // Hand the row back to the cache's own answer.
-        set(CAPABILITY.id, Phase::Absent);
+        set(LLM.id, Phase::Absent);
         probe_cache();
-        assert_ne!(phase(CAPABILITY.id), Phase::Unknown);
+        assert_ne!(phase(LLM.id), Phase::Unknown);
     }
 
     #[test]
     fn sizes_read_in_familiar_units() {
         assert_eq!(bytes_label(500), "500 B");
         assert_eq!(bytes_label(795_276_408), "795 MB");
-        assert_eq!(bytes_label(1_264_633_910), "1.26 GB");
+        assert_eq!(bytes_label(LLM.bytes), "3.80 GB");
     }
 }

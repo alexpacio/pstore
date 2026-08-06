@@ -17,8 +17,7 @@ use crate::agents::launch::Line;
 use crate::agents::registry::{Effort, PromptVia};
 use crate::models::Checkpoint;
 use crate::pii;
-use crate::router::Reading;
-use crate::router::scoring::Ranking;
+use crate::router::Ranking;
 
 /// Identifies one running job so its output can be routed to the right panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -31,6 +30,8 @@ pub enum Kind {
     Hint,
     /// A prompt-shrinking pass.
     Shrink,
+    /// Turning the prompt into an agent-ready instruction.
+    Plan,
     /// Classifying the prompt and ranking the field.
     Rank,
     /// Re-probing installed agents.
@@ -66,12 +67,8 @@ pub enum Event {
         kind: Kind,
         error: String,
     },
-    /// A classification pass finished.
-    Ranked {
-        id: JobId,
-        reading: Box<Reading>,
-        ranking: Box<Ranking>,
-    },
+    /// A ranking pass finished.
+    Ranked { id: JobId, ranking: Box<Ranking> },
     /// A detection pass finished.
     Detected { id: JobId, agents: Vec<Detected> },
     /// A sanitisation pass finished.
@@ -211,23 +208,32 @@ impl Runner {
         })
     }
 
-    /// Classify `text` and rank the field.
+    /// Rank the installed agents against `text` with the local model.
     ///
-    /// `classify` is injected so the UI can hand in either the Candle-backed reader or
-    /// the heuristic one without this module depending on either.
-    pub fn rank<C>(&self, text: String, agents: Vec<Detected>, classify: C) -> Handle
+    /// `rank` is injected so this module does not depend on the router, and so tests can
+    /// drive the job machinery without a 3.8 GB checkpoint.
+    pub fn rank<R>(&self, text: String, agents: Vec<Detected>, rank: R) -> Handle
     where
-        C: FnOnce(&str) -> Reading + Send + 'static,
+        R: FnOnce(&str, &[Detected]) -> Result<Ranking, String> + Send + 'static,
     {
-        self.spawn(Kind::Rank, "scoring models".into(), move |id, tx, _| {
-            let reading = classify(&text);
-            let ranking =
-                crate::router::scoring::rank(&agents, &reading.capability, reading.complexity);
-            let _ = tx.send(Event::Ranked {
-                id,
-                reading: Box::new(reading),
-                ranking: Box::new(ranking),
-            });
+        self.spawn(Kind::Rank, "ranking models".into(), move |id, tx, _| {
+            match rank(&text, &agents) {
+                Ok(ranking) => {
+                    let _ = tx.send(Event::Ranked {
+                        id,
+                        ranking: Box::new(ranking),
+                    });
+                }
+                // Ranking has no fallback: if the model could not answer there is no
+                // second-best ranking to show, only the reason.
+                Err(error) => {
+                    let _ = tx.send(Event::Failed {
+                        id,
+                        kind: Kind::Rank,
+                        error,
+                    });
+                }
+            }
         })
     }
 
@@ -266,6 +272,14 @@ impl Runner {
         };
         self.spawn(Kind::Models, label, move |id, tx, cancel| {
             let mut failures = Vec::new();
+
+            // The runtime first: it is 11-17 MB against the checkpoint's 3.8 GB, and
+            // weights with nothing to run them are of no use. Failing here before the long
+            // transfer starts is the kind thing to do.
+            if let Err(e) = provision_runtime(&tx, id, &cancel) {
+                failures.push(e);
+            }
+
             for c in &targets {
                 if cancel.load(Ordering::Relaxed) {
                     let _ = tx.send(Event::Cancelled {
@@ -336,12 +350,22 @@ impl Runner {
         self.spawn(
             Kind::Sanitize,
             "checking for personal data".into(),
-            move |id, tx, _| {
-                let scan = pii::sanitize(&text);
-                let _ = tx.send(Event::Scanned {
-                    id,
-                    scan: Box::new(scan),
-                });
+            move |id, tx, _| match pii::sanitize(&text) {
+                Ok(scan) => {
+                    let _ = tx.send(Event::Scanned {
+                        id,
+                        scan: Box::new(scan),
+                    });
+                }
+                // A scan that could not run must not arrive as an empty plan: "no personal
+                // data found" would then be indistinguishable from "nothing looked".
+                Err(error) => {
+                    let _ = tx.send(Event::Failed {
+                        id,
+                        kind: Kind::Sanitize,
+                        error,
+                    });
+                }
             },
         )
     }
@@ -423,39 +447,59 @@ impl Runner {
     }
 }
 
-/// Load whichever of `targets` are on disk, returning one message per failure.
+/// Make sure `llama-cli` is present, downloading it if it is not.
 ///
-/// The classifiers are reset first: a previous attempt may have recorded "not downloaded"
-/// for a checkpoint that has since arrived, and that verdict is remembered on purpose so it
-/// is not retried on every keystroke.
-fn load_downloaded(targets: &[Checkpoint], tx: &Sender<Event>, id: JobId) -> Vec<String> {
-    let mut failures = Vec::new();
-    let classifiers = targets
-        .iter()
-        .any(|c| c.id == crate::models::CAPABILITY.id || c.id == crate::models::DIFFICULTY.id);
-    let tagger = targets.iter().any(|c| c.id == crate::models::PII.id);
+/// Nothing to do when it is already resolvable — from an override, a system install, a
+/// previous download, or `PATH`.
+#[cfg(feature = "local-llm")]
+fn provision_runtime(tx: &Sender<Event>, id: JobId, cancel: &AtomicBool) -> Result<(), String> {
+    let prefs = crate::config::prefs_snapshot();
+    if crate::runtime::locate(prefs.llama_cli_path.as_deref()).is_some() {
+        return Ok(());
+    }
+    let asset = crate::runtime::asset()?;
+    let _ = tx.send(Event::Note {
+        id,
+        text: format!(
+            "downloading llama-cli {} ({})",
+            crate::runtime::RELEASE_TAG,
+            crate::models::bytes_label(asset.bytes)
+        ),
+    });
+    crate::runtime::download(cancel)
+        .map(|_| ())
+        .map_err(|e| format!("llama-cli: {e}"))
+}
 
-    if classifiers {
-        let _ = tx.send(Event::Note {
-            id,
-            text: "loading the routing classifiers…".into(),
-        });
-        crate::router::reset_classifiers();
-        if let Err(e) = crate::router::preload_classifiers() {
-            failures.push(e);
-        }
+/// Without local inference there is no runtime to provision.
+#[cfg(not(feature = "local-llm"))]
+fn provision_runtime(_tx: &Sender<Event>, _id: JobId, _cancel: &AtomicBool) -> Result<(), String> {
+    Err(crate::models::NO_LOCAL_INFERENCE.to_string())
+}
+
+/// Check whichever of `targets` are on disk, returning one message per failure.
+///
+/// State is reset first: a previous attempt may have recorded "not downloaded" for a
+/// checkpoint that has since arrived, and that verdict is remembered on purpose so it is
+/// not retried on every keystroke.
+///
+/// One checkpoint now serves every feature, so this is a single check rather than one per
+/// subsystem — and "checking" is all it is. Nothing is held in memory between calls: each
+/// model call is a fresh `llama-cli` process, so there is no load step to watch, only a
+/// question of whether the weights and the runtime are both present.
+fn load_downloaded(targets: &[Checkpoint], tx: &Sender<Event>, id: JobId) -> Vec<String> {
+    if !targets.iter().any(|c| c.id == crate::models::LLM.id) {
+        return Vec::new();
     }
-    if tagger {
-        let _ = tx.send(Event::Note {
-            id,
-            text: "loading the PII tagger…".into(),
-        });
-        pii::reset();
-        if let Err(e) = pii::preload() {
-            failures.push(format!("PII tagger: {e}"));
-        }
+    let _ = tx.send(Event::Note {
+        id,
+        text: "checking the local model…".into(),
+    });
+    crate::router::reset_classifiers();
+    match crate::router::preload_classifiers() {
+        Ok(()) => Vec::new(),
+        Err(e) => vec![e],
     }
-    failures
 }
 
 /// "2 of 3 models loaded", for the status bar.
@@ -543,14 +587,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn rank_job_uses_the_injected_classifier() {
-        let r = Runner::new();
-        let h = r.rank("anything".into(), Vec::new(), |text| {
-            assert_eq!(text, "anything", "classifier receives the prompt");
-            crate::router::read_heuristic(text)
-        });
-
+    fn drain_until_terminal(r: &Runner) -> Vec<Event> {
         let mut events = Vec::new();
         for _ in 0..400 {
             events.extend(r.drain());
@@ -559,19 +596,55 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let ranked = events
+        events
+    }
+
+    #[test]
+    fn rank_job_uses_the_injected_ranker() {
+        let r = Runner::new();
+        let h = r.rank("anything".into(), Vec::new(), |text, _agents| {
+            assert_eq!(text, "anything", "the ranker receives the prompt");
+            Ok(Ranking {
+                considered: 7,
+                ..Ranking::default()
+            })
+        });
+
+        let events = drain_until_terminal(&r);
+        let ranking = events
             .iter()
             .find_map(|e| match e {
-                Event::Ranked {
-                    reading, ranking, ..
-                } => Some((reading, ranking)),
+                Event::Ranked { ranking, .. } => Some(ranking),
                 _ => None,
             })
             .expect("no Ranked event");
-        assert_eq!(ranked.0.source, crate::router::Source::Heuristic);
-        // No agents were passed in, so the field is empty but the job still completes.
-        assert!(ranked.1.candidates.is_empty());
+        assert_eq!(ranking.considered, 7);
         assert!(events.iter().all(|e| e.id() == h.id));
+    }
+
+    /// Ranking has no fallback, so a failure has to arrive as a failure. If it came back
+    /// as an empty `Ranked` the UI would render "no models fit this prompt", which is a
+    /// different and wrong claim.
+    #[test]
+    fn a_failed_ranking_reports_the_reason() {
+        let r = Runner::new();
+        r.rank("anything".into(), Vec::new(), |_, _| {
+            Err("model not downloaded".into())
+        });
+
+        let events = drain_until_terminal(&r);
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Failed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .expect("no Failed event");
+        assert_eq!(error, "model not downloaded");
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Ranked { .. })),
+            "a failed ranking must not also emit a ranking"
+        );
     }
 
     /// Drain until a terminal event arrives, or give up.
@@ -618,31 +691,38 @@ mod tests {
         }
     }
 
+    /// A sanitize job must end in exactly one of two states: a real result, or a stated
+    /// reason. What it must never do is arrive as an empty `Scanned` — "no personal data
+    /// found" would then be indistinguishable from "nothing looked", and that is how
+    /// personal data reaches an agent.
+    ///
+    /// Deliberately agnostic about whether the model is installed. An earlier version of
+    /// this test asserted failure, which passed only on machines with no checkpoint and
+    /// started failing the moment one was downloaded.
     #[test]
-    fn a_sanitize_job_reports_what_the_checked_patterns_found() {
+    fn a_sanitize_job_either_finds_something_or_says_why() {
         let r = Runner::new();
         let h = r.sanitize("scrivi a mario@example.com per il bonifico".into());
         assert_eq!(h.kind, Kind::Sanitize);
 
         let events = drain_until_done(&r);
-        let scan = events
-            .iter()
-            .find_map(|e| match e {
-                Event::Scanned { scan, .. } => Some(scan),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("no Scanned event: {events:?}"));
-        // The pattern pass runs whether or not the tagger's weights are present, so this
-        // holds in a clean checkout with nothing downloaded.
-        assert!(
-            scan.plan
-                .items
-                .iter()
-                .any(|i| i.finding.tag == "EMAIL" && i.masked),
-            "the address should be found: {:?}",
-            scan.plan.items
-        );
-        assert!(events.iter().all(|e| e.id() == h.id));
+        let scanned = events.iter().find_map(|e| match e {
+            Event::Scanned { scan, .. } => Some(scan),
+            _ => None,
+        });
+        let failed = events.iter().find_map(|e| match e {
+            Event::Failed { error, .. } => Some(error.clone()),
+            _ => None,
+        });
+
+        match (scanned, failed) {
+            (Some(scan), None) => assert!(
+                !scan.plan.items.is_empty(),
+                "the model ran but reported nothing in a prompt containing an address"
+            ),
+            (None, Some(why)) => assert!(!why.is_empty(), "a failure needs a reason"),
+            (a, b) => panic!("expected exactly one outcome, got {a:?} / {b:?}"),
+        }
     }
 
     #[test]
@@ -650,20 +730,12 @@ mod tests {
         // The label is what the status bar shows before any bytes move, so the user knows
         // what they just agreed to.
         let r = Runner::new();
-        let one = r.fetch_models(vec![crate::models::CAPABILITY]);
+        let one = r.fetch_models(vec![crate::models::LLM]);
         one.cancel();
         assert!(
-            one.label.contains("795 MB") && one.label.contains("Capability"),
+            one.label.contains("3.80 GB") && one.label.contains("Bonsai"),
             "got {}",
             one.label
-        );
-
-        let all = r.fetch_models(crate::models::ALL.to_vec());
-        all.cancel();
-        assert!(
-            all.label.contains("3 checkpoints") && all.label.contains("2.80 GB"),
-            "got {}",
-            all.label
         );
     }
 
@@ -671,13 +743,13 @@ mod tests {
     ///
     /// Only meaningful with `candle`: without it there is no download path to cancel.
     #[test]
-    #[cfg(feature = "candle")]
+    #[cfg(feature = "local-llm")]
     fn a_raised_cancel_flag_stops_a_download_before_it_starts() {
         let cancel = Arc::new(AtomicBool::new(true));
         let started = std::time::Instant::now();
-        let err = crate::models::download(&crate::models::PII, &cancel).unwrap_err();
+        let err = crate::models::download(&crate::models::LLM, &cancel).unwrap_err();
         assert!(err.contains("cancelled"), "got {err}");
-        // Generous on purpose: the point is that a 1.26 GB transfer did not start, not that
+        // Generous on purpose: the point is that a 3.8 GB transfer did not start, not that
         // the return was instant. A tight bound here only buys flakiness on a busy machine.
         assert!(
             started.elapsed() < Duration::from_secs(10),
@@ -690,27 +762,26 @@ mod tests {
     fn the_cache_summary_counts_loaded_and_downloaded_separately() {
         use crate::models::{ALL, Phase};
 
-        let mixed = [
-            (ALL[0], Phase::Ready),
-            (ALL[1], Phase::Cached),
-            (ALL[2], Phase::Absent),
-        ];
+        // Written against a synthetic board rather than `ALL`, so the wording stays under
+        // test whatever the catalogue happens to hold.
+        let c = ALL[0];
+        let mixed = [(c, Phase::Ready), (c, Phase::Cached), (c, Phase::Absent)];
         let summary = summarize_cache(&mixed);
         assert!(summary.contains("1 of 3"), "got {summary}");
         assert!(summary.contains("2 downloaded"), "got {summary}");
 
-        let all_ready: Vec<_> = ALL.iter().map(|c| (*c, Phase::Ready)).collect();
+        let all_ready = [(c, Phase::Ready), (c, Phase::Ready)];
         assert_eq!(
             summarize_cache(&all_ready),
-            "3 of 3 local models loaded",
+            "2 of 2 local models loaded",
             "with everything loaded there is nothing left to mention"
         );
 
         // A failure counts as neither loaded nor downloaded.
         let failed = [
-            (ALL[0], Phase::Failed("no network".into())),
-            (ALL[1], Phase::Absent),
-            (ALL[2], Phase::Absent),
+            (c, Phase::Failed("no network".into())),
+            (c, Phase::Absent),
+            (c, Phase::Absent),
         ];
         assert_eq!(
             summarize_cache(&failed),

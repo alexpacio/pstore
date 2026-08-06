@@ -5,25 +5,6 @@
 
 use std::fmt;
 
-/// The six capability dimensions, in the order the Brick capability classifier
-/// emits them (per its model card's `id2label`).
-///
-/// Do **not** reorder: [`crate::router::capability`] permutes the classifier's raw
-/// output into this order at load time, and the skill vectors below are written in it.
-/// Brick's own `skill_router.models` YAML example uses a *different* (alphabetical)
-/// order — mixing the two silently produces wrong routing.
-pub const DIMS: [&str; 6] = [
-    "instruction_following",
-    "coding",
-    "math_reasoning",
-    "world_knowledge",
-    "planning_agentic",
-    "creative_synthesis",
-];
-
-/// A point in the 6-dim capability space.
-pub type Vec6 = [f32; 6];
-
 /// Cost/capability tier. Informational: shown in the UI, never scored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
@@ -47,7 +28,13 @@ impl fmt::Display for Tier {
 
 /// Reasoning-effort level. Higher effort raises a model's effective capability and
 /// its latency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// Serialised in lowercase so a config file names levels the way the agent CLIs do
+/// (`"low"`, `"xhigh"`) rather than the way Rust spells them.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Effort {
     /// Minimal reasoning — fastest.
     Low,
@@ -79,20 +66,6 @@ impl Effort {
             Effort::High => "high",
             Effort::XHigh => "xhigh",
             Effort::Max => "max",
-        }
-    }
-
-    /// How much of the model's headroom this effort unlocks, in `[0, 1]`.
-    ///
-    /// A model run at `Low` does not reach its own ceiling; `Max` does, with
-    /// diminishing returns in between.
-    pub fn headroom(self) -> f32 {
-        match self {
-            Effort::Low => 0.62,
-            Effort::Medium => 0.80,
-            Effort::High => 0.92,
-            Effort::XHigh => 0.97,
-            Effort::Max => 1.00,
         }
     }
 
@@ -162,11 +135,6 @@ pub struct ModelSpec {
     pub display: &'static str,
     /// Weight class. Informational only.
     pub tier: Tier,
-    /// Capability ceiling per dimension, in [`DIMS`] order, in `[0, 1]`.
-    ///
-    /// This is what the model can do at [`Effort::Max`]; lower effort reaches a
-    /// fraction of it (see [`Effort::headroom`]).
-    pub skill: Vec6,
     /// Relative price for the same work, normalised so the cheapest known model is
     /// `1.0`.
     ///
@@ -224,7 +192,6 @@ pub const UNKNOWN_MODEL: ModelSpec = ModelSpec {
     id: "",
     display: "(agent default)",
     tier: Tier::Mid,
-    skill: [0.80, 0.80, 0.74, 0.76, 0.78, 0.76],
     relative_price: 3.0,
     metered: false,
 };
@@ -251,7 +218,6 @@ impl AgentSpec {
     }
 }
 
-// Skill vectors are ordered per DIMS:
 // [instruction_following, coding, math_reasoning, world_knowledge, planning_agentic, creative_synthesis]
 
 const CLAUDE_EFFORTS: &[Effort] = &[
@@ -271,7 +237,6 @@ const CLAUDE_MODELS: &[ModelSpec] = &[
         id: "haiku",
         display: "Haiku 4.5",
         tier: Tier::Cheap,
-        skill: [0.78, 0.70, 0.62, 0.64, 0.58, 0.66],
         relative_price: 1.0,
         metered: false,
     },
@@ -279,7 +244,6 @@ const CLAUDE_MODELS: &[ModelSpec] = &[
         id: "sonnet",
         display: "Sonnet 5",
         tier: Tier::Mid,
-        skill: [0.90, 0.92, 0.84, 0.82, 0.88, 0.84],
         relative_price: 3.0,
         metered: false,
     },
@@ -287,7 +251,6 @@ const CLAUDE_MODELS: &[ModelSpec] = &[
         id: "opus",
         display: "Opus 5",
         tier: Tier::Top,
-        skill: [0.95, 0.97, 0.91, 0.89, 0.96, 0.89],
         relative_price: 5.0,
         metered: false,
     },
@@ -299,7 +262,6 @@ const CLAUDE_MODELS: &[ModelSpec] = &[
         id: "fable",
         display: "Fable 5",
         tier: Tier::Top,
-        skill: [0.97, 0.98, 0.95, 0.92, 0.98, 0.93],
         relative_price: 10.0,
         metered: true,
     },
@@ -309,7 +271,6 @@ const CODEX_MODELS: &[ModelSpec] = &[ModelSpec {
     id: "gpt-5.1-codex",
     display: "GPT-5.1 Codex",
     tier: Tier::Top,
-    skill: [0.91, 0.95, 0.89, 0.85, 0.91, 0.81],
     relative_price: 4.0,
     metered: false,
 }];
@@ -319,7 +280,6 @@ const GEMINI_MODELS: &[ModelSpec] = &[
         id: "gemini-3-flash",
         display: "Gemini 3 Flash",
         tier: Tier::Cheap,
-        skill: [0.80, 0.74, 0.72, 0.78, 0.64, 0.72],
         relative_price: 1.2,
         metered: false,
     },
@@ -327,7 +287,6 @@ const GEMINI_MODELS: &[ModelSpec] = &[
         id: "gemini-3-pro",
         display: "Gemini 3 Pro",
         tier: Tier::Mid,
-        skill: [0.89, 0.89, 0.92, 0.90, 0.86, 0.84],
         relative_price: 3.5,
         metered: false,
     },
@@ -531,47 +490,17 @@ mod tests {
         assert_eq!(bins.len(), before, "duplicate binary name");
     }
 
+    /// Latency ordering is what the hint path sorts on, so it has to be monotonic — a
+    /// higher effort that claimed to be faster would send hints to the slowest option.
     #[test]
-    fn skill_vectors_are_well_formed() {
-        assert_eq!(DIMS.len(), 6);
-        for agent in AGENTS {
-            for m in agent.models {
-                assert_eq!(m.skill.len(), DIMS.len());
-                for (i, v) in m.skill.iter().enumerate() {
-                    assert!(
-                        (0.0..=1.0).contains(v),
-                        "{}/{} dim {} out of range: {v}",
-                        agent.id,
-                        m.id,
-                        DIMS[i]
-                    );
-                }
-            }
-        }
-        for (i, v) in UNKNOWN_MODEL.skill.iter().enumerate() {
-            assert!(
-                (0.0..=1.0).contains(v),
-                "placeholder dim {} out of range",
-                DIMS[i]
-            );
-        }
-    }
-
-    #[test]
-    fn effort_headroom_and_latency_rise_together() {
+    fn effort_latency_rises_with_effort() {
         for pair in Effort::ALL.windows(2) {
             let (lo, hi) = (pair[0], pair[1]);
-            assert!(lo.headroom() < hi.headroom(), "{lo} headroom >= {hi}");
             assert!(
                 lo.latency_factor() < hi.latency_factor(),
                 "{lo} latency >= {hi}"
             );
         }
-        assert_eq!(
-            Effort::Max.headroom(),
-            1.0,
-            "Max must reach the full ceiling"
-        );
         assert_eq!(
             Effort::Low.latency_factor(),
             1.0,

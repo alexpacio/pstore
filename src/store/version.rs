@@ -28,6 +28,8 @@ pub enum Note {
     Autosave,
     /// Result of the prompt shrinker being accepted.
     Shrink,
+    /// Result of the planner being accepted.
+    Plan,
     /// State captured immediately before restoring an older version.
     Restore,
     /// A hint was inserted into the document.
@@ -43,6 +45,7 @@ impl Note {
             Note::Manual => "saved",
             Note::Autosave => "autosave",
             Note::Shrink => "shrunk",
+            Note::Plan => "planned",
             Note::Restore => "pre-restore",
             Note::Hint => "hint",
             Note::Sanitize => "masked",
