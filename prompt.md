@@ -1,1 +1,0 @@
-generate an email for my self to send to a friend of mine. the email should talk about love in an informal way
