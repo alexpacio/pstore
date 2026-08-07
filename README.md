@@ -97,14 +97,15 @@ it outside pstore.
 
 Grab the archive for your platform from the [Releases page](https://github.com/alexpacio/pstore/releases/latest), then:
 
-#### macOS
+#### macOS (Apple Silicon)
 
 ```bash
-tar xzf pstore-macos-arm64.tar.gz      # Apple Silicon
-# or: tar xzf pstore-macos-x86_64.tar.gz   # Intel
+tar xzf pstore-macos-arm64.tar.gz
 xattr -d com.apple.quarantine pstore   # unsigned binary; clears Gatekeeper's block
 sudo mv pstore /usr/local/bin/
 ```
+
+Intel Macs aren't built by CI; use `cargo install` or build from source below instead.
 
 #### Linux
 
