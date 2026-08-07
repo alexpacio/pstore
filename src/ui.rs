@@ -601,14 +601,24 @@ impl Ui {
                     .on_hover_text(format!("what decided it: {because}"));
             }
             ui.checkbox(&mut self.show_all_candidates, "show all");
+            // Exclusions are kept, not deleted — they are the only answer to "why is Crush never
+            // suggested?" (see `router::withhold_unknown`). But most of them are standing facts
+            // about the setup rather than anything about *this* prompt: an agent whose config
+            // names no model reads the same on every ranking forever. Spelled out inline that is
+            // a permanent sentence of noise next to a result that changes each run, so it goes
+            // behind a count the user opens when they are actually asking the question.
             if !ranking.excluded.is_empty() {
-                let text = ranking
-                    .excluded
-                    .iter()
-                    .map(|(id, why)| format!("{id}: {why}"))
-                    .collect::<Vec<_>>()
-                    .join("  ·  ");
-                ui.weak(format!("excluded — {text}"));
+                let n = ranking.excluded.len();
+                egui::CollapsingHeader::new(format!(
+                    "{n} agent{} not ranked",
+                    if n == 1 { "" } else { "s" }
+                ))
+                .id_salt("excluded")
+                .show(ui, |ui| {
+                    for (id, why) in &ranking.excluded {
+                        ui.weak(format!("{id}: {why}"));
+                    }
+                });
             }
         });
 
