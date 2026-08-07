@@ -55,12 +55,6 @@ Weights are cached in the shared Hugging Face location (`~/.cache/huggingface`) 
 short-lived subprocess — nothing stays resident between operations, and nothing about your
 prompt leaves the machine.
 
-> We could not find any documentation from PrismML describing Bonsai's training process as
-> reinforcement learning against Claude or GPT — their published whitepaper attributes the
-> compression to a proprietary weight-transformation method applied to the pretrained Qwen3.6-27B,
-> and the only outside model named anywhere in it is Gemini 3 Flash, used solely as a benchmark
-> judge. If you have a source for the RL claim, it's worth checking before it goes in writing.
-
 ### Memory and context sizing
 
 pstore never loads the checkpoint at its native 262K-token context — that would cost several
