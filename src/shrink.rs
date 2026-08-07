@@ -21,7 +21,9 @@
 //! no coding agent is involved and the prompt does not leave. [`run`] is the entry point;
 //! it is blocking and belongs on a worker thread.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "local-llm")]
+use std::sync::atomic::Ordering;
 
 /// The compression instruction.
 ///
@@ -62,6 +64,18 @@ pub fn compose(document: &str) -> String {
     format!("{INSTRUCTION}\n\n---\n\n{document}")
 }
 
+/// Without local inference there is nothing to shrink *with*, and no fallback to reach for: a
+/// telegraphic rewrite is a judgement about what each word is carrying, so there is nothing to
+/// approximate it with. Reported, like every other model-dependent feature.
+#[cfg(not(feature = "local-llm"))]
+pub fn run(
+    _text: &str,
+    _cancel: &AtomicBool,
+    _note: &mut dyn FnMut(String),
+) -> Result<String, String> {
+    Err(crate::models::NO_LOCAL_INFERENCE.to_string())
+}
+
 /// Shrink a whole prompt, one model call per chunk.
 ///
 /// Blocking, and slow in units of seconds per chunk — the model is a subprocess that maps
@@ -71,6 +85,7 @@ pub fn compose(document: &str) -> String {
 ///
 /// Returns the reason on failure rather than a partial document. Half a shrunk prompt is
 /// not a shorter prompt, it is a truncated one, and it must never reach the diff.
+#[cfg(feature = "local-llm")]
 pub fn run(
     text: &str,
     cancel: &AtomicBool,
@@ -79,6 +94,11 @@ pub fn run(
     let pieces = chunks(text, crate::router::llm::shrink_chunk_chars());
     let total = pieces.len();
     let mut out = String::with_capacity(text.len());
+
+    // One load of the weights for the whole pass, sized for the longest chunk in it. Opening this
+    // per chunk would pay the load again for every part of a long document.
+    let widest = pieces.iter().map(|(body, _)| body.len()).max().unwrap_or(0);
+    let pass = crate::router::llm::ShrinkPass::open(widest)?;
 
     for (n, (body, separator)) in pieces.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -93,7 +113,7 @@ pub fn run(
         if total > 1 {
             note(format!("shrinking… part {} of {total}", n + 1));
         }
-        let rewritten = crate::router::llm::shrink(body)?;
+        let rewritten = pass.chunk(body)?;
         if rewritten.trim().is_empty() {
             return Err(format!(
                 "the model returned nothing for part {} of {total}",

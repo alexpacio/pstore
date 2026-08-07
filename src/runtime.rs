@@ -1,4 +1,4 @@
-//! Finding — and if necessary fetching — the `llama-cli` that runs the checkpoint.
+//! Finding — and if necessary fetching — the `llama-server` that runs the checkpoint.
 //!
 //! pstore does not link an inference engine. It runs the model the same way it runs a
 //! coding agent: as a child process. That process has to come from somewhere, and asking
@@ -22,7 +22,7 @@ use crate::models::Phase;
 
 /// The llama.cpp fork release pstore is built and tested against.
 ///
-/// Bumping this means re-checking the flags in [`crate::router::llm`] — they have been
+/// Bumping this means re-checking the flags in [`crate::router::session`] — they have been
 /// renamed upstream before.
 pub const RELEASE_TAG: &str = "prism-b9599-9ca265a";
 
@@ -31,22 +31,12 @@ pub const RELEASE_URL: &str = "https://github.com/PrismML-Eng/llama.cpp/releases
 
 /// The binary pstore looks for and runs.
 ///
-/// **Not** `llama-cli`. That one refuses `--no-conversation` at runtime — despite listing it
-/// in `--help` — and says to use `llama-completion` instead. `llama-completion` is the
-/// non-interactive one, which is all pstore ever wants.
+/// **The server, not the one-shot binary.** pstore runs one load of the weights per operation and
+/// several calls through it — see [`crate::router::session`] — and only the server takes a
+/// grammar per request, which ranking needs: one call is constrained by a JSON schema and the
+/// next by a hand-written grammar. It is never exposed; it binds loopback on a kernel-chosen
+/// port behind a one-time key and dies with the operation.
 pub const BINARY: &str = if cfg!(windows) {
-    "llama-completion.exe"
-} else {
-    "llama-completion"
-};
-
-/// The binary behind [`crate::serve`], for running the checkpoint as a background service.
-///
-/// Same release, same kernels, same weights — the only difference is that it stays up and
-/// speaks HTTP, so a coding agent can use the model pstore already downloaded instead of
-/// reaching a vendor's API. Extracted alongside [`BINARY`] rather than fetched on demand:
-/// they come out of one archive, and 15 MB now beats a second download later.
-pub const SERVER_BINARY: &str = if cfg!(windows) {
     "llama-server.exe"
 } else {
     "llama-server"
@@ -75,7 +65,7 @@ impl Asset {
 /// Accelerated Linux builds (CUDA, ROCm, Vulkan) exist too, but picking between them means
 /// probing the machine's driver stack, and guessing wrong yields a binary that fails to
 /// start rather than one that runs slowly. The portable build always works; a user with a
-/// GPU can point `llama_cli_path` at an accelerated build they chose themselves.
+/// GPU can point `llama_path` at an accelerated build they chose themselves.
 pub fn asset() -> Result<Asset, String> {
     // macOS: Metal is in the standard arm64 build, no separate variant needed.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -123,7 +113,7 @@ pub fn asset() -> Result<Asset, String> {
     #[allow(unreachable_code)]
     Err(format!(
         "no prebuilt llama-cli for {}-{}; build the PrismML fork yourself and set \
-         `llama_cli_path` in .pstore/config.json",
+         `llama_path` in .pstore/config.json",
         std::env::consts::OS,
         std::env::consts::ARCH
     ))
@@ -136,7 +126,7 @@ pub fn asset() -> Result<Asset, String> {
 /// inference misbehaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
-    /// `llama_cli_path` in the config.
+    /// `llama_path` in the config.
     Override,
     /// A machine-wide install an administrator provisioned.
     System,
@@ -203,11 +193,11 @@ fn is_executable(p: &std::path::Path) -> bool {
     true
 }
 
-/// Find `llama-cli` without touching the network.
+/// Find the runtime without touching the network.
 ///
 /// Order is deliberate: an explicit override always wins, then a machine-wide install
 /// (an administrator chose it for everyone), then pstore's own copy, then `PATH` last —
-/// a `llama-cli` on `PATH` is most likely stock llama.cpp, which cannot load these
+/// a `llama-server` on `PATH` is most likely stock llama.cpp, which cannot load these
 /// weights, so it is a fallback rather than a preference.
 pub fn locate(override_path: Option<&str>) -> Option<Runtime> {
     if let Some(p) = override_path.filter(|p| !p.trim().is_empty()) {
@@ -249,24 +239,12 @@ fn which_on_path() -> Option<PathBuf> {
         .find(|p| is_executable(p))
 }
 
-/// The `llama-server` beside the resolved runtime, if it is there.
-///
-/// Deliberately derived from [`locate`] rather than searched for independently: the server
-/// and the one-shot binary are a matched pair from one release, and a `llama-server` from
-/// somewhere else on `PATH` is most likely stock llama.cpp, which cannot load these weights.
-/// An override that points at a `llama-completion` gets its sibling checked the same way.
-pub fn locate_server(override_path: Option<&str>) -> Option<PathBuf> {
-    let rt = locate(override_path)?;
-    let candidate = rt.path.parent()?.join(SERVER_BINARY);
-    is_executable(&candidate).then_some(candidate)
-}
-
 /// Why the runtime is not usable, phrased so the Models window can show it verbatim.
 pub fn missing_reason(override_path: Option<&str>) -> String {
     match override_path.filter(|p| !p.trim().is_empty()) {
-        Some(p) => format!("`llama_cli_path` is set to {p:?}, which is not an executable file"),
+        Some(p) => format!("`llama_path` is set to {p:?}, which is not an executable file"),
         None => format!(
-            "{BINARY} not installed — pstore can download it ({}), or set `llama_cli_path`",
+            "{BINARY} not installed — pstore can download it ({}), or set `llama_path`",
             match asset() {
                 Ok(a) => crate::models::bytes_label(a.bytes),
                 Err(_) => "unavailable for this platform".into(),
@@ -287,9 +265,7 @@ pub fn progress() -> Phase {
 
 #[cfg(feature = "local-llm")]
 mod provision {
-    use super::{
-        Asset, BINARY, Origin, PathBuf, Phase, Runtime, SERVER_BINARY, asset, managed_dir,
-    };
+    use super::{Asset, BINARY, Origin, PathBuf, Phase, Runtime, asset, managed_dir};
     use std::io::Read;
     use std::sync::{Mutex, OnceLock};
 
@@ -317,7 +293,7 @@ mod provision {
         }
     }
 
-    /// Download, verify and unpack the pinned `llama-cli` into pstore's assets directory.
+    /// Download, verify and unpack the pinned runtime into pstore's assets directory.
     ///
     /// Blocking; call from a worker thread. Reports into [`PROGRESS`] as bytes arrive.
     /// Returns the installed runtime, or the reason it could not be installed.
@@ -331,7 +307,7 @@ mod provision {
         let dir = managed_dir().ok_or("no user data directory to install into")?;
 
         set(Phase::Fetching {
-            file: "llama-cli",
+            file: BINARY,
             done: 0,
             total: asset.bytes,
             files_done: 0,
@@ -400,7 +376,7 @@ mod provision {
             }
             out.extend_from_slice(&buf[..n]);
             set(Phase::Fetching {
-                file: "llama-cli",
+                file: BINARY,
                 done: out.len() as u64,
                 total,
                 files_done: 0,
@@ -434,16 +410,15 @@ mod provision {
 
     /// Unpack the archive and return the path to the installed binary.
     ///
-    /// Only `llama-cli` and the shared libraries beside it are extracted; the release also
+    /// Only the runtime and the shared libraries beside it are extracted; the release also
     /// carries a dozen other tools pstore never runs. Entries are flattened into `dir`
     /// after their file name is checked, so a crafted archive cannot write outside it.
     fn unpack(bytes: &[u8], dir: &std::path::Path) -> Result<PathBuf, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-        // The binary plus every shared library beside it. `libllama-completion-impl.dylib`
-        // in particular is not optional: the binary is a thin shim over it.
+        // The binary plus every shared library beside it. `libllama-server-impl.dylib` in
+        // particular is not optional: the binary is a thin shim over it.
         let wanted = |name: &str| {
             name == BINARY
-                || name == SERVER_BINARY
                 || name.ends_with(".so")
                 || name.ends_with(".dylib")
                 || name.ends_with(".dll")
@@ -512,15 +487,8 @@ mod provision {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            for name in [BINARY, SERVER_BINARY] {
-                let p = dir.join(name);
-                // The server is a convenience, not a requirement: an archive without it
-                // still gives a working pstore, and `serve` says so if it is asked for.
-                if p.is_file() {
-                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|e| format!("making {name} executable: {e}"))?;
-                }
-            }
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("making {BINARY} executable: {e}"))?;
         }
         Ok(binary)
     }
@@ -565,7 +533,7 @@ mod tests {
     /// the setting look broken in a way that is very hard to diagnose.
     #[test]
     fn a_bad_override_does_not_fall_through() {
-        assert!(locate(Some("/definitely/not/a/real/llama-cli")).is_none());
+        assert!(locate(Some("/definitely/not/a/real/llama-server")).is_none());
         // Blank is treated as unset rather than as a broken path.
         let blank = locate(Some("   "));
         assert_eq!(blank.is_some(), locate(None).is_some());
@@ -573,9 +541,9 @@ mod tests {
 
     #[test]
     fn missing_reason_names_the_setting() {
-        let configured = missing_reason(Some("/nope/llama-cli"));
-        assert!(configured.contains("/nope/llama-cli"));
-        assert!(configured.contains("llama_cli_path"));
+        let configured = missing_reason(Some("/nope/llama-server"));
+        assert!(configured.contains("/nope/llama-server"));
+        assert!(configured.contains("llama_path"));
 
         let absent = missing_reason(None);
         assert!(absent.contains(BINARY), "got {absent}");

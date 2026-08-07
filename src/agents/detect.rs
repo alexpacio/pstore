@@ -97,6 +97,12 @@ pub struct Detected {
     pub has_credentials: bool,
     /// Current belief about usability.
     pub status: Status,
+    /// The model this agent's own config says it will run, for the agents pstore cannot tell.
+    ///
+    /// `None` either because the agent takes a `--model` flag (its models are in the registry)
+    /// or because its config did not say — see [`super::configured`]. The second case is what
+    /// keeps a nameless candidate out of the ranking.
+    pub configured_model: Option<String>,
 }
 
 impl Detected {
@@ -266,6 +272,9 @@ pub fn detect_in(dir: &Path, probe: &Probe) -> Vec<Detected> {
             path,
             has_credentials,
             status,
+            // Only for the agents that choose their own model; the rest get theirs from the
+            // registry, and asking their config would be a second answer to a settled question.
+            configured_model: super::configured::model_for(spec, dir),
         });
     }
     out

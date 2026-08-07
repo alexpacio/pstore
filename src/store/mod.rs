@@ -5,7 +5,7 @@
 
 pub mod version;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::config::SIDECAR;
 
@@ -70,11 +70,6 @@ impl PromptStore {
     /// Create a store over `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
-    }
-
-    /// The directory being managed.
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
 
     /// List `.md` prompts, newest-modified first. Non-recursive; skips `.pstore/`.

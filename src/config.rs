@@ -50,11 +50,12 @@ pub struct Config {
 /// names, because this is a setting people edit by hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum LocalModel {
-    /// 3.8 GB. Choose it when memory is the binding constraint.
+    /// 3.8 GB, and **the default**: it routes as well as the larger build and is about twice as
+    /// fast per token.
+    #[default]
     #[serde(rename = "1-bit")]
     OneBit,
-    /// 7.17 GB. The default: measurably better at the judgement pstore asks for.
-    #[default]
+    /// 7.17 GB. Longer shortlists and sharper reasons, for a machine with the memory to spare.
     #[serde(rename = "ternary")]
     Ternary,
 }
@@ -85,41 +86,28 @@ pub struct Prefs {
     pub sidebar_width: f32,
     /// Preferred agent id to send to, overriding the ranker's pick.
     pub pinned_agent: Option<String>,
-    /// Allow pstore to download the checkpoint and the `llama-cli` runtime.
+    /// Allow pstore to download the checkpoint and the `llama-server` runtime.
     ///
     /// Covers both: with this off, pstore makes no network request of any kind, and the
     /// features that need the model are disabled rather than degraded.
     pub allow_model_download: bool,
-    /// Use this `llama-cli` instead of a provisioned or discovered one.
+    /// Use this `llama-server` instead of a provisioned or discovered one.
     ///
     /// For a build the user made themselves — an accelerated one, say. It must be
     /// PrismML's fork; stock llama.cpp cannot load the checkpoint's quantisation.
-    pub llama_cli_path: Option<String>,
+    pub llama_path: Option<String>,
     /// Hard upper bound on the context window any single model call may request.
     ///
-    /// A **cap**, not a setting: the window is fitted to each prompt (see
-    /// [`crate::router::llm::fit_context`]) and is normally far below this. Lowering it
-    /// bounds memory on a small machine; raising it costs KV cache roughly linearly and is
-    /// only needed for prompts larger than anything pstore currently sends.
+    /// A **cap**, not a setting: the window is fitted to each operation from the prompts it will
+    /// actually send (see [`crate::router::llm::fit_context_for`]) and is normally far below
+    /// this. Lowering it bounds memory on a small machine; raising it costs KV cache roughly
+    /// linearly and is only needed for prompts larger than anything pstore currently sends.
     pub model_context_ceiling: usize,
-    /// Port the background model server binds on loopback.
+    /// Which build of the checkpoint to run — `"1-bit"` (the default) or `"ternary"`.
     ///
-    /// Only consulted when the server is started from the Models window; nothing listens
-    /// otherwise. Change it if something else already owns the default — the server refuses
-    /// to start on a busy port rather than silently sharing it.
-    pub model_server_port: u16,
-    /// Context window the background server is built with.
-    ///
-    /// Unlike pstore's own calls, this one cannot be fitted per prompt: the server is built
-    /// once and serves whatever arrives, and a coding agent's context grows through a
-    /// session. So it is a real setting rather than a ceiling, and it costs KV cache for as
-    /// long as the server runs.
-    pub model_server_context: usize,
-    /// Which build of the checkpoint to run — `"ternary"` or `"1-bit"`.
-    ///
-    /// Switching takes effect on the next model call, not the next launch: nothing is
-    /// resident between calls. Switching to a build that has not been downloaded is allowed,
-    /// and the features that need it say so until it arrives.
+    /// Switching takes effect on the next operation, not the next launch: nothing is resident
+    /// between them. Switching to a build that has not been downloaded is allowed, and the
+    /// features that need it say so until it arrives.
     pub local_model: LocalModel,
     /// How many characters of reasoning the local model may produce before it must answer.
     ///
@@ -132,6 +120,18 @@ pub struct Prefs {
     /// Zero disables reasoning entirely, which is faster and measurably worse — see
     /// [`crate::router::llm::rank`].
     pub model_reasoning_budget: usize,
+    /// Look up a model pstore has no facts about, over the network.
+    ///
+    /// A candidate the local checkpoint does not recognise and the built-in table does not
+    /// describe is **excluded** from ranking rather than ranked blind — see
+    /// [`crate::knowledge`]. This setting decides whether pstore first tries to find out what
+    /// the model is instead of giving up on it.
+    ///
+    /// What leaves the machine is the **model's name** and nothing else: never the prompt,
+    /// never the file, never the project. Results are cached on disk, so a given name is
+    /// looked up once. Turn it off — or set `allow_model_download: false`, which also
+    /// covers this — to keep pstore entirely offline.
+    pub allow_model_lookup: bool,
     /// Which models and effort levels pstore may pick from.
     pub filter: Filter,
 }
@@ -144,16 +144,13 @@ impl Default for Prefs {
             sidebar_width: 260.0,
             pinned_agent: None,
             allow_model_download: true,
-            llama_cli_path: None,
+            llama_path: None,
             model_context_ceiling: 8192,
             local_model: LocalModel::default(),
-            model_server_port: 8787,
-            // Enough for a coding agent's session without pinning gigabytes of cache: at
-            // 4-bit KV on this architecture, 32k costs a few hundred megabytes.
-            model_server_context: 32_768,
             // Measured: 1 400 characters is where the reasoning on a hard routing prompt
             // has finished its analysis and started repeating itself.
             model_reasoning_budget: 1400,
+            allow_model_lookup: true,
             filter: Filter::default(),
         }
     }
@@ -172,12 +169,11 @@ struct Layer {
     sidebar_width: Option<f32>,
     pinned_agent: Option<String>,
     allow_model_download: Option<bool>,
-    llama_cli_path: Option<String>,
+    llama_path: Option<String>,
     model_context_ceiling: Option<usize>,
     local_model: Option<LocalModel>,
-    model_server_port: Option<u16>,
-    model_server_context: Option<usize>,
     model_reasoning_budget: Option<usize>,
+    allow_model_lookup: Option<bool>,
     filter: Option<Filter>,
 }
 
@@ -214,8 +210,8 @@ impl Layer {
         if let Some(v) = self.allow_model_download {
             base.allow_model_download = v;
         }
-        if self.llama_cli_path.is_some() {
-            base.llama_cli_path = self.llama_cli_path;
+        if self.llama_path.is_some() {
+            base.llama_path = self.llama_path;
         }
         if let Some(v) = self.model_context_ceiling {
             base.model_context_ceiling = v;
@@ -223,14 +219,11 @@ impl Layer {
         if let Some(v) = self.local_model {
             base.local_model = v;
         }
-        if let Some(v) = self.model_server_port {
-            base.model_server_port = v;
-        }
-        if let Some(v) = self.model_server_context {
-            base.model_server_context = v;
-        }
         if let Some(v) = self.model_reasoning_budget {
             base.model_reasoning_budget = v;
+        }
+        if let Some(v) = self.allow_model_lookup {
+            base.allow_model_lookup = v;
         }
         // Replaced wholesale rather than merged. A half-merged policy — this layer's allow
         // list against that layer's block list — is not something anyone can reason about

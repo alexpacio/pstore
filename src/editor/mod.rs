@@ -25,11 +25,6 @@ impl Selection {
             (self.end, self.start)
         }
     }
-
-    /// Whether the selection covers no characters.
-    pub fn is_empty(self) -> bool {
-        self.start == self.end
-    }
 }
 
 /// The prompt being edited.
@@ -99,6 +94,72 @@ impl Buffer {
         self.last_change = Some(Instant::now());
         let text = self.text.clone();
         self.history.on_edit(&text, caret);
+    }
+
+    /// Where the caret is, in characters.
+    pub fn caret(&self) -> usize {
+        self.selection.end
+    }
+
+    /// How many characters the buffer holds.
+    pub fn len_chars(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    /// Move the caret, extending the selection when `extend` is set.
+    ///
+    /// Clamped to the buffer, so a caller doing its own arithmetic over lines cannot put the
+    /// caret past the end and panic the next edit.
+    pub fn move_caret(&mut self, to: usize, extend: bool) {
+        let to = to.min(self.len_chars());
+        self.selection = Selection {
+            start: if extend { self.selection.start } else { to },
+            end: to,
+        };
+    }
+
+    /// Type one character at the caret, replacing the selection if there is one.
+    ///
+    /// Coalesced into the current undo granule the same way the widget path is — typing a word
+    /// is one undo step, not eight — which is the reason this lives here rather than in a front
+    /// end. A front end that mutated `text` itself would silently get per-keystroke undo.
+    pub fn type_char(&mut self, c: char) {
+        let (lo, hi) = self.selection.sorted();
+        self.splice(lo, hi, &c.to_string());
+    }
+
+    /// Delete the selection, or the character before the caret.
+    pub fn backspace(&mut self) {
+        let (lo, hi) = self.selection.sorted();
+        if lo != hi {
+            return self.splice(lo, hi, "");
+        }
+        if lo == 0 {
+            return;
+        }
+        self.splice(lo - 1, lo, "");
+    }
+
+    /// Delete the selection, or the character after the caret.
+    pub fn delete(&mut self) {
+        let (lo, hi) = self.selection.sorted();
+        if lo != hi {
+            return self.splice(lo, hi, "");
+        }
+        if lo >= self.len_chars() {
+            return;
+        }
+        self.splice(lo, lo + 1, "");
+    }
+
+    /// Replace `lo..hi` with `insert`, as a coalescing edit rather than an atomic one.
+    fn splice(&mut self, lo: usize, hi: usize, insert: &str) {
+        let mut out: String = self.text.chars().take(lo).collect();
+        out.push_str(insert);
+        out.extend(self.text.chars().skip(hi));
+        self.text = out;
+        let caret = lo + insert.chars().count();
+        self.on_widget_edit(caret);
     }
 
     /// Commit pending typing to history once the buffer has been idle long enough.

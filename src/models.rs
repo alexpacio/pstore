@@ -50,19 +50,28 @@ impl Checkpoint {
     }
 }
 
-/// 1-bit Bonsai 27B — the small operating point.
+/// 1-bit Bonsai 27B — **the default**.
 ///
 /// Binary `{−1, +1}` weights at a true 1.125 bits: a 27B model in 3.8 GB, which is what makes
 /// it fit machines the ternary build does not. It retains 89.5% of FP16 on the card's
-/// aggregate.
+/// aggregate, loads in about half the time, and decodes about twice as fast.
 ///
-/// It is **not** the default, and the reason is specific rather than a benchmark table.
+/// It was **not** the default, and the reason was specific rather than a benchmark table.
 /// Routing is instruction-following and judgement, which are the two categories this build
 /// gives up most on — IFBench 52.4 and τ²-Bench 61.3, against FP16's 68.0 and 82.9. Asked to
 /// rank fifteen (model, effort) pairs for a hard three-file refactor it answered
 /// `Haiku 4.5, effort medium` and then indices 2, 3, 4 and 5 in order, scoring all five
-/// `fit: 85` with a copy-pasted reason. Choose it when memory is the binding constraint, and
-/// expect the ranking to be coarser.
+/// `fit: 85` with a copy-pasted reason: it was counting, not ranking.
+///
+/// **That is fixed, and it was the question rather than the weights.** Deciding the prompt's
+/// difficulty in its own call, ranking models rather than (model, effort) pairs, and banding the
+/// scores by position — see [`crate::router::llm::Demand`] and
+/// [`crate::router::llm::fit_band`] — this build now puts Opus 5 at high effort on top of a
+/// twenty-one-combination field for that same refactor, and Haiku 4.5 at low effort for a typo.
+///
+/// What remains is narrower: it is asked for three picks rather than five
+/// ([`crate::router::llm::shortlist_for`]) because it fills a longer shortlist less
+/// convincingly, and its reasons are blunter. Choose it when memory is the binding constraint.
 pub const LLM_1BIT: Checkpoint = Checkpoint {
     id: "llm-1bit",
     title: "Bonsai 27B (1-bit)",
@@ -73,14 +82,15 @@ pub const LLM_1BIT: Checkpoint = Checkpoint {
     license: "Apache-2.0",
 };
 
-/// Ternary Bonsai 27B — the quality operating point, and the default.
+/// Ternary Bonsai 27B — the quality operating point.
 ///
 /// Ternary `{−1, 0, +1}` weights at a true 1.71 bits, 7.17 GB deployed, 94.6% of FP16. The
-/// extra zero state is a more expressive alphabet, and on the judgement-shaped work pstore
-/// asks for it is the difference between a ranking and a list.
+/// extra zero state is a more expressive alphabet, which shows up as longer shortlists it can
+/// separate honestly and sharper reasons for each pick.
 ///
 /// It costs 3.4 GB more on disk and in memory, and roughly twice the bytes moved per decoded
-/// token — see [`crate::router::llm`] for what that means in seconds.
+/// token — see [`crate::router::llm`] for what that means in seconds. Choose it when the machine
+/// has the memory to spare and the wait is worth more than the seconds.
 pub const LLM_TERNARY: Checkpoint = Checkpoint {
     id: "llm-ternary",
     title: "Bonsai 27B (ternary)",
@@ -94,10 +104,11 @@ pub const LLM_TERNARY: Checkpoint = Checkpoint {
 /// Every checkpoint, in the order the Models window lists them.
 ///
 /// Two entries, and pstore runs exactly one of them — whichever
-/// [`crate::config::Prefs::local_model`] names. They are offered side by side rather than
-/// decided here because the trade is a judgement about *this* machine: a laptop with 16 GB
-/// and one with 64 GB should not be given the same answer. Both may sit on disk at once; only
-/// the selected one is ever run, and only its absence blocks anything.
+/// [`crate::config::Prefs::local_model`] names. The smaller one is listed first because it is the
+/// default: it routes as well and costs half the memory and half the time. They are offered side
+/// by side rather than decided here because the remaining trade is a judgement about *this*
+/// machine. Both may sit on disk at once; only the selected one is ever run, and only its absence
+/// blocks anything.
 ///
 /// Neither entry lists the `mmproj` vision tower or the `dspark` drafter their repositories
 /// also ship. pstore sends no images; and the drafter — lossless though it is, since
@@ -105,7 +116,7 @@ pub const LLM_TERNARY: Checkpoint = Checkpoint {
 /// serving path, is not enabled by PrismML on Apple Silicon at all because a batch-1
 /// verification pass does not amortise there, and would only touch generation, which is under
 /// half of a ranking call.
-pub const ALL: [Checkpoint; 2] = [LLM_TERNARY, LLM_1BIT];
+pub const ALL: [Checkpoint; 2] = [LLM_1BIT, LLM_TERNARY];
 
 /// Which preference value selects the checkpoint with this id, if any.
 ///
@@ -127,12 +138,12 @@ pub fn choice_for(id: &str) -> Option<crate::config::LocalModel> {
 pub fn tradeoff(id: &str) -> &'static str {
     match id {
         _ if id == LLM_1BIT.id => {
-            "89.5% of FP16 · ~5 GB peak · faster per token, and coarser — it ranked a hard \
-             three-file refactor to the cheapest model at medium effort"
+            "89.5% of FP16 · ~5 GB peak · the default: about twice as fast per token and \
+             routes the same, with a three-pick shortlist rather than five"
         }
         _ if id == LLM_TERNARY.id => {
             "94.6% of FP16 · ~8.4 GB peak · about half the tokens per second, and the one \
-             that separates a shortlist instead of listing it"
+             that separates a longer field with sharper reasons"
         }
         _ => "",
     }
@@ -517,7 +528,7 @@ mod tests {
 
         let snap = snapshot();
         assert_eq!(snap.len(), ALL.len());
-        assert_eq!(snap[0].0.id, LLM_TERNARY.id);
+        assert_eq!(snap[0].0.id, LLM_1BIT.id, "the default is listed first");
 
         // Hand the rows back to the cache's own answer.
         set(LLM_TERNARY.id, Phase::Absent);
@@ -547,8 +558,9 @@ mod tests {
         }
         assert_eq!(choice_for("not-a-checkpoint"), None);
 
-        // The default has to be one of the two, and it is the quality one.
-        assert_eq!(LocalModel::default().checkpoint().id, LLM_TERNARY.id);
+        // The default has to be one of the two, and it is the small one: it routes as well as
+        // the other and costs half the memory and half the wait.
+        assert_eq!(LocalModel::default().checkpoint().id, LLM_1BIT.id);
     }
 
     /// The preference is written by hand into a config file, so it serialises as the words a

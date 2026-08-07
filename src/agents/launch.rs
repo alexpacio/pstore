@@ -167,15 +167,6 @@ fn wait_for(
     }
 }
 
-/// A line emitted by a streaming run.
-#[derive(Debug, Clone)]
-pub enum Line {
-    /// Text extracted from stdout, ready to append to the panel.
-    Out(String),
-    /// A stderr line, retained for failure classification.
-    Err(String),
-}
-
 /// Run headlessly, forwarding output line-by-line so the UI can render tokens as
 /// they arrive. Blocks until the child exits; call from a worker thread.
 // Plumbing: every argument is a distinct, unrelated input (program, argv,
@@ -189,7 +180,7 @@ pub fn run_streaming(
     cwd: Option<&Path>,
     timeout: Duration,
     cancel: Option<&Cancel>,
-    tx: &Sender<Line>,
+    tx: &Sender<String>,
 ) -> std::io::Result<Output> {
     let started = Instant::now();
     let mut cmd = Command::new(program);
@@ -224,21 +215,22 @@ pub fn run_streaming(
                 if let Some(text) = extract_text(&line)
                     && !text.is_empty()
                 {
-                    let _ = out_tx.send(Line::Out(text));
+                    let _ = out_tx.send(text);
                 }
             }
         }
         collected
     });
 
-    let err_tx = tx.clone();
+    // stderr is collected but never forwarded: it is read for failure classification, not shown
+    // as output, and an agent's progress chatter in the answer panel is noise the user then has
+    // to read past.
     let err_handle = std::thread::spawn(move || {
         let mut collected = String::new();
         if let Some(p) = stderr {
             for line in BufReader::new(p).lines().map_while(Result::ok) {
                 collected.push_str(&line);
                 collected.push('\n');
-                let _ = err_tx.send(Line::Err(line));
             }
         }
         collected
@@ -663,16 +655,11 @@ mod tests {
         drop(tx);
         assert!(out.ok());
 
-        let mut text = Vec::new();
-        let mut errs = Vec::new();
-        for line in rx {
-            match line {
-                Line::Out(s) => text.push(s),
-                Line::Err(s) => errs.push(s),
-            }
-        }
-        assert_eq!(text, vec!["one", "two"]);
-        assert_eq!(errs, vec!["oops"]);
+        // Only stdout is forwarded. stderr is collected for classification — `oops` is in
+        // `out.stderr` — and deliberately kept out of the stream the answer panel renders.
+        let streamed: Vec<String> = rx.into_iter().collect();
+        assert_eq!(streamed, vec!["one", "two"]);
+        assert!(out.stderr.contains("oops"), "got {:?}", out.stderr);
     }
 
     #[test]

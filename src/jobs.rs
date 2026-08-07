@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use crate::agents::detect::Detected;
 use crate::agents::failover::{self, AllFailed, Completed};
-use crate::agents::launch::Line;
 use crate::agents::registry::{Effort, PromptVia};
 use crate::models::Checkpoint;
 use crate::pii;
@@ -241,35 +240,6 @@ impl Runner {
         })
     }
 
-    /// Start the background model server and wait until it answers.
-    ///
-    /// On a worker because it maps up to 7.17 GB and then polls a health check: doing it on
-    /// the UI thread would freeze the window for the whole load.
-    pub fn serve_model(&self) -> Handle {
-        self.spawn(
-            Kind::Models,
-            "starting the background model server".into(),
-            move |id, tx, _| {
-                let note = match crate::serve::start() {
-                    Ok(s) => format!("serving {} at {}", s.title(), s.base_url()),
-                    Err(error) => {
-                        let _ = tx.send(Event::Failed {
-                            id,
-                            kind: Kind::Models,
-                            error,
-                        });
-                        return;
-                    }
-                };
-                let _ = tx.send(Event::Done {
-                    id,
-                    kind: Kind::Models,
-                    note,
-                });
-            },
-        )
-    }
-
     /// Look at the model cache and record what is already downloaded.
     ///
     /// Cheap and network-free, but it touches the filesystem a dozen times, so it stays
@@ -468,17 +438,11 @@ impl Runner {
         self.spawn(kind, label, move |id, tx, cancel| {
             // Bridge the launcher's line channel onto the UI event channel, so text
             // reaches the panel as it is produced rather than at process exit.
-            let (line_tx, line_rx) = std::sync::mpsc::channel::<Line>();
+            let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
             let pump_tx = tx.clone();
             let pump = std::thread::spawn(move || {
-                for line in line_rx {
-                    match line {
-                        Line::Out(text) => {
-                            let _ = pump_tx.send(Event::Chunk { id, text });
-                        }
-                        // stderr is kept for classification, not shown as output.
-                        Line::Err(_) => {}
-                    }
+                for text in line_rx {
+                    let _ = pump_tx.send(Event::Chunk { id, text });
                 }
             });
 
@@ -533,7 +497,7 @@ impl Runner {
 #[cfg(feature = "local-llm")]
 fn provision_runtime(tx: &Sender<Event>, id: JobId, cancel: &AtomicBool) -> Result<(), String> {
     let prefs = crate::config::prefs_snapshot();
-    if crate::runtime::locate(prefs.llama_cli_path.as_deref()).is_some() {
+    if crate::runtime::locate(prefs.llama_path.as_deref()).is_some() {
         return Ok(());
     }
     let asset = crate::runtime::asset()?;

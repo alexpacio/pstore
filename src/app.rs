@@ -160,11 +160,6 @@ pub struct App {
     pub models_open: bool,
     /// Job currently downloading or loading weights.
     pub models_job: Option<JobId>,
-    /// Job currently starting the background model server.
-    ///
-    /// Its own slot rather than sharing `models_job`: starting the server maps gigabytes and
-    /// waits on a health check, and it must not make the download buttons look busy.
-    pub serve_job: Option<JobId>,
     /// Handles for running jobs, so the user can stop them.
     running: Vec<Handle>,
 
@@ -214,7 +209,6 @@ impl App {
             pii_job: None,
             models_open: false,
             models_job: None,
-            serve_job: None,
             running: Vec::new(),
             pinned_agent: None,
             status: "detecting agents…".into(),
@@ -468,22 +462,6 @@ impl App {
         let job = self.runner.load_models(downloaded);
         self.models_job = Some(job.id);
         self.running.push(job);
-    }
-
-    /// Start the selected build as a background service.
-    ///
-    /// Nothing here decides *whether* to serve — that is the button's job — but a second
-    /// start while one is already in flight would map the weights twice, which on the ternary
-    /// build is 14 GB before either finishes.
-    pub fn start_server(&mut self) {
-        if self.serve_job.is_some() {
-            self.status = "already starting the server".into();
-            return;
-        }
-        let job = self.runner.serve_model();
-        self.serve_job = Some(job.id);
-        self.running.push(job);
-        self.status = "starting the background model server…".into();
     }
 
     /// Stop a running download.
@@ -822,11 +800,6 @@ impl App {
         }
     }
 
-    /// Whether a job is still running.
-    pub fn is_running(&self, id: JobId) -> bool {
-        self.running.iter().any(|h| h.id == id)
-    }
-
     /// Drain worker events and run periodic upkeep. Call once per frame.
     pub fn tick(&mut self) {
         self.buffer.tick();
@@ -857,9 +830,6 @@ impl App {
                 }
             }
             Event::Done { id, kind, note } => {
-                if kind == Kind::Models && self.serve_job == Some(id) {
-                    self.serve_job = None;
-                }
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
                 }
@@ -951,7 +921,7 @@ impl App {
                         let model = if result.model_id.is_empty() {
                             "agent default"
                         } else {
-                            result.model_id
+                            &result.model_id
                         };
                         h.answered_by = Some(format!(
                             "{} · {model} · effort {} ({:.1}s)",
@@ -988,9 +958,6 @@ impl App {
                 if kind == Kind::Plan && self.plan_job == Some(id) {
                     self.plan_job = None;
                 }
-                if kind == Kind::Models && self.serve_job == Some(id) {
-                    self.serve_job = None;
-                }
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
                 }
@@ -1011,9 +978,6 @@ impl App {
                 }
                 if kind == Kind::Plan && self.plan_job == Some(id) {
                     self.plan_job = None;
-                }
-                if kind == Kind::Models && self.serve_job == Some(id) {
-                    self.serve_job = None;
                 }
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
@@ -1099,8 +1063,8 @@ mod tests {
         router::Choice {
             agent_id: agent,
             agent_display: agent,
-            model_id: "m",
-            model_display: "M",
+            model_id: "m".into(),
+            model_display: "M".into(),
             tier: registry::Tier::Mid,
             effort,
             effort_selectable: true,
@@ -1109,6 +1073,7 @@ mod tests {
             relative_price: 1.0,
             fit,
             rationale: String::new(),
+            row_index: 0,
         }
     }
 
@@ -1371,6 +1336,7 @@ mod tests {
                 version: Some("1.0".into()),
                 has_credentials: true,
                 status: Status::Verified,
+                configured_model: None,
             }],
         });
         assert_eq!(app.agents.len(), 1);

@@ -185,14 +185,14 @@ impl UndoStack {
         Some(self.entries[self.cursor].clone())
     }
 
-    /// Number of retained committed states, for tests and diagnostics.
-    pub fn len(&self) -> usize {
+    /// Number of retained committed states.
+    ///
+    /// Private, and only the tests ask: the one that matters holds [`CAP`] honest, because a
+    /// history that quietly stopped being bounded would cost memory on a long prompt and
+    /// nothing would say so.
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    /// Whether only the baseline state is retained.
-    pub fn is_empty(&self) -> bool {
-        self.entries.len() <= 1
     }
 }
 

@@ -1,132 +1,118 @@
 //! The one place that runs the model.
 //!
-//! Every local inference in pstore — ranking the agents, finding personal data — is a
-//! `llama-cli` invocation made from here. The module is deliberately the only thing that
-//! knows the command line, so the flags that bound memory (see [`fit_context`]) cannot be
-//! forgotten at one call site and applied at another.
+//! Every local inference in pstore — ranking the agents, judging how hard a prompt is, finding
+//! personal data, compressing a document — is a call made from here, through a
+//! [`Session`](super::session::Session).
 //!
-//! **One process per call.** There is no resident server: `llama-completion` starts, maps
-//! the weights, generates, and exits.
+//! **One load per operation, and nothing between them.** A session maps the weights, answers
+//! every call that one user action needs, and dies with it. Ranking is two calls, a shrink is one
+//! per chunk, a personal-data scan is one per chunk; all of them load once. Between operations
+//! there is no process, no port and no memory held, which is both the privacy property and what
+//! makes the context window honest — it is computed from the prompts this operation will actually
+//! send. See [`super::session`] for why that is the server binary rather than one-shot completion.
 //!
-//! **What a call actually costs.** Measured warm on an M4-Pro-class laptop against a
-//! fifteen-candidate ranking prompt, on the 1-bit checkpoint this module was first written
-//! for:
+//! **Every operation is tuned to what it is.** Two kinds of work happen here and they want
+//! opposite settings, so [`Task`] carries them rather than a global default:
 //!
-//! | Phase | Cost |
-//! | --- | --- |
-//! | process start, mmap and the `-fit` probe | ~1.1 s |
-//! | prompt evaluation | ~10 ms/token (~100 tok/s) |
-//! | generation | ~41 ms/token (~24 tok/s) |
+//! | | Judgement — ranking | Extraction — difficulty, personal data, shrink, model recall |
+//! | --- | --- | --- |
+//! | sampling | `temp 0.7 · top-p 0.95 · top-k 20` | greedy |
+//! | reasoning | a bounded `<think>` block | none |
+//! | why | the checkpoint's published thinking-mode settings, and reasoning at temperature zero collapses into repetition — the same `reason` on all five picks | one right answer and nothing to deliberate; running the personal-data scan at 0.7 cost it a live finding, returning the name in `Contact Mario Rossi at mario@example.com` and dropping the address |
 //!
-//! Those rates are the checkpoint's own, not a misconfiguration: PrismML publish 26 tok/s
-//! generation and 133 tok/s prompt evaluation for this class of machine, and the numbers
-//! here sit right on that. A ranking call lands at **~13 s** with reasoning off and **~26 s**
-//! with it, and the ternary weights move roughly twice the bytes per token. This module used
-//! to claim ~1.4 s per call and ~27 tok/s of *prompt* evaluation; the first was out by an
-//! order of magnitude and the second had the two phases the wrong way round.
+//! **Output is grammar-constrained**, so the sampler cannot emit anything that fails to parse and
+//! parsing is a `serde_json` call rather than a best-effort scrape. One trap, learned the hard
+//! way: never give a JSON grammar an unbounded whitespace rule. `ws ::= [ \t\n]*` between two
+//! tokens is a legal place to emit spaces forever, and the model did exactly that — hundreds of
+//! tokens of blanks, then the generation limit, and no answer. Every rule here is bounded.
 //!
-//! So both halves are worth minding. Generation costs 4× more per token than prompt
-//! evaluation, which is why [`rank_grammar`] permits no whitespace and no long strings;
-//! prompt evaluation is linear with no fixed floor, which is why [`rank_prompt`] stays
-//! terse. The rule that keeps this affordable is **one invocation per user action**;
-//! anything needing more should be one prompt instead.
+//! **Nothing outlives the window.** Closing a window does not kill its children, so every session
+//! is registered while it runs and killed by [`shutdown`], which each front end calls on its way
+//! out.
 //!
-//! A resident server would buy back the ~1.1 s of startup and, more usefully, let the
-//! unchanging head of the prompt — the rules and the candidate list — stay in the KV cache
-//! instead of being re-evaluated every call. That is seconds, not milliseconds, and it is
-//! the one structural argument for a port to bind and a health check to write. It is not
-//! taken here.
+//! **What a call costs**, warm, on an M4-Pro-class laptop:
 //!
-//! **Nothing outlives the window.** One process per call is only half of that promise:
-//! closing a window does not kill its children, so a generation still in flight would keep
-//! 7.17 GB of weights resident with nobody left to show the answer to. Every child is
-//! therefore registered while it runs and killed by [`shutdown`], which the app calls on its
-//! way out.
+//! | Phase | 1-bit | ternary |
+//! | --- | --- | --- |
+//! | mapping the weights, once per operation | ~1.5 s | ~2.5 s |
+//! | prompt evaluation | ~95 tok/s | ~50 tok/s |
+//! | generation | ~25 tok/s | ~13 tok/s |
 //!
-//! **The chat template is the model's own** — `--jinja`. This is not a detail. Without that
-//! flag llama.cpp silently falls back to a legacy ChatML template, and the checkpoint — a
-//! thinking model whose own template opens a `<think>` block — is prompted in a shape it was
-//! never trained on. Asked to rank fifteen (model, effort) pairs for a hard three-file
-//! refactor it answered `Haiku 4.5, effort medium`, followed by indices 2, 3, 4 and 5 in
-//! order, scoring every one of them `fit: 85` with a copy-pasted reason: it was not
-//! discriminating at all, it was counting. With `--jinja` and nothing else changed it
-//! answered Opus 5 at high effort, then Opus at medium and low, then Sonnet — with fits that
-//! descend. One flag.
-//!
-//! **Reasoning is bounded by the grammar.** Given room to think, the model thinks well: it
-//! identifies the task as a hard refactor, rules out the light models by name, and weighs
-//! effort against latency. What it does not do is stop — unbounded, one routing call spent
-//! 1 399 tokens re-litigating its own conclusion and never reached an answer. So the grammar
-//! allows a reasoning block of at most `model_reasoning_budget` characters and then
-//! *requires* `</think>`: the budget is enforced by the sampler rather than hoped for. Set it
-//! to zero to skip reasoning, which is ~20 s faster and measurably worse.
-//!
-//! **Output is grammar-constrained.** The sampler cannot emit anything that does not parse,
-//! so parsing is a `serde_json` call rather than a best-effort scrape, and a malformed reply
-//! is a bug in the grammar rather than a Tuesday. One trap, learned the hard way: never give
-//! a JSON grammar an unbounded whitespace rule. `ws ::= [ \t\n]*` between two tokens is a
-//! legal place to emit spaces forever, and the model did exactly that — hundreds of tokens
-//! of blanks, then the generation limit, and no answer. Every rule here is bounded.
+//! Generation costs ~4× more per token than prompt evaluation, which is why [`rank_grammar`]
+//! permits no whitespace and caps every string; prompt evaluation is linear with no fixed floor,
+//! which is why [`rank_prompt`] stays terse.
 
-use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use super::session::Session;
+use crate::agents::registry::Tier;
 use crate::models;
 use crate::runtime;
 
 /// Rough characters per token, for sizing the context window.
 ///
-/// Deliberately pessimistic. Real Qwen-family tokenizers average nearer 3.7 on English
-/// prose and better on code; 3.0 over-counts, which is the safe direction — see
-/// [`fit_context`].
+/// Deliberately pessimistic. Real Qwen-family tokenizers average nearer 3.7 on English prose and
+/// better on code; 3.0 over-counts, which is the safe direction — see [`fit_context`].
 const CHARS_PER_TOKEN: f32 = 3.0;
 
-/// Smallest context worth asking for. Below this the savings are noise and the risk of
-/// clipping a prompt is not.
+/// Smallest context worth asking for. Below this the savings are noise and the risk of clipping a
+/// prompt is not.
 const MIN_CONTEXT: usize = 512;
 
-/// Context is requested in multiples of this, so nearly-identical prompts reuse the same
+/// Context is requested in multiples of this, so nearly-identical operations reuse the same
 /// allocation size rather than each landing on its own.
 const CONTEXT_STEP: usize = 256;
 
 /// Size the context window to the work actually being done.
 ///
-/// The checkpoint natively supports 262 144 tokens. Running there would cost ~12 GB of KV
-/// cache for prompts that are, in every one of pstore's uses, a few hundred tokens. So the
-/// window is fitted per call: at the sizes pstore asks for, the cache is tens of megabytes
-/// and the 7.17 GB of weights is essentially the entire footprint.
+/// The checkpoint natively supports 262 144 tokens. Running there would cost ~12 GB of KV cache
+/// for prompts that are, in every one of pstore's uses, a few hundred tokens. So the window is
+/// fitted per **operation**: at the sizes pstore asks for the cache is tens of megabytes and the
+/// weights are essentially the entire footprint.
 ///
-/// The estimate errs high on purpose. `llama-cli` silently truncates a prompt that does not
-/// fit, which would mean PII spans pointing into text the model never saw — a wrong answer
-/// that looks like a right one. Over-estimating costs a few megabytes; under-estimating
-/// costs correctness.
+/// The estimate errs high on purpose. A prompt that does not fit is silently truncated, which
+/// would mean PII spans pointing into text the model never saw — a wrong answer that looks like a
+/// right one. Over-estimating costs a few megabytes; under-estimating costs correctness.
 pub fn fit_context(prompt: &str, max_output_tokens: usize, ceiling: usize) -> usize {
-    let prompt_tokens = (prompt.len() as f32 / CHARS_PER_TOKEN).ceil() as usize;
-    // 25% headroom over an already-pessimistic estimate, plus the chat template's own
-    // wrapper tokens, which are not in `prompt`.
-    let needed = prompt_tokens + prompt_tokens / 4 + max_output_tokens + 256;
+    fit_context_for(&[(prompt.len(), max_output_tokens)], ceiling)
+}
+
+/// The window an operation needs: the largest of its calls, since one session serves them all.
+///
+/// Taking the maximum rather than the sum is the whole point of sizing per operation: a
+/// four-chunk shrink needs room for one chunk at a time, not for the document.
+pub fn fit_context_for(calls: &[(usize, usize)], ceiling: usize) -> usize {
+    let needed = calls
+        .iter()
+        .map(|(chars, output)| {
+            let prompt_tokens = (*chars as f32 / CHARS_PER_TOKEN).ceil() as usize;
+            // 25% headroom over an already-pessimistic estimate, plus the chat template's own
+            // wrapper tokens, which are not in the prompt.
+            prompt_tokens + prompt_tokens / 4 + output + 256
+        })
+        .max()
+        .unwrap_or(0);
     let stepped = needed.div_ceil(CONTEXT_STEP) * CONTEXT_STEP;
     stepped.clamp(MIN_CONTEXT, ceiling.max(MIN_CONTEXT))
 }
 
-/// What the runtime and the weights add up to: either a way to run the model, or the
-/// reason there isn't one.
+/// What the runtime and the weights add up to: either a way to run the model, or the reason there
+/// isn't one.
 ///
 /// Returns the selected checkpoint alongside the paths, because everything downstream reports
 /// progress against *its* row on the status board. Reading [`models::active`] once here and
-/// passing it along is what stops a mid-call preference change from marking one build's row
+/// passing it along is what stops a mid-operation preference change from marking one build's row
 /// `Ready` on the strength of the other build's run.
-fn ready() -> Result<(PathBuf, PathBuf, models::Checkpoint), String> {
+pub(super) fn ready() -> Result<(PathBuf, PathBuf, models::Checkpoint), String> {
     let prefs = crate::config::prefs_snapshot();
 
-    let rt = runtime::locate(prefs.llama_cli_path.as_deref())
-        .ok_or_else(|| runtime::missing_reason(prefs.llama_cli_path.as_deref()))?;
+    let rt = runtime::locate(prefs.llama_path.as_deref())
+        .ok_or_else(|| runtime::missing_reason(prefs.llama_path.as_deref()))?;
 
     let checkpoint = prefs.local_model.checkpoint();
     if !models::is_cached(&checkpoint) {
@@ -151,136 +137,88 @@ fn hub_path(checkpoint: &models::Checkpoint) -> Result<PathBuf, String> {
     super::hub::cached(checkpoint.repo, file)
 }
 
-/// How the sampler is to be constrained — and, with it, how it should sample.
+/// How the sampler is to be constrained.
 ///
-/// Two mechanisms because two jobs. A JSON Schema is the better thing to write and maintain,
-/// and it is what the extraction path wants; but it constrains the very first sampled token,
-/// which leaves no room for a reasoning block. Where reasoning earns its seconds — ranking —
-/// the grammar is written out by hand instead.
-pub enum Constrain<'a> {
-    /// Compile a JSON Schema into the sampler. No reasoning is possible.
-    Schema(&'a Value),
+/// Two mechanisms because two jobs. A JSON Schema is the better thing to write and maintain, and
+/// it is what the extraction paths want; but it constrains the very first sampled token, which
+/// leaves no room for a reasoning block. Where reasoning earns its seconds — ranking — the
+/// grammar is written out by hand instead.
+#[derive(Debug, Clone)]
+pub enum Constrain {
+    /// A JSON Schema, compiled into the sampler. No reasoning is possible.
+    Schema(Value),
     /// A GBNF grammar, which may allow a `<think>` block before the JSON.
     Grammar(String),
 }
 
-impl Constrain<'_> {
-    /// Whether this call is asking the model to reason before answering.
+/// One call: what constrains it, how much it may write, and how it should sample.
+///
+/// Constructed by the operation rather than defaulted, because the two kinds of work here want
+/// opposite settings and getting that wrong is invisible — a personal-data scan at temperature
+/// 0.7 does not fail, it quietly misses an address. See the module header for the measurements.
+#[derive(Debug, Clone)]
+pub struct Task {
+    /// How the sampler is constrained.
+    pub constrain: Constrain,
+    /// Upper bound on generated tokens. Must cover the reasoning block as well as the JSON, or
+    /// the grammar will still be waiting for `</think>` when the budget runs out.
+    pub max_output: usize,
+    /// `0.0` is greedy.
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: u32,
+}
+
+impl Task {
+    /// A call that copies, classifies or extracts: greedy, no reasoning.
     ///
-    /// It decides the sampling settings, and the difference is not cosmetic. The
-    /// checkpoint's published `temp 0.7 / top-p 0.95 / top-k 20` are the settings **its
-    /// thinking-mode benchmarks were run at**, and reasoning at temperature zero collapses
-    /// into repetition — the same `reason` string on all five picks, every time.
+    /// Most of what pstore asks for. There is one right answer and nothing for temperature to
+    /// diversify — only a copy to get exactly right.
+    pub fn extraction(schema: Value, max_output: usize) -> Self {
+        Task {
+            constrain: Constrain::Schema(schema),
+            max_output,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+        }
+    }
+
+    /// A call that weighs options: the checkpoint's published thinking-mode sampling.
     ///
-    /// Extraction is the opposite case and wants greedy decoding. Finding an address in a
-    /// paragraph has one right answer, and there is no deliberation for temperature to
-    /// diversify — only a copy to get exactly right. Running the personal-data scan at 0.7
-    /// cost it a live finding: asked for the personal data in
-    /// `Contact Mario Rossi at mario@example.com`, it returned the name and dropped the
-    /// address. Sampling settings are not a global taste; they belong to the task.
-    fn reasons(&self) -> bool {
-        matches!(self, Constrain::Grammar(g) if g.contains(END_OF_THOUGHT))
+    /// Those numbers are not a taste. They are the settings its thinking-mode benchmarks were run
+    /// at, and reasoning at temperature zero collapses into repetition — the same `reason` string
+    /// on all five picks, every time.
+    pub fn judgement(grammar: String, max_output: usize) -> Self {
+        Task {
+            constrain: Constrain::Grammar(grammar),
+            max_output,
+            temperature: 0.7,
+            top_p: 0.95,
+            top_k: 20,
+        }
     }
 }
 
-/// Run the model once and return its (grammar-constrained) JSON reply.
+// ---------------------------------------------------------------------------
+// Process lifetime
+// ---------------------------------------------------------------------------
+
+/// Every session alive right now: its pid, the checkpoint it is holding, and its handle.
 ///
-/// Blocking, and slow in units of seconds rather than milliseconds — see the module header
-/// for the breakdown. Call it from a worker thread. `max_output_tokens` bounds both
-/// generation and the context window, so it has to cover the reasoning block as well as the
-/// JSON, or the grammar will still be waiting for `</think>` when the token budget runs out.
-///
-/// Ends early, with the reason, if [`shutdown`] runs while the model is generating.
-pub fn complete_json(
-    prompt: &str,
-    constrain: Constrain<'_>,
-    max_output_tokens: usize,
-) -> Result<Value, String> {
-    let (binary, weights, checkpoint) = ready()?;
-    let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
-    let ctx = fit_context(prompt, max_output_tokens, ceiling);
+/// The checkpoint id is what makes "never two builds resident at once" enforceable. Without it a
+/// switch could only kill everything or nothing, and there would be no way to answer the question
+/// this registry exists to answer: *which* weights is that 4 GB?
+static LIVE: Mutex<Vec<LiveSession>> = Mutex::new(Vec::new());
 
-    let mut cmd = Command::new(&binary);
-    let reasons = constrain.reasons();
-    match constrain {
-        Constrain::Schema(schema) => cmd.arg("--json-schema").arg(schema.to_string()),
-        Constrain::Grammar(gbnf) => cmd.arg("--grammar").arg(gbnf),
-    };
-    cmd.arg("-m")
-        .arg(&weights)
-        .arg("-p")
-        .arg(prompt)
-        // The model's own chat template, not llama.cpp's legacy ChatML guess. Without this
-        // the checkpoint is prompted in a shape it was not trained on and ranks visibly
-        // worse — see the module header, where the before and after are written out.
-        .arg("--jinja")
-        // Echoing the prompt back would double the output for nothing.
-        .arg("--no-display-prompt")
-        // Closed stdin is what makes it exit. Even `llama-completion` drops into a prompt
-        // after generating; with no stdin it takes the EOF and leaves. `--log-disable` is
-        // deliberately *not* used — it silences the load errors on stderr too, which are
-        // the only diagnostic when a run fails.
-        .stdin(Stdio::null())
-        .args(["-n", &max_output_tokens.to_string()])
-        .args(["-c", &ctx.to_string()])
-        // Memory: 4-bit KV cache and flash attention. Small at these context sizes, but
-        // free, and they keep the ceiling honest if someone raises it.
-        .args(["--cache-type-k", "q4_0", "--cache-type-v", "q4_0"])
-        .args(["--flash-attn", "on"])
-        // Nothing warms up or gets pinned: this process exists for one generation.
-        .args(["--no-warmup", "-ngl", "999"])
-        // Pinned either way, so a call is reproducible whichever branch it takes.
-        .args(["--seed", "1"]);
-
-    // Sampling belongs to the task, not to the module — see `Constrain::reasons`.
-    if reasons {
-        cmd.args(["--temp", "0.7", "--top-p", "0.95", "--top-k", "20"]);
-    } else {
-        cmd.args(["--temp", "0"]);
-    }
-
-    models::set(checkpoint.id, models::Phase::Loading);
-    let run = supervise(cmd, checkpoint).map_err(|e| {
-        models::set(checkpoint.id, models::Phase::Failed(e.clone()));
-        format!("running {}: {e}", binary.display())
-    })?;
-
-    if let Some(why) = run.stopped {
-        // Nothing is wrong with the model or the machine, so this is not a `Failed` phase:
-        // something deliberately took the process away — the app is closing, or the user
-        // picked the other build and this run was holding the one they left.
-        models::set(checkpoint.id, models::Phase::Cached);
-        return Err(why.reason().into());
-    }
-
-    if !run.ok {
-        let why = run.stderr.trim();
-        // The tail is the useful part; the head is load-time chatter about tensors.
-        let tail: String = why.lines().rev().take(4).collect::<Vec<_>>().join(" / ");
-        models::set(checkpoint.id, models::Phase::Failed(tail.clone()));
-        return Err(format!("llama-cli failed: {tail}"));
-    }
-
-    models::set(checkpoint.id, models::Phase::Ready);
-    parse_reply(&run.stdout)
-}
-
-/// How often a run looks to see whether its child has finished.
-///
-/// The child is polled rather than waited on: a blocking `wait` would hold its lock for the
-/// whole generation, leaving [`shutdown`] queued behind the very thing it is trying to kill.
-/// 20 ms against a call measured in seconds is noise.
-const POLL: Duration = Duration::from_millis(20);
-
-/// Every model process alive right now: pid, the checkpoint it is holding, and the handle.
-///
-/// The checkpoint id is what makes "never two builds resident at once" enforceable. Without
-/// it a switch could only kill everything or nothing, and there would be no way to answer the
-/// question this registry exists to answer: *which* weights is that 7 GB?
-static LIVE: Mutex<Vec<(u32, &'static str, Arc<Mutex<Child>>)>> = Mutex::new(Vec::new());
+/// One live session, shared between the [`Session`] that owns it and this registry.
+type LiveSession = (u32, &'static str, Arc<Mutex<Child>>);
 
 /// Raised once the app is on its way out, so no further weights are mapped.
 static CLOSING: AtomicBool = AtomicBool::new(false);
+
+/// What to tell the user when a call is refused or cut short by the app closing.
+pub(super) const CLOSING_REASON: &str = "the model was stopped because pstore is closing";
 
 /// A poisoned lock means a thread panicked mid-update. Recovering the guard is better than
 /// refusing to kill the process it was holding.
@@ -291,137 +229,51 @@ fn recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
-/// Why a run ended before it produced an answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stopped {
-    /// The app is on its way out.
-    Closing,
-    /// The user selected the other build, and this run was holding the old one.
-    Switched,
+/// Whether the app is on its way out.
+pub(super) fn stopping() -> bool {
+    CLOSING.load(Ordering::Relaxed)
 }
 
-impl Stopped {
-    /// What to tell the user, phrased as a state of affairs rather than an error.
-    fn reason(self) -> &'static str {
-        match self {
-            Stopped::Closing => "the model was stopped because pstore is closing",
-            Stopped::Switched => {
-                "the model was stopped because the local model was switched — try again"
-            }
-        }
-    }
-}
-
-/// One finished — or killed — model process.
-struct Run {
-    /// Whether it exited successfully.
-    ok: bool,
-    stdout: String,
-    stderr: String,
-    /// Why it was killed, if it did not finish on its own.
-    stopped: Option<Stopped>,
-}
-
-/// Run `cmd` to completion, killing it if the app closes or the selected build changes.
+/// Refuse to map weights that should not be mapped.
 ///
-/// The child is registered in [`LIVE`] under `checkpoint` for the whole of its life, which is
-/// what makes both [`shutdown`] and [`unload_other_builds`] possible. Both pipes are drained
-/// on their own threads: `llama-completion` writes kilobytes of load-time chatter to stderr,
-/// and an unread pipe would stall the generation rather than fail it.
-fn supervise(mut cmd: Command, checkpoint: models::Checkpoint) -> Result<Run, String> {
-    // Refused rather than started, for two races that both end with weights mapped that
-    // should not be. A worker between resolving the weights and spawning must not map 7.17 GB
-    // as the window disappears — and it must not map the *old* build after the user has
-    // switched, which is the one way two builds could still end up resident at once.
-    if CLOSING.load(Ordering::Relaxed) {
-        return Ok(Run::killed(Stopped::Closing));
+/// Two races that both end with gigabytes resident that should not be: a worker between resolving
+/// the weights and spawning must not map them as the window disappears — and it must not map the
+/// *old* build after the user has switched, which is the one way two builds could end up resident
+/// at once.
+pub(super) fn refuse_if_stopping(checkpoint: &models::Checkpoint) -> Result<(), String> {
+    if stopping() {
+        return Err(CLOSING_REASON.into());
     }
     if checkpoint.id != models::active().id {
-        return Ok(Run::killed(Stopped::Switched));
+        return Err(
+            "the model was stopped because the local model was switched — try again".into(),
+        );
     }
+    Ok(())
+}
 
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| e.to_string())?;
+/// Record a session while it runs, so [`shutdown`] and a build switch can reach it.
+pub(super) fn register(pid: u32, checkpoint: &'static str, child: Arc<Mutex<Child>>) {
+    recover(&LIVE).push((pid, checkpoint, child));
+}
 
-    let mut out_pipe = child.stdout.take();
-    let mut err_pipe = child.stderr.take();
-    let out = std::thread::spawn(move || drain(out_pipe.as_mut()));
-    let err = std::thread::spawn(move || drain(err_pipe.as_mut()));
-
-    let pid = child.id();
-    let child = Arc::new(Mutex::new(child));
-    recover(&LIVE).push((pid, checkpoint.id, Arc::clone(&child)));
-
-    // The lock is only ever held across a non-blocking `try_wait`, so `shutdown` and a build
-    // switch can take it at any point during the generation.
-    let status = loop {
-        match recover(&child).try_wait() {
-            Ok(Some(s)) => break Some(s),
-            // Already reaped by a kill, or the child is gone. Either way it is over.
-            Err(_) => break None,
-            Ok(None) => {}
-        }
-        std::thread::sleep(POLL);
-    };
+/// Forget a session that has ended.
+pub(super) fn deregister(pid: u32) {
     recover(&LIVE).retain(|(p, _, _)| *p != pid);
-
-    let ok = status.is_some_and(|s| s.success());
-    // A run that finished cleanly still counts as finished — its answer is good even if
-    // nothing is left to display it. Only a run that failed asks why, and the answer is
-    // whichever deliberate kill could have reached it.
-    let stopped = (!ok)
-        .then(|| {
-            if CLOSING.load(Ordering::Relaxed) {
-                Some(Stopped::Closing)
-            } else if checkpoint.id != models::active().id {
-                Some(Stopped::Switched)
-            } else {
-                None
-            }
-        })
-        .flatten();
-
-    Ok(Run {
-        ok,
-        stdout: out.join().unwrap_or_default(),
-        stderr: err.join().unwrap_or_default(),
-        stopped,
-    })
 }
 
-impl Run {
-    /// A run that never started, or was killed before it could answer.
-    fn killed(why: Stopped) -> Self {
-        Run {
-            ok: false,
-            stdout: String::new(),
-            stderr: String::new(),
-            stopped: Some(why),
-        }
-    }
-}
-
-fn drain<R: Read>(pipe: Option<&mut R>) -> String {
-    let mut s = String::new();
-    if let Some(p) = pipe {
-        let _ = p.read_to_string(&mut s);
-    }
-    s
-}
-
-/// Kill and reap every live model process the predicate selects, by checkpoint id.
+/// Kill and reap every live session the predicate selects, by checkpoint id.
 ///
-/// Returns the checkpoints that were actually holding weights, so the caller can correct
-/// their rows on the status board — a killed run leaves a checkpoint marked `Loading` or
-/// `Ready` that is now neither.
+/// Returns the checkpoints that were actually holding weights, so the caller can correct their
+/// rows on the status board — a killed session leaves a checkpoint marked `Loading` or `Ready`
+/// that is now neither.
+///
+/// The doomed entries are removed from [`LIVE`] under the lock and killed outside it, so a session
+/// that ends by itself in the meantime cannot be waited on from two places, and a second caller
+/// cannot pick up the same child. Killing an already-exited child and waiting an already-reaped
+/// one both fail harmlessly, which is the state this function exists to reach.
 fn stop_live_where(mut wanted: impl FnMut(&str) -> bool) -> Vec<&'static str> {
-    // The doomed entries are removed from `LIVE` under the lock and killed outside it, so a
-    // run that finishes by itself in the meantime cannot be waited on from two places, and
-    // a second caller cannot pick up the same child.
-    let doomed: Vec<(u32, &'static str, Arc<Mutex<Child>>)> = {
+    let doomed: Vec<LiveSession> = {
         let mut live = recover(&LIVE);
         let (doomed, keep) = std::mem::take(&mut *live)
             .into_iter()
@@ -431,18 +283,21 @@ fn stop_live_where(mut wanted: impl FnMut(&str) -> bool) -> Vec<&'static str> {
     };
 
     for (_, _, child) in &doomed {
-        let mut c = recover(child);
-        // Both calls fail on a child that has just exited on its own, which is the state
-        // this function exists to reach.
-        let _ = c.kill();
-        // Reaped here rather than left to the supervising thread: a zombie holds its slot,
-        // and the caller may be on its way out.
-        let _ = c.wait();
+        end(child);
     }
     doomed.into_iter().map(|(_, id, _)| id).collect()
 }
 
-/// Kill and reap every model process running now. Returns how many there were.
+/// End a child and reap it. Idempotent: both calls fail on a process that has already gone.
+pub(super) fn end(child: &Arc<Mutex<Child>>) {
+    let mut c = recover(child);
+    let _ = c.kill();
+    // Reaped here rather than left to the operating system: a zombie holds its slot, and the port
+    // it was bound to stays taken until the process is really gone.
+    let _ = c.wait();
+}
+
+/// Kill and reap every session running now. Returns how many there were.
 fn stop_live() -> usize {
     stop_live_where(|_| true).len()
 }
@@ -450,17 +305,17 @@ fn stop_live() -> usize {
 /// Stop anything still holding a build that is no longer the selected one.
 ///
 /// **The invariant this exists for: at most one build's weights are resident at any moment.**
-/// Nothing is resident *between* calls — every call is its own subprocess — so switching build
-/// is normally free. The exception is switching *during* a call: the running process goes on
-/// holding its 3.8 or 7.17 GB until it finishes, and the next call would map the other build
-/// alongside it. On a machine chosen for the small build because memory is tight, that is
-/// 11 GB at once, which is the situation the choice was made to avoid.
+/// Nothing is resident *between* operations, so switching build is normally free. The exception is
+/// switching *during* one: that session goes on holding its 3.8 or 7.17 GB until it finishes, and
+/// the next operation would map the other build alongside it. On a machine chosen for the small
+/// build because memory is tight, that is 11 GB at once, which is the situation the choice was
+/// made to avoid.
 ///
-/// So the old run is killed rather than waited out. It cannot produce a useful answer anyway:
-/// its result would be a ranking from the build the user has just decided against.
+/// So the old session is killed rather than waited out. It cannot produce a useful answer anyway:
+/// its result would come from the build the user has just decided against.
 ///
 /// Call it **after** publishing the new preference, so [`models::active`] already reflects the
-/// switch — that ordering is also what makes the guard in [`supervise`] catch a worker that is
+/// switch — that ordering is also what makes [`refuse_if_stopping`] catch a worker that is
 /// mid-flight. Cheap and safe when nothing is running, which is the common case.
 pub fn unload_other_builds() -> usize {
     let keep = models::active().id;
@@ -469,49 +324,39 @@ pub fn unload_other_builds() -> usize {
         // Weights on disk, nothing running: true of the build we just left.
         models::set(id, models::Phase::Cached);
     }
-
-    // The background server holds weights resident by definition, and for as long as it is
-    // up — so it is the one thing that can hold a build the user has left for an unbounded
-    // time rather than the tail of one call. It has to be reached by the same switch.
-    let served = crate::serve::stop_unless(keep);
-
-    stopped.len() + usize::from(served)
+    stopped.len()
 }
 
 /// Where the model's reasoning stops and its answer starts.
 const END_OF_THOUGHT: &str = "</think>";
 
-/// Pull the JSON object out of `llama-cli`'s stdout.
+/// Pull the JSON object out of a reply.
 ///
-/// The grammar guarantees the *model's* output parses, but the process still prints its own
-/// framing around it, and which framing depends on build flags. Rather than depend on that,
-/// take the outermost braces.
-///
-/// The reasoning block is dropped first, and that ordering matters: reasoning about a routing
-/// decision quotes JSON, braces and all, so scanning for the first `{` across the whole reply
-/// would parse the model's rough notes instead of its answer. Everything up to the *last*
-/// `</think>` goes.
-fn parse_reply(stdout: &str) -> Result<Value, String> {
-    let stdout = match stdout.rfind(END_OF_THOUGHT) {
-        Some(i) => &stdout[i + END_OF_THOUGHT.len()..],
-        None => stdout,
+/// The grammar guarantees the model's output parses, but the reasoning block is dropped first and
+/// that ordering matters: reasoning about a routing decision quotes JSON, braces and all, so
+/// scanning for the first `{` across the whole reply would parse the model's rough notes instead
+/// of its answer. Everything up to the *last* `</think>` goes.
+pub(super) fn parse_reply(reply: &str) -> Result<Value, String> {
+    let reply = match reply.rfind(END_OF_THOUGHT) {
+        Some(i) => &reply[i + END_OF_THOUGHT.len()..],
+        None => reply,
     };
-    let start = stdout
+    let start = reply
         .find('{')
-        .ok_or_else(|| format!("no JSON in the model's reply: {:?}", truncate(stdout, 200)))?;
-    let end = stdout.rfind('}').ok_or_else(|| {
+        .ok_or_else(|| format!("no JSON in the model's reply: {:?}", truncate(reply, 200)))?;
+    let end = reply.rfind('}').ok_or_else(|| {
         format!(
             "truncated JSON in the model's reply: {:?}",
-            truncate(stdout, 200)
+            truncate(reply, 200)
         )
     })?;
     if end < start {
         return Err(format!(
             "malformed JSON in the model's reply: {:?}",
-            truncate(stdout, 200)
+            truncate(reply, 200)
         ));
     }
-    serde_json::from_str(&stdout[start..=end])
+    serde_json::from_str(&reply[start..=end])
         .map_err(|e| format!("could not parse the model's reply: {e}"))
 }
 
@@ -522,16 +367,247 @@ fn truncate(s: &str, n: usize) -> &str {
     }
 }
 
+/// Open a session sized for one call, run it, and let the weights go.
+///
+/// The single-call shape. Operations that make several calls open the session themselves and keep
+/// it for all of them — that is the whole point of [`Session`].
+fn once(task: &Task, prompt: &str) -> Result<Value, String> {
+    let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
+    let session = Session::open(fit_context(prompt, task.max_output, ceiling))?;
+    session.run(task, prompt)
+}
+
 // ---------------------------------------------------------------------------
 // Ranking
 // ---------------------------------------------------------------------------
 
 /// Longest `reason` the grammar will allow, in characters.
 ///
-/// Every one of these is a token the model spends at ~41 ms, five times over, so the cap is
+/// Every one of these is a token the model spends at ~41 ms, several times over, so the cap is
 /// tight and the prompt asks for twelve words. A reason cut off mid-word reads as a bug, so
 /// the prompt's instruction and this number have to stay in agreement.
 const REASON_CHARS: usize = 90;
+
+/// How many picks to ask each build for.
+///
+/// Not the same number for both, and that is the single most effective change made to ranking on
+/// the small build. Five picks over a thirty-row grid is a task the 1-bit checkpoint does not do:
+/// asked for five it emitted indices 1, 2, 3, 4, 5 with `fit: 85` on every one and a copy-pasted
+/// reason — it was not discriminating, it was counting to five. Three picks over a list of
+/// *models* is a question it can answer.
+///
+/// The ternary build keeps five, which it handles: enough to show the shape of the field — a
+/// frontier model, a cheap one, a couple of efforts between — without asking for separations at
+/// the tail that nothing could justify.
+fn shortlist_for(checkpoint: &models::Checkpoint) -> usize {
+    if checkpoint.id == models::LLM_1BIT.id {
+        3
+    } else {
+        super::SHORTLIST
+    }
+}
+
+/// How much capability a prompt actually demands, decided in its own call.
+///
+/// **Why this is a separate call.** Ranking asks for two judgements at once: how hard is this
+/// work, and which of twenty options best matches that. The 1-bit build can do the first and
+/// visibly cannot do both — asked for a shortlist on a three-file refactor it returned Haiku
+/// first, "weak on multi-file reasoning, prompt requires multi-file", and Opus last, "best for
+/// hard refactors, prompt is hard refactor". Its analysis was right in both rows and its
+/// *ordering* ignored it. Splitting the question means the difficulty arrives in the ranking
+/// prompt as a stated fact rather than as a second thing to work out while sorting.
+///
+/// It costs one extra call, which the module header's "one invocation per user action" rule
+/// otherwise forbids. It is worth it here and cheap in the right way: the prompt is the document
+/// with no candidate list, and the reply is one word, so it is a fraction of a ranking call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Demand {
+    /// A typo, a rename, a comment, one small well-specified edit.
+    Easy,
+    /// Ordinary work in one or two files.
+    Moderate,
+    /// Several files, an invariant or public API to preserve, or code to understand first.
+    Hard,
+}
+
+impl Demand {
+    fn as_str(self) -> &'static str {
+        match self {
+            Demand::Easy => "easy",
+            Demand::Moderate => "moderate",
+            Demand::Hard => "hard",
+        }
+    }
+
+    /// What ranking should do about it, spelled out for the model that has to act on it.
+    fn instruction(self) -> &'static str {
+        match self {
+            Demand::Easy => {
+                "Rank the LIGHTEST adequate model FIRST, at low effort. A frontier model is the \
+                 wrong answer here: it costs latency this prompt does not need."
+            }
+            Demand::Moderate => {
+                "Rank a mid-tier model FIRST, at low or medium effort. Neither the lightest \
+                 model nor the frontier one is right for this."
+            }
+            Demand::Hard => {
+                "Rank the most CAPABLE model FIRST, at high effort. A light model is the wrong \
+                 answer here even though it is cheaper and faster — put it last if at all."
+            }
+        }
+    }
+}
+
+/// Judge how much capability `text` demands.
+///
+/// Greedy and without reasoning: this is one classification with one right answer, and the whole
+/// point of asking it separately is that it is the cheap half. `because` is asked for because a
+/// model that has to justify a label picks it more carefully — and because it is worth showing
+/// the user why their prompt was routed the way it was.
+pub fn judge_demand(session: &Session, text: &str) -> Result<(Demand, String), String> {
+    let reply = session.run(&demand_task(), &demand_prompt(text))?;
+    let demand = match reply.get("difficulty").and_then(Value::as_str) {
+        Some("easy") => Demand::Easy,
+        Some("hard") => Demand::Hard,
+        // The schema admits only the three, and "moderate" is the answer that biases least if a
+        // future one slips through.
+        _ => Demand::Moderate,
+    };
+    let because = tidy(
+        reply
+            .get("because")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        BECAUSE_CHARS,
+    );
+    Ok((demand, because))
+}
+
+/// Longest phrase the model may give for *why* it judged the prompt as it did.
+///
+/// Shown in every front end, so it is trimmed at a word boundary when the sampler stops here —
+/// "a single typo in the README, which is a one" reads as pstore having mangled it.
+const BECAUSE_CHARS: usize = 70;
+
+/// Room for the difficulty reply: a word and a short phrase.
+const DEMAND_OUTPUT: usize = 64;
+
+fn demand_task() -> Task {
+    Task::extraction(
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["difficulty", "because"],
+            "properties": {
+                "difficulty": {"type": "string", "enum": ["easy", "moderate", "hard"]},
+                "because": {"type": "string", "minLength": 1, "maxLength": BECAUSE_CHARS}
+            }
+        }),
+        DEMAND_OUTPUT,
+    )
+}
+
+fn demand_prompt(text: &str) -> String {
+    format!(
+        "How much capability does this coding request need?\n\
+         \n\
+         - easy: a typo, a rename, a comment, or one small well-specified edit.\n\
+         - moderate: ordinary work in one or two files.\n\
+         - hard: several files, an invariant or public API that must not change, or code that \
+         has to be understood before it can be changed.\n\
+         \n\
+         Answer with the label and, in under ten words, the thing about the request that decided \
+         it.\n\
+         \n\
+         <request>\n{text}\n</request>\n"
+    )
+}
+
+/// One (agent, model) pair, with every effort level it can be asked for.
+///
+/// **The unit the model ranks is this, not a (model, effort) candidate**, and the difference is
+/// what makes the small build work at all. The candidate grid holds one row per effort, so five
+/// efforts of Opus look like five nearly-identical lines; ranking those means separating things
+/// that differ in one word, which is where the checkpoint stops discriminating and starts
+/// enumerating. Ranking models and asking for the effort as a *field* poses the same question
+/// with a fifth of the rows and no near-duplicates in them.
+struct Row {
+    agent_id: &'static str,
+    agent_display: &'static str,
+    model_id: super::Name,
+    model_display: super::Name,
+    tier: crate::agents::registry::Tier,
+    metered: bool,
+    relative_price: f32,
+    /// Efforts this (agent, model) can actually be asked for, ascending.
+    efforts: Vec<crate::agents::registry::Effort>,
+    /// Whether pstore can select the effort or is only predicting it.
+    effort_selectable: bool,
+    /// What pstore can tell the model about this model, or empty if it needs no telling.
+    note: String,
+}
+
+/// Collapse the candidate grid into one row per (agent, model), preserving order.
+fn rows(candidates: &[super::Candidate], brief: &crate::knowledge::Brief) -> Vec<Row> {
+    let mut out: Vec<Row> = Vec::new();
+    for c in candidates {
+        match out
+            .iter_mut()
+            .find(|r| r.agent_id == c.agent_id && r.model_id == c.model_id)
+        {
+            Some(row) => {
+                if !row.efforts.contains(&c.effort) {
+                    row.efforts.push(c.effort);
+                }
+            }
+            None => out.push(Row {
+                agent_id: c.agent_id,
+                agent_display: c.agent_display,
+                model_id: c.model_id.clone(),
+                model_display: c.model_display.clone(),
+                tier: c.tier,
+                metered: c.metered,
+                relative_price: c.relative_price,
+                efforts: vec![c.effort],
+                effort_selectable: c.effort_selectable,
+                note: brief.note(&c.model_id).unwrap_or_default().to_string(),
+            }),
+        }
+    }
+    for row in &mut out {
+        row.efforts.sort_unstable();
+    }
+    out
+}
+
+/// Put the options the difficulty calls for at the top of the list.
+///
+/// **A small model has positional bias, and this is what turns that from a hazard into a
+/// tailwind.** Asked to shortlist a hard three-file refactor from a list running
+/// light → frontier, the 1-bit build returned options 0, 1 and 2 in order — Haiku first — with
+/// reasons that contradicted its own ranking ("may struggle with complex threading logic"). It
+/// had the difficulty right and was reading the list rather than judging it.
+///
+/// Sorting by how well each row's tier matches the difficulty pstore has *already decided* means
+/// that failure mode now produces a defensible answer instead of an inverted one, and a model
+/// that really is ranking is unaffected: it picks by index either way, and the indices are the
+/// same options.
+///
+/// The sort is stable, so rows of equal tier keep the order the registry gave them and the result
+/// does not depend on how a `HashMap` felt that day.
+fn order_for(rows: &mut [Row], demand: Demand) {
+    let wanted = match demand {
+        Demand::Easy => Tier::Cheap,
+        Demand::Moderate => Tier::Mid,
+        Demand::Hard => Tier::Top,
+    };
+    let rank_of = |t: Tier| match t {
+        Tier::Cheap => 0i32,
+        Tier::Mid => 1,
+        Tier::Top => 2,
+    };
+    rows.sort_by_key(|r| (rank_of(r.tier) - rank_of(wanted)).abs());
+}
 
 /// Rank `candidates` against `text`.
 ///
@@ -541,30 +617,126 @@ const REASON_CHARS: usize = 90;
 ///
 /// Expect **seconds**: ~13 s with reasoning off and ~30–40 s with it, scaling with the
 /// candidate list. This is the call the whole "one invocation per user action" rule exists to
-/// ration.
+/// ration — and the reason a degenerate answer is retried **once** and no more.
 pub fn rank(
     text: &str,
     candidates: &[super::Candidate],
     excluded: Vec<(&'static str, String)>,
+    brief: &crate::knowledge::Brief,
 ) -> Result<super::Ranking, String> {
     let started = std::time::Instant::now();
-    let want = super::SHORTLIST.min(candidates.len());
-    let budget = crate::config::prefs_snapshot().model_reasoning_budget;
+    let mut rows = rows(candidates, brief);
+    let want = shortlist_for(&models::active()).min(rows.len());
+    let prefs = crate::config::prefs_snapshot();
+    let budget = prefs.model_reasoning_budget;
+    let grammar = rank_grammar(&rows, want, budget);
+    let task = Task::judgement(grammar, rank_output_tokens(want, budget));
 
-    let reply = complete_json(
-        &rank_prompt(text, candidates, want),
-        Constrain::Grammar(rank_grammar(candidates.len(), want, budget)),
-        rank_output_tokens(want, budget),
-    )?;
-    let mut choices = build_choices(&reply, candidates)?;
+    // The window covers both calls, because one session serves both. Sized against the *retry*
+    // wording of the ranking prompt, which is the longest this operation can send — a window that
+    // fits only the first attempt would silently truncate the second.
+    let widest = rank_prompt(text, &rows, want, Demand::Moderate, true);
+    let ctx = fit_context_for(
+        &[
+            (demand_prompt(text).len(), DEMAND_OUTPUT),
+            (widest.len(), task.max_output),
+        ],
+        prefs.model_context_ceiling,
+    );
+
+    let session = Session::open(ctx)?;
+
+    // The cheap judgement first, so the expensive one has one thing to do rather than two. See
+    // [`Demand`] for the live failure that motivates the split.
+    let (demand, because) = judge_demand(&session, text)?;
+    // ...and then the options are presented in the order that judgement implies. See
+    // [`order_for`]: on a small model this is the difference between a ranking and the first
+    // three rows of the list.
+    order_for(&mut rows, demand);
+
+    // Two attempts at most. A ranking call is tens of seconds, so this is not a retry loop that
+    // can be widened later without someone noticing — and a second degenerate answer is reported
+    // as such rather than retried into a third.
+    let mut degenerate = None;
+    let mut choices = Vec::new();
+    for attempt in 0..2 {
+        let reply = session.run(&task, &rank_prompt(text, &rows, want, demand, attempt > 0))?;
+        choices = build_choices(&reply, &rows, candidates)?;
+
+        degenerate = degeneracy(&choices, rows.len());
+        if degenerate.is_none() {
+            break;
+        }
+    }
     normalise_latency(&mut choices);
 
     Ok(super::Ranking {
         choices,
         considered: candidates.len(),
         excluded,
+        demand: Some((demand.as_str(), because)),
+        described: brief
+            .known
+            .iter()
+            .filter(|k| k.source != crate::knowledge::Source::Checkpoint)
+            .count(),
+        degenerate,
         elapsed: started.elapsed(),
     })
+}
+
+/// Whether the model produced a ranking or merely a list.
+///
+/// This exists because the failure it detects is **invisible**: five rows, five scores, five
+/// reasons, every field populated, and the order is whatever the options happened to be in. A
+/// user cannot tell that from a real answer, and acting on it means running the wrong model. So
+/// it is named, and [`super::Ranking::degenerate`] carries the reason to the UI.
+///
+/// Two signatures, both taken from live runs on the 1-bit build:
+///
+/// * **the same reason on every pick** — the checkpoint wrote one sentence and repeated it, which
+///   is what it does when it has not actually compared the options;
+/// * **consecutive indices** over a list long enough for that to be a coincidence worth
+///   disbelieving — `1, 2, 3, 4` out of thirty is enumeration, not judgement.
+///
+/// Identical `fit` values were the third signature and are now unrepresentable: the grammar
+/// gives each position its own band (see [`fit_band`]). The check stays because a grammar can be
+/// changed by someone who does not know that is why it was written that way.
+fn degeneracy(choices: &[super::Choice], available: usize) -> Option<String> {
+    if choices.len() < 2 {
+        return (available > 2).then(|| {
+            format!(
+                "the local model returned {} pick(s) out of {available} options — it did not \
+                 rank the field",
+                choices.len()
+            )
+        });
+    }
+
+    let first = choices[0].rationale.trim().to_ascii_lowercase();
+    if !first.is_empty()
+        && choices
+            .iter()
+            .all(|c| c.rationale.trim().to_ascii_lowercase() == first)
+    {
+        return Some(
+            "the local model gave every pick the same reason, so it did not compare them"
+                .to_string(),
+        );
+    }
+
+    if choices.iter().all(|c| c.fit == choices[0].fit) {
+        return Some(
+            "the local model scored every pick identically, so it did not separate them"
+                .to_string(),
+        );
+    }
+
+    // There was a third signature — picks at consecutive indices — and it has been removed
+    // rather than tightened. Now that [`order_for`] presents the options best-first for the
+    // difficulty, "the first three in order" is what a *correct* answer often looks like, so the
+    // heuristic would fire on exactly the results it was meant to protect.
+    None
 }
 
 /// Generation budget for a ranking call: the reasoning block plus the JSON.
@@ -574,8 +746,9 @@ pub fn rank(
 /// reasoning allowance is converted at the pessimistic [`CHARS_PER_TOKEN`] and then given
 /// room to spare.
 fn rank_output_tokens(want: usize, reasoning_budget: usize) -> usize {
-    // ~35 tokens covers one `{"index":12,"fit":95,"reason":"..."}` with a full-length reason.
-    let json = 16 + want * 40;
+    // ~48 tokens covers one `{"index":12,"effort":"medium","fit":95,"reason":"…"}` with a
+    // full-length reason.
+    let json = 16 + want * 52;
     let thought = if reasoning_budget == 0 {
         0
     } else {
@@ -584,10 +757,49 @@ fn rank_output_tokens(want: usize, reasoning_budget: usize) -> usize {
     json + thought
 }
 
+/// The two-digit range a pick at `position` must score in.
+///
+/// **Descending bands, enforced by the sampler.** The model used to be asked for five numbers
+/// between 0 and 100 with the instruction that they must differ, and on the small build it
+/// returned `85, 85, 85, 85, 85`; on the ternary build it once returned `0` and `1` for a
+/// correctly-ordered shortlist, which a sort on `fit` then inverted. Both are instructions the
+/// grammar can simply make unrepresentable, so it does: the first pick scores 85–99, the second
+/// 70–84, and so on down. Within its band the model still has fifteen values to say *how much*
+/// better this pick is than the next, which is what [`super::Ranking::fastest_within`] reads.
+fn fit_band(position: usize) -> (u32, u32) {
+    /// Width of each band. Five bands of 15 reach from 99 down to 25, which leaves the bottom
+    /// of the scale for nothing — a pick that is in the shortlist is not a bad option.
+    const WIDTH: u32 = 15;
+    let top = 99u32.saturating_sub(position as u32 * WIDTH);
+    (top.saturating_sub(WIDTH - 1).max(1), top.max(1))
+}
+
+/// A GBNF alternation matching exactly the two-digit integers in `lo..=hi`.
+///
+/// Written out rather than left to a digit pattern with a range check afterwards, for the same
+/// reason indices are: what the grammar forbids cannot come back and be dropped later.
+fn digits_in_range(lo: u32, hi: u32) -> String {
+    use std::fmt::Write;
+    let mut parts: Vec<String> = Vec::new();
+    for tens in (lo / 10)..=(hi / 10) {
+        let low_unit = lo.max(tens * 10) % 10;
+        let high_unit = hi.min(tens * 10 + 9) % 10;
+        let mut part = String::new();
+        let _ = write!(part, "\"{tens}\" ");
+        if low_unit == high_unit {
+            let _ = write!(part, "\"{low_unit}\"");
+        } else {
+            let _ = write!(part, "[{low_unit}-{high_unit}]");
+        }
+        parts.push(part);
+    }
+    parts.join(" | ")
+}
+
 /// The grammar for a ranking reply: an optional bounded reasoning block, then the JSON.
 ///
 /// Written by hand rather than compiled from a JSON Schema, because a schema constrains the
-/// first sampled token and the whole point here is to leave room for `<think>` first. Three
+/// first sampled token and the whole point here is to leave room for `<think>` first. Four
 /// things are deliberate:
 ///
 /// * **No whitespace rule at all.** The JSON is emitted dense. An unbounded `ws` rule between
@@ -596,9 +808,11 @@ fn rank_output_tokens(want: usize, reasoning_budget: usize) -> usize {
 ///   check afterwards. The list is short and this way an out-of-range pick is unrepresentable
 ///   rather than merely rejected — [`build_choices`] still drops what does not map, but it
 ///   should never have to.
+/// * **Each position has its own `fit` band**, so the scores descend by construction. See
+///   [`fit_band`] for the two live failures that instruction could not prevent on its own.
 /// * **Every repetition is bounded.** `{0,n}` throughout, so a run cannot become unbounded by
 ///   any path through the grammar.
-fn rank_grammar(candidates: usize, want: usize, reasoning_budget: usize) -> String {
+fn rank_grammar(rows: &[Row], want: usize, reasoning_budget: usize) -> String {
     use std::fmt::Write;
 
     // The template has already opened the block, so the grammar only has to close it.
@@ -611,73 +825,190 @@ fn rank_grammar(candidates: usize, want: usize, reasoning_budget: usize) -> Stri
     };
 
     let mut index = String::new();
-    for i in 0..candidates.max(1) {
+    for i in 0..rows.len().max(1) {
         if i > 0 {
             index.push_str(" | ");
         }
         let _ = write!(index, "\"{i}\"");
     }
 
-    // `want - 1` repetitions after the first, so the array is exactly `want` long the way
-    // `minItems`/`maxItems` used to make it.
-    let more = want.saturating_sub(1);
+    // Every effort any row offers. Which row supports which cannot be expressed here — the
+    // grammar has no way to make one field depend on another — so an effort the chosen model
+    // cannot be asked for is snapped to its nearest neighbour in `build_choices`.
+    let mut efforts: Vec<crate::agents::registry::Effort> = Vec::new();
+    for row in rows {
+        for e in &row.efforts {
+            if !efforts.contains(e) {
+                efforts.push(*e);
+            }
+        }
+    }
+    efforts.sort_unstable();
+    let effort_rule = efforts
+        .iter()
+        .map(|e| format!("\"\\\"{e}\\\"\""))
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    // Positional choice rules, so each pick carries its own descending band.
+    let mut answer = String::from("answer ::= \"{\\\"choices\\\":[\"");
+    let mut choices = String::new();
+    for position in 0..want.max(1) {
+        if position > 0 {
+            let _ = write!(answer, " \",\"");
+        }
+        let _ = write!(answer, " choice{position}");
+        let (lo, hi) = fit_band(position);
+        let _ = write!(
+            choices,
+            "choice{position} ::= \"{{\\\"index\\\":\" index \",\\\"effort\\\":\" effort \
+             \",\\\"fit\\\":\" fit{position} \",\\\"reason\\\":\" reason \"}}\"\n\
+             fit{position} ::= {}\n",
+            digits_in_range(lo, hi)
+        );
+    }
+    let _ = write!(answer, " \"]}}\"");
+
     format!(
         "{root}\n\
-         answer ::= \"{{\\\"choices\\\":[\" choice (\",\" choice){{{more}}} \"]}}\"\n\
-         choice ::= \"{{\\\"index\\\":\" index \",\\\"fit\\\":\" fit \",\\\"reason\\\":\" reason \"}}\"\n\
+         {answer}\n\
+         {choices}\
          index ::= {index}\n\
-         fit ::= [0-9] | [1-9] [0-9] | \"100\"\n\
+         effort ::= {effort_rule}\n\
          reason ::= \"\\\"\" [^\"\\\\\\n]{{0,{REASON_CHARS}}} \"\\\"\"\n"
     )
 }
 
 /// Build the ranking prompt.
 ///
-/// The candidate list carries price and metering because the model is being asked to make
-/// the judgement pstore used to encode by hand — and "this one bills per token" is exactly
-/// the sort of thing that should shift a recommendation, but only when the extra capability
-/// is actually needed.
-fn rank_prompt(text: &str, candidates: &[super::Candidate], want: usize) -> String {
+/// Three things earn their tokens here, and nothing else is allowed to:
+///
+/// * **what each model is** — the notes from [`crate::knowledge`]. Without them the checkpoint is
+///   ranking names: its training ended before Opus 5 and Gemini 3 existed, and a model asked to
+///   judge a name it does not know does not decline, it invents. This is the single largest
+///   quality change to ranking, and it is also why a model nothing can describe is not in this
+///   list at all;
+/// * **the tier and the available efforts** — the two words that changed a routing decision in
+///   testing;
+/// * **`PAID-PER-TOKEN`** — the exception. "Included in subscription" was dropped because it is
+///   the default, and saying so thirty times cost more than the one line that flags the
+///   exception.
+fn rank_prompt(text: &str, rows: &[Row], want: usize, demand: Demand, retry: bool) -> String {
+    use std::fmt::Write;
+
     let mut list = String::new();
-    for (i, c) in candidates.iter().enumerate() {
-        use std::fmt::Write;
-        // Terse on purpose. Prompt evaluation runs at ~27 tokens/second on this checkpoint,
-        // so the candidate list — thirty lines on a machine with several agents installed —
-        // dominates the cost of a ranking call. Everything here earns its tokens: the two
-        // words that changed a routing decision in testing are the tier and the effort.
-        // "included in subscription" was dropped because it is the default and saying so
-        // thirty times cost more than the one line that flags the exception.
+    for (i, r) in rows.iter().enumerate() {
+        let efforts = r
+            .efforts
+            .iter()
+            .map(|e| e.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
         let _ = write!(
             list,
-            "\n{i}: {} via {} [{}, effort {}{}]{}",
-            c.model_display,
-            c.agent_display,
-            c.tier,
-            c.effort,
-            if c.effort_selectable { "" } else { "?" },
-            if c.metered { " PAID-PER-TOKEN" } else { "" },
+            "\n{i}: {} via {} [{}, effort {efforts}{}]{}",
+            r.model_display,
+            r.agent_display,
+            r.tier,
+            if r.effort_selectable { "" } else { "?" },
+            if r.metered { " PAID-PER-TOKEN" } else { "" },
         );
+        if !r.note.is_empty() {
+            let _ = write!(list, "\n   {}", r.note);
+        }
     }
+
+    // Only on the second attempt, and only naming the thing that went wrong. A prompt that
+    // always carried this would spend tokens teaching the model to avoid a mistake it was not
+    // making, and on a small checkpoint that is its own kind of noise.
+    let insist = if retry {
+        "\nThe previous answer repeated itself. Each pick must be a DIFFERENT option, with a \
+         different reason naming what distinguishes it.\n"
+    } else {
+        ""
+    };
 
     format!(
         "Pick the {want} best options for the prompt below, best first.\n\
          \n\
+         This prompt has already been judged **{difficulty}**.\n\
+         {act}\n\
+         \n\
          Rules:\n\
-         - Match capability to demand: no frontier model for simple work, no light model \
-         for a hard multi-file refactor.\n\
-         - Higher effort costs latency. Prefer lower unless the prompt needs the reasoning.\n\
+         - Choose an `effort` from the ones listed for that option.\n\
          - PAID-PER-TOKEN costs extra money; rank one high only if clearly better than \
          every other option here.\n\
          - `?` after the effort means it cannot be set, only predicted.\n\
-         - `fit` is 0-100 for THIS prompt, and the five must differ.\n\
-         - `reason`: under 10 words, about THIS option. A different reason for each — \
-         say what distinguishes it from the pick above.\n\
+         - `fit` is 0-100 for THIS prompt. Score the best pick highest.\n\
+         - `reason`: under 10 words, about THIS option, and it must AGREE with where you put \
+         it. Never rank an option first while saying it is risky or insufficient.\n\
+         - A different reason for each: say what distinguishes it from the pick above.\n\
+         - Pick each option at most once.\n\
+         {insist}\
          \n\
          Options:{list}\n\
          \n\
          Prompt to route:\n\
-         <prompt>\n{text}\n</prompt>\n"
+         <prompt>\n{text}\n</prompt>\n",
+        difficulty = demand.as_str(),
+        act = demand.instruction(),
     )
+}
+
+/// The effort to use for `row`, given what the model asked for.
+///
+/// The grammar offers the union of every row's efforts because it cannot make one field depend on
+/// another, so a model can legally ask Gemini for `max` when Gemini's effort is not settable at
+/// all. Snapped to the nearest level the row actually offers rather than rejected: the pick — this
+/// model, for this prompt — is the judgement being asked for, and throwing it away over a detail
+/// pstore can resolve itself would cost the user their answer.
+fn snap_effort(
+    row: &Row,
+    asked: crate::agents::registry::Effort,
+) -> crate::agents::registry::Effort {
+    use crate::agents::registry::Effort;
+
+    if row.efforts.contains(&asked) {
+        return asked;
+    }
+    let position = |e: Effort| Effort::ALL.iter().position(|c| *c == e).unwrap_or(0) as i32;
+    let target = position(asked);
+    row.efforts
+        .iter()
+        .copied()
+        .min_by_key(|e| (position(*e) - target).abs())
+        .unwrap_or(Effort::High)
+}
+
+/// Clean up a reason, and mark it when the grammar cut it short.
+///
+/// The prompt asks for under ten words and [`REASON_CHARS`] is the sampler's hard stop; when the
+/// model writes past it the reply ends mid-word, and "excels at repo-scale edits and complex
+/// refactoring logi" reads as a bug in pstore rather than as a model being verbose. So a reason
+/// that came back at exactly the cap — which is what truncation looks like — is cut back to its
+/// last whole word and ellipsised, which reads as what it is.
+fn tidy_reason(raw: &str) -> String {
+    tidy(raw, REASON_CHARS)
+}
+
+/// Clean up a sampled string, and mark it when it stopped at `cap` rather than at its own end.
+///
+/// Shared by the two short strings the model writes for a person to read — a choice's reason and
+/// the phrase that decided the difficulty — because both are capped and both look like a bug in
+/// pstore when the cap lands mid-word.
+fn tidy(raw: &str, cap: usize) -> String {
+    // Measured before trimming: the cap applies to what the sampler emitted, and a string that
+    // happened to stop on a space would otherwise slip under the test and keep its dangling word.
+    let truncated = raw.chars().count() >= cap;
+    let trimmed = raw.trim();
+    if !truncated {
+        return trimmed.to_string();
+    }
+    match trimmed.rsplit_once(' ') {
+        Some((head, _)) => format!("{}…", head.trim_end_matches([',', ';', ':'])),
+        // One long word at the cap: nothing to cut back to, so say it was cut.
+        None => format!("{trimmed}…"),
+    }
 }
 
 /// Map the model's indices back onto real candidates.
@@ -687,8 +1018,11 @@ fn rank_prompt(text: &str, candidates: &[super::Candidate], want: usize) -> Stri
 /// like a bug in pstore.
 fn build_choices(
     reply: &Value,
+    rows: &[Row],
     candidates: &[super::Candidate],
 ) -> Result<Vec<super::Choice>, String> {
+    use crate::agents::registry::Effort;
+
     let raw = reply
         .get("choices")
         .and_then(Value::as_array)
@@ -702,8 +1036,8 @@ fn build_choices(
             .and_then(Value::as_u64)
             .ok_or_else(|| format!("a choice had no usable index: {item}"))?
             as usize;
-        let Some(c) = candidates.get(idx) else {
-            // The grammar bounds this, so reaching here means the schema and the list
+        let Some(row) = rows.get(idx) else {
+            // The grammar bounds this, so reaching here means the grammar and the list
             // disagree — skip rather than launching something arbitrary.
             continue;
         };
@@ -712,24 +1046,43 @@ fn build_choices(
         }
         seen.push(idx);
 
+        let asked = item
+            .get("effort")
+            .and_then(Value::as_str)
+            .and_then(|s| Effort::ALL.iter().copied().find(|e| e.as_str() == s))
+            // No effort field at all is not something the grammar allows; if it happens, the
+            // middle of what this row offers is a better answer than refusing the pick.
+            .unwrap_or(Effort::High);
+        let effort = snap_effort(row, asked);
+
+        // The grid is what pstore can actually launch, so the (row, effort) pair is confirmed
+        // against it rather than assumed. A pair missing from the grid means the row was built
+        // from candidates that no longer exist, which is a bug, not a launch to attempt.
+        if !candidates
+            .iter()
+            .any(|c| c.agent_id == row.agent_id && c.model_id == row.model_id && c.effort == effort)
+        {
+            continue;
+        }
+
         out.push(super::Choice {
-            agent_id: c.agent_id,
-            agent_display: c.agent_display,
-            model_id: c.model_id,
-            model_display: c.model_display,
-            tier: c.tier,
-            effort: c.effort,
-            effort_selectable: c.effort_selectable,
-            metered: c.metered,
-            relative_latency: c.effort.latency_factor(),
-            relative_price: c.relative_price,
+            agent_id: row.agent_id,
+            agent_display: row.agent_display,
+            model_id: row.model_id.clone(),
+            model_display: row.model_display.clone(),
+            tier: row.tier,
+            effort,
+            effort_selectable: row.effort_selectable,
+            metered: row.metered,
+            relative_latency: effort.latency_factor(),
+            relative_price: row.relative_price,
             fit: item.get("fit").and_then(Value::as_f64).unwrap_or(0.0) as f32,
-            rationale: item
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
+            rationale: tidy_reason(
+                item.get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+            row_index: idx,
         });
     }
 
@@ -741,8 +1094,10 @@ fn build_choices(
     // Against the real checkpoint, a "fix a typo" prompt came back correctly ordered — the
     // light model first, with a reason saying so — but scored `fit: 0` and `fit: 1`. Sorting
     // on those numbers inverted the answer the model had actually given. The ordering is
-    // what it was asked for and what it gets right; `fit` is a self-assessment that is
-    // useful for the table and the hint tolerance, and not to be trusted as a sort key.
+    // what it was asked for and what it gets right; `fit` is a self-assessment, useful for the
+    // table and the hint tolerance, and not to be trusted as a sort key. The grammar's
+    // descending bands now keep the two consistent, which is a reason to leave this alone
+    // rather than a reason to revisit it.
     Ok(out)
 }
 
@@ -759,6 +1114,77 @@ pub fn normalise_latency(choices: &mut [super::Choice]) {
             c.relative_latency /= min;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Which models the checkpoint actually knows
+// ---------------------------------------------------------------------------
+
+/// Ask the checkpoint which of `models` it can describe from its own knowledge.
+///
+/// Returns indices into `models`. This is the second step of [`crate::knowledge::resolve`] and it
+/// only runs for names pstore's own table does not cover, so on a stock installation it never
+/// runs at all.
+///
+/// **Greedy, and no reasoning.** "Do you know this name?" is recall, not judgement: there is
+/// nothing to deliberate and nothing for temperature to diversify. Reasoning here would cost a
+/// second ranking call's worth of seconds to answer a question the first sampled token settles.
+///
+/// The prompt pushes hard towards omission, because the failure that matters is asymmetric. A
+/// model wrongly left out is ranked from a web lookup or reported as unknown — visible, and
+/// recoverable. A model wrongly claimed as known is ranked on an invention, which is exactly
+/// what this whole path exists to stop.
+pub fn known_models(models: &[String]) -> Result<Vec<usize>, String> {
+    if models.is_empty() {
+        return Ok(Vec::new());
+    }
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["known"],
+        "properties": {
+            "known": {
+                "type": "array",
+                "maxItems": models.len(),
+                "items": {"type": "integer", "minimum": 0, "maximum": models.len() - 1}
+            }
+        }
+    });
+
+    let list = models
+        .iter()
+        .enumerate()
+        .map(|(i, m)| format!("\n{i}: {m}"))
+        .collect::<String>();
+    let prompt = format!(
+        "Below are names of AI language models.\n\
+         \n\
+         Return the indices of ONLY the ones you genuinely know — where you could state which \
+         company makes it and what it is good at.\n\
+         \n\
+         If a name is unfamiliar, or you are guessing from the way it is spelled, LEAVE IT OUT. \
+         An empty list is the right answer when you know none of them. Do not guess.\n\
+         \n\
+         Models:{list}\n"
+    );
+
+    // 8 tokens per index, plus the wrapper. The list is short by construction.
+    // Its own session, and the only operation that gets one for a single call. It runs at all
+    // only when [`FACTS`](crate::knowledge::FACTS) does not cover the field, which on a stock
+    // installation is never — so the common ranking path still loads the weights exactly once.
+    let task = Task::extraction(schema, 32 + models.len() * 8);
+    let reply = once(&task, &prompt)?;
+    Ok(reply
+        .get("known")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_u64)
+                .map(|i| i as usize)
+                .filter(|i| *i < models.len())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
@@ -785,35 +1211,49 @@ const PII_OUTPUT_TOKENS: usize = 1200;
 /// paragraph is extraction, not judgement — there is no deliberation to be had — and the cost
 /// would be paid once per chunk.
 pub fn detect_pii(text: &str) -> Result<Vec<crate::pii::Finding>, String> {
-    let schema = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["findings"],
-        "properties": {
-            "findings": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["tag", "text"],
-                    "properties": {
-                        "tag": {"type": "string", "enum": crate::pii::TAGS},
-                        "text": {"type": "string", "minLength": 1, "maxLength": 200}
+    let task = Task::extraction(
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["findings"],
+            "properties": {
+                "findings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["tag", "text"],
+                        "properties": {
+                            "tag": {"type": "string", "enum": crate::pii::TAGS},
+                            "text": {"type": "string", "minLength": 1, "maxLength": 200}
+                        }
                     }
                 }
             }
-        }
-    });
+        }),
+        PII_OUTPUT_TOKENS,
+    );
+
+    let chunks = crate::pii::segments(text, crate::pii::CHUNK_CHARS);
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One window, sized for the largest chunk — every chunk goes through the same session, so the
+    // cache has to hold the biggest of them and no more.
+    let widest = chunks
+        .iter()
+        .map(|(_, c)| pii_prompt(c).len())
+        .max()
+        .unwrap_or(0);
+    let ctx = fit_context_for(
+        &[(widest, PII_OUTPUT_TOKENS)],
+        crate::config::prefs_snapshot().model_context_ceiling,
+    );
+    let session = Session::open(ctx)?;
 
     let mut out = Vec::new();
-    // Long prompts are chunked so no single call approaches the context ceiling. Offsets
-    // are translated back to the whole document by `locate_spans`.
-    for (offset, chunk) in crate::pii::segments(text, crate::pii::CHUNK_CHARS) {
-        let reply = complete_json(
-            &pii_prompt(chunk),
-            Constrain::Schema(&schema),
-            PII_OUTPUT_TOKENS,
-        )?;
+    for (offset, chunk) in chunks {
+        let reply = session.run(&task, &pii_prompt(chunk))?;
         let findings = reply
             .get("findings")
             .and_then(Value::as_array)
@@ -947,40 +1387,66 @@ pub fn shrink_chunk_chars() -> usize {
 /// Bounded above the input on purpose. A rewrite that saves nothing is a legitimate answer —
 /// an already-terse prompt has nothing to give — and clipping the reply at the token cap
 /// would not produce a shorter prompt, it would produce invalid JSON and an error.
-fn shrink_output_tokens(chunk: &str) -> usize {
-    let tokens = (chunk.len() as f32 / CHARS_PER_TOKEN).ceil() as usize;
+fn shrink_output_tokens_for(chars: usize) -> usize {
+    let tokens = (chars as f32 / CHARS_PER_TOKEN).ceil() as usize;
     (tokens + tokens / 4 + 64).clamp(128, 4096)
 }
 
-/// Rewrite one chunk of a prompt in the compressed form [`crate::shrink`] asks for.
+/// A shrink in progress: one load of the weights, one call per chunk.
 ///
-/// Greedy, like the personal-data scan and for the same reason: most of the output is text
-/// copied from the input — paths, identifiers, code — and there is nothing for temperature
-/// to diversify but the copy. Reasoning is not enabled either; deliberating about a sentence
-/// costs more seconds than the sentence is worth, once per chunk.
-pub fn shrink(chunk: &str) -> Result<String, String> {
-    let schema = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["prompt"],
-        "properties": {
-            "prompt": {"type": "string", "minLength": 1}
-        }
-    });
+/// Held by [`crate::shrink::run`] for the whole pass rather than opened per chunk. A long document
+/// is four or five calls, and mapping the weights for each of them would be seconds of pure
+/// overhead on work that is otherwise linear in the text.
+pub struct ShrinkPass {
+    session: Session,
+    task: Task,
+}
 
-    let reply = complete_json(
-        &crate::shrink::compose(chunk),
-        Constrain::Schema(&schema),
-        shrink_output_tokens(chunk),
-    )?;
+impl ShrinkPass {
+    /// Open a pass sized for the largest chunk it will be given.
+    ///
+    /// `widest` is the longest chunk in characters, which the caller already knows from
+    /// [`crate::shrink::chunks`]. Sizing from the actual chunks rather than from
+    /// [`shrink_chunk_chars`] means a short document opens a small window.
+    pub fn open(widest: usize) -> Result<Self, String> {
+        let output = shrink_output_tokens_for(widest);
+        let instruction = crate::shrink::INSTRUCTION.len();
+        let ctx = fit_context_for(
+            &[(instruction + widest, output)],
+            crate::config::prefs_snapshot().model_context_ceiling,
+        );
+        Ok(ShrinkPass {
+            session: Session::open(ctx)?,
+            task: Task::extraction(
+                json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["prompt"],
+                    "properties": {"prompt": {"type": "string", "minLength": 1}}
+                }),
+                output,
+            ),
+        })
+    }
 
-    reply
-        .get("prompt")
-        .and_then(Value::as_str)
-        // The schema constrains the shape, not the manners: a model told "no preamble" still
-        // opens with one often enough that the cleanup has to stay.
-        .map(crate::shrink::clean)
-        .ok_or_else(|| "the model's reply had no rewritten prompt".to_string())
+    /// Rewrite one chunk in the compressed form [`crate::shrink`] asks for.
+    ///
+    /// Greedy, like the personal-data scan and for the same reason: most of the output is text
+    /// copied from the input — paths, identifiers, code — and there is nothing for temperature to
+    /// diversify but the copy. Reasoning is not enabled either; deliberating about a sentence
+    /// costs more seconds than the sentence is worth, once per chunk.
+    pub fn chunk(&self, body: &str) -> Result<String, String> {
+        let reply = self
+            .session
+            .run(&self.task, &crate::shrink::compose(body))?;
+        reply
+            .get("prompt")
+            .and_then(Value::as_str)
+            // The schema constrains the shape, not the manners: a model told "no preamble" still
+            // opens with one often enough that the cleanup has to stay.
+            .map(crate::shrink::clean)
+            .ok_or_else(|| "the model's reply had no rewritten prompt".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1018,9 +1484,6 @@ pub fn reset() {
 /// prevent.
 pub fn shutdown() {
     CLOSING.store(true, Ordering::Relaxed);
-    // The server first: it is the only child that would otherwise outlive the window
-    // indefinitely, holding both the memory and the port.
-    crate::serve::stop();
     if stop_live() > 0 {
         // Weights on disk, nothing running: what is true a moment before the app exits. Set
         // on whichever build was selected — the run that was killed can only have been that
@@ -1034,6 +1497,7 @@ pub fn shutdown() {
 mod tests {
     use super::*;
     use crate::agents::registry::{Effort, Tier};
+    use crate::knowledge::Brief;
 
     fn candidate(
         agent: &'static str,
@@ -1043,14 +1507,50 @@ mod tests {
         super::super::Candidate {
             agent_id: agent,
             agent_display: "Agent",
-            model_id: model,
-            model_display: model,
+            model_id: model.into(),
+            model_display: model.into(),
             tier: Tier::Mid,
             effort,
             effort_selectable: true,
             metered: false,
             relative_price: 1.0,
         }
+    }
+
+    /// A candidate carrying the registry's real facts for `model`, so a test that depends on a
+    /// model's tier — the ordering does — is not quietly asserting against `Tier::Mid`.
+    fn real(agent: &'static str, model: &'static str, effort: Effort) -> super::super::Candidate {
+        let spec = crate::agents::registry::find(agent).expect("an agent in the registry");
+        let m = spec
+            .models
+            .iter()
+            .find(|m| m.id == model)
+            .unwrap_or_else(|| panic!("{agent} does not expose {model}"));
+        super::super::Candidate {
+            agent_id: spec.id,
+            agent_display: spec.display,
+            model_id: m.id.into(),
+            model_display: m.display.into(),
+            tier: m.tier,
+            effort,
+            effort_selectable: spec.effort_flag.is_supported(),
+            metered: m.metered,
+            relative_price: m.relative_price,
+        }
+    }
+
+    /// A field of `n` distinct models, each at one effort — enough to exercise the grammar and
+    /// the index alternation without naming anything real.
+    fn test_rows(n: usize) -> Vec<Row> {
+        let cands: Vec<super::super::Candidate> = (0..n)
+            .map(|i| {
+                let mut c = candidate("claude", "m", Effort::High);
+                c.model_id = format!("model-{i}").into();
+                c.model_display = c.model_id.clone();
+                c
+            })
+            .collect();
+        rows(&cands, &Brief::default())
     }
 
     /// The whole memory argument rests on this: a short prompt must not open a large
@@ -1109,7 +1609,7 @@ mod tests {
         let stretched = "x".repeat(chunk + chunk / 4);
         let prompt = crate::shrink::compose(&stretched);
         let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
-        let ctx = fit_context(&prompt, shrink_output_tokens(&stretched), ceiling);
+        let ctx = fit_context(&prompt, shrink_output_tokens_for(stretched.len()), ceiling);
         assert!(
             ctx < ceiling,
             "a stretched chunk needs {ctx} tokens against a {ceiling} ceiling — \
@@ -1122,7 +1622,7 @@ mod tests {
     #[test]
     fn shrink_output_has_room_for_an_unchanged_rewrite() {
         let text = "x".repeat(3_000);
-        let tokens = shrink_output_tokens(&text);
+        let tokens = shrink_output_tokens_for(text.len());
         assert!(
             tokens as f32 > text.len() as f32 / CHARS_PER_TOKEN,
             "{tokens} tokens cannot hold a rewrite the size of its input"
@@ -1150,35 +1650,100 @@ mod tests {
             candidate("claude", "sonnet", Effort::Medium),
             candidate("codex", "gpt", Effort::High),
         ];
+        let rows = rows(&cands, &Brief::default());
         let reply = json!({"choices": [
-            {"index": 1, "fit": 80, "reason": "strong at refactors"},
-            {"index": 0, "fit": 90, "reason": "cheaper and enough"},
+            {"index": 1, "effort": "high", "fit": 90, "reason": "strong at refactors"},
+            {"index": 0, "effort": "medium", "fit": 78, "reason": "cheaper and enough"},
         ]});
 
-        let out = build_choices(&reply, &cands).unwrap();
+        let out = build_choices(&reply, &rows, &cands).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].model_id, "gpt", "emitted order is the ranking");
         assert_eq!(out[0].rationale, "strong at refactors");
         assert_eq!(out[1].model_id, "sonnet");
         // Latency comes from the registry, not from the model.
         assert_eq!(out[0].relative_latency, Effort::High.latency_factor());
+        // And the index is kept, so a run of consecutive picks can be recognised later.
+        assert_eq!(out[0].row_index, 1);
+    }
+
+    /// The grid is one row per (model, effort); the model ranks one row per *model* and names
+    /// the effort. Getting that mapping wrong would launch an effort the agent never offered.
+    #[test]
+    fn efforts_collapse_into_one_row_per_model() {
+        let cands = [
+            candidate("claude", "opus", Effort::Low),
+            candidate("claude", "opus", Effort::High),
+            candidate("claude", "opus", Effort::Max),
+            candidate("claude", "haiku", Effort::Low),
+        ];
+        let rows = rows(&cands, &Brief::default());
+
+        assert_eq!(rows.len(), 2, "four candidates, two models");
+        assert_eq!(rows[0].model_id, "opus");
+        assert_eq!(
+            rows[0].efforts,
+            vec![Effort::Low, Effort::High, Effort::Max],
+            "every effort the grid offered for that model, ascending"
+        );
+        assert_eq!(rows[1].efforts, vec![Effort::Low]);
+
+        // The chosen effort has to survive onto the Choice, since that is what gets launched.
+        let reply = json!({"choices": [
+            {"index": 0, "effort": "max", "fit": 95, "reason": "hard refactor"},
+        ]});
+        let out = build_choices(&reply, &rows, &cands).unwrap();
+        assert_eq!(out[0].effort, Effort::Max);
+    }
+
+    /// The grammar offers every effort any row supports, because it cannot tie one field to
+    /// another — so an effort this model cannot be asked for has to be resolved, not launched.
+    #[test]
+    fn an_unavailable_effort_snaps_to_the_nearest_one_offered() {
+        let cands = [
+            candidate("claude", "opus", Effort::Low),
+            candidate("claude", "opus", Effort::Max),
+            // Gemini cannot be told an effort at all: the grid offers it exactly one.
+            candidate("gemini", "flash", Effort::High),
+        ];
+        let rows = rows(&cands, &Brief::default());
+
+        let gemini = rows.iter().find(|r| r.agent_id == "gemini").unwrap();
+        assert_eq!(snap_effort(gemini, Effort::Max), Effort::High);
+        assert_eq!(snap_effort(gemini, Effort::Low), Effort::High);
+
+        let opus = rows.iter().find(|r| r.model_id == "opus").unwrap();
+        assert_eq!(snap_effort(opus, Effort::Max), Effort::Max, "exact match");
+        // Medium is one step from Low and two from Max, so it snaps down.
+        assert_eq!(snap_effort(opus, Effort::Medium), Effort::Low);
+
+        // End to end: asking Gemini for `max` yields a launchable choice, not a dropped one.
+        let reply = json!({"choices": [
+            {"index": 1, "effort": "max", "fit": 90, "reason": "fast enough"},
+        ]});
+        let out = build_choices(&reply, &rows, &cands).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].agent_id, "gemini");
+        assert_eq!(out[0].effort, Effort::High);
     }
 
     /// Regression from a live run: the checkpoint ordered a shortlist correctly but scored
     /// it `fit: 0` then `fit: 1`. Re-sorting on `fit` inverted the answer it had given, so
-    /// the emitted order has to win.
+    /// the emitted order has to win. The grammar's bands now make that reply unreachable, and
+    /// the property still holds if someone changes them.
     #[test]
     fn a_useless_fit_scale_does_not_reorder_the_ranking() {
         let cands = [
             candidate("claude", "haiku", Effort::Low),
             candidate("claude", "opus", Effort::High),
         ];
+        let rows = rows(&cands, &Brief::default());
         let reply = json!({"choices": [
-            {"index": 0, "fit": 0, "reason": "simple task, light model is enough"},
-            {"index": 1, "fit": 1, "reason": "more than this needs"},
+            {"index": 0, "effort": "low", "fit": 0, "reason": "simple task, light model is enough"},
+            {"index": 1, "effort": "high", "fit": 1, "reason": "more than this needs"},
         ]});
 
-        let out = build_choices(&reply, &cands).unwrap();
+        let out = build_choices(&reply, &rows, &cands).unwrap();
         assert_eq!(
             out[0].model_id, "haiku",
             "the model's own ordering must survive its own scoring"
@@ -1188,20 +1753,317 @@ mod tests {
     #[test]
     fn duplicate_and_out_of_range_choices_are_dropped() {
         let cands = [candidate("claude", "sonnet", Effort::Medium)];
+        let rows = rows(&cands, &Brief::default());
         let reply = json!({"choices": [
-            {"index": 0, "fit": 90, "reason": "good"},
-            {"index": 0, "fit": 70, "reason": "same option again"},
-            {"index": 99, "fit": 99, "reason": "does not exist"},
+            {"index": 0, "effort": "medium", "fit": 90, "reason": "good"},
+            {"index": 0, "effort": "medium", "fit": 70, "reason": "same option again"},
+            {"index": 99, "effort": "medium", "fit": 99, "reason": "does not exist"},
         ]});
 
-        let out = build_choices(&reply, &cands).unwrap();
+        let out = build_choices(&reply, &rows, &cands).unwrap();
         assert_eq!(out.len(), 1, "one real option, listed once");
         assert_eq!(out[0].fit, 90.0);
 
         // Nothing usable at all is an error, not an empty shortlist the UI would render as
         // "no models fit".
-        let none = json!({"choices": [{"index": 99, "fit": 99, "reason": "nope"}]});
-        assert!(build_choices(&none, &cands).is_err());
+        let none = json!({"choices": [{"index": 99, "effort": "low", "fit": 99, "reason": "no"}]});
+        assert!(build_choices(&none, &rows, &cands).is_err());
+    }
+
+    /// What pstore knows about a model has to reach the prompt, because the checkpoint's
+    /// training predates every model in the field. Without this the ranker is judging names.
+    #[test]
+    fn model_facts_reach_the_prompt() {
+        use crate::knowledge::{Known, Source};
+
+        let cands = [candidate("claude", "opus", Effort::High)];
+        let brief = Brief {
+            known: vec![Known {
+                model: "opus".into(),
+                note: "frontier model, best for hard refactors".into(),
+                source: Source::Table,
+            }],
+            unknown: Vec::new(),
+        };
+        let rows = rows(&cands, &brief);
+        assert_eq!(rows[0].note, "frontier model, best for hard refactors");
+
+        let prompt = rank_prompt("do a thing", &rows, 1, Demand::Hard, false);
+        assert!(
+            prompt.contains("frontier model, best for hard refactors"),
+            "the note is missing from the prompt: {prompt}"
+        );
+        // And the retry instruction is only added when there is something to correct.
+        assert!(!prompt.contains("repeated itself"));
+        assert!(
+            rank_prompt("do a thing", &rows, 1, Demand::Hard, true).contains("repeated itself")
+        );
+    }
+
+    /// Observed on both builds: the model writes past the sampler's stop and the reply ends
+    /// mid-word. A shortlist row reading "excels at repo-scale edits and complex refactoring
+    /// logi" looks like pstore corrupted it.
+    #[test]
+    fn a_truncated_reason_is_cut_back_to_a_word() {
+        let cut = "Coding-specialized frontier model excels at repo-scale edits and complex refac";
+        assert!(
+            cut.len() < REASON_CHARS,
+            "this fixture should be under the cap"
+        );
+        assert_eq!(tidy_reason(cut), cut, "a short reason is left alone");
+
+        // At the cap, which is what the sampler stopping mid-word looks like.
+        let at_cap: String =
+            std::iter::repeat_n("word ", 20).collect::<String>()[..REASON_CHARS].to_string();
+        let tidied = tidy_reason(&at_cap);
+        assert!(tidied.ends_with('…'), "{tidied:?}");
+        assert!(!tidied.contains("wor…"), "cut mid-word: {tidied:?}");
+
+        // Trailing punctuation left dangling by the cut goes with it.
+        let dangling = format!("{}, and", "x".repeat(REASON_CHARS - 6));
+        assert!(!tidy_reason(&dangling).contains(",…"), "{dangling:?}");
+
+        // One unbroken token at the cap has nothing to cut back to, but must still be marked.
+        let one_word = "x".repeat(REASON_CHARS);
+        assert_eq!(tidy_reason(&one_word), format!("{one_word}…"));
+
+        assert_eq!(tidy_reason("  spaced out  "), "spaced out");
+
+        // The same trim serves the difficulty phrase, at its own cap — the two strings the model
+        // writes for a person to read are both capped and both look mangled when cut mid-word.
+        assert_eq!(
+            tidy("a single typo in the README, which is a one", 42),
+            "a single typo in the README, which is a…"
+        );
+        assert_eq!(tidy("short enough", 42), "short enough");
+    }
+
+    /// The bands are what make "all five scored 85" unrepresentable rather than merely
+    /// discouraged, so they have to descend and not overlap.
+    #[test]
+    fn fit_bands_descend_without_overlapping() {
+        let mut previous: Option<(u32, u32)> = None;
+        for position in 0..super::super::SHORTLIST {
+            let (lo, hi) = fit_band(position);
+            assert!(lo <= hi, "band {position} is inverted: {lo}..={hi}");
+            assert!(hi <= 99, "a fit over 99 needs three digits");
+            assert!(lo >= 10, "a one-digit fit would not match the grammar");
+            if let Some((prev_lo, _)) = previous {
+                assert!(
+                    hi < prev_lo,
+                    "band {position} ({lo}..={hi}) overlaps the one above it"
+                );
+            }
+            previous = Some((lo, hi));
+        }
+        assert_eq!(fit_band(0).1, 99, "the best pick can score full marks");
+    }
+
+    /// The digit alternation has to match exactly the range it claims, or the sampler either
+    /// forbids a legal score or allows one outside the band.
+    #[test]
+    fn digit_ranges_cover_exactly_their_bounds() {
+        assert_eq!(digits_in_range(85, 99), "\"8\" [5-9] | \"9\" [0-9]");
+        assert_eq!(digits_in_range(70, 84), "\"7\" [0-9] | \"8\" [0-4]");
+        // A range inside one decade, and a single value.
+        assert_eq!(digits_in_range(40, 45), "\"4\" [0-5]");
+        assert_eq!(digits_in_range(50, 50), "\"5\" \"0\"");
+    }
+
+    /// A degenerate answer is populated in every field and wrong in the only one that matters,
+    /// so it has to be recognised rather than shown. Both signatures come from live 1-bit runs.
+    #[test]
+    fn enumeration_is_told_apart_from_ranking() {
+        let pick = |index: usize, fit: f32, reason: &str| super::super::Choice {
+            agent_id: "claude",
+            agent_display: "Claude Code",
+            model_id: "m".into(),
+            model_display: "M".into(),
+            tier: Tier::Mid,
+            effort: Effort::High,
+            effort_selectable: true,
+            metered: false,
+            relative_latency: 1.0,
+            relative_price: 1.0,
+            fit,
+            rationale: reason.into(),
+            row_index: index,
+        };
+
+        // A real ranking: distinct options, descending scores, reasons that differ.
+        let good = vec![
+            pick(4, 95.0, "frontier model for a hard refactor"),
+            pick(0, 80.0, "cheaper and probably enough"),
+            pick(2, 65.0, "fast but likely to miss cases"),
+        ];
+        assert_eq!(degeneracy(&good, 15), None);
+
+        // The one from the README: the same reason copy-pasted onto every pick.
+        let same_reason = vec![
+            pick(1, 95.0, "good fit for this prompt"),
+            pick(2, 80.0, "good fit for this prompt"),
+            pick(3, 65.0, "Good fit for this prompt"),
+        ];
+        let why = degeneracy(&same_reason, 15).expect("copy-pasted reasons are degenerate");
+        assert!(why.contains("same reason"), "got {why}");
+
+        // Identical scores, which the grammar now forbids and this still catches.
+        let same_fit = vec![
+            pick(1, 85.0, "frontier"),
+            pick(2, 85.0, "mid"),
+            pick(3, 85.0, "cheap"),
+        ];
+        assert!(degeneracy(&same_fit, 15).is_some());
+
+        // Consecutive picks are NOT degenerate: `order_for` puts the options the difficulty
+        // calls for at the top, so "the first three in order" is what a correct answer looks
+        // like. Flagging it would cry wolf on exactly the results the check protects.
+        let in_order = vec![
+            pick(0, 95.0, "frontier, and this is a hard refactor"),
+            pick(1, 80.0, "mid-tier, close behind"),
+            pick(2, 65.0, "light, listed for completeness"),
+            pick(3, 50.0, "slower for no gain here"),
+        ];
+        assert_eq!(degeneracy(&in_order, 15), None);
+
+        // One pick out of a real field is not a ranking either.
+        assert!(degeneracy(&good[..1], 15).is_some());
+        // Unless that is all there was.
+        assert_eq!(degeneracy(&good[..1], 1), None);
+    }
+
+    /// The difficulty read is the premise of the ranking, so what it tells the ranker to do has
+    /// to differ per level and has to name the direction — that instruction is the whole fix for
+    /// the 1-bit build putting Haiku first on a three-file refactor.
+    #[test]
+    fn each_difficulty_points_the_ranking_somewhere_different() {
+        let all = [Demand::Easy, Demand::Moderate, Demand::Hard];
+
+        let mut labels: Vec<&str> = all.iter().map(|d| d.as_str()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), all.len(), "levels must be distinguishable");
+
+        let mut instructions: Vec<&str> = all.iter().map(|d| d.instruction()).collect();
+        instructions.sort_unstable();
+        instructions.dedup();
+        assert_eq!(
+            instructions.len(),
+            all.len(),
+            "each level needs its own steer"
+        );
+
+        // The two directions have to be stated as directions, not as preferences.
+        assert!(Demand::Hard.instruction().contains("CAPABLE"));
+        assert!(Demand::Easy.instruction().contains("LIGHTEST"));
+
+        // And the steer has to reach the prompt, or the extra call bought nothing.
+        let cands = [candidate("claude", "opus", Effort::High)];
+        let rows = rows(&cands, &Brief::default());
+        for d in all {
+            let p = rank_prompt("x", &rows, 1, d, false);
+            assert!(p.contains(d.as_str()), "{d:?} is not stated in the prompt");
+            assert!(
+                p.contains(d.instruction()),
+                "{d:?} does not tell the ranker what to do"
+            );
+        }
+    }
+
+    /// A small model reads the top of the list, so the top of the list has to be the answer.
+    /// Asked to shortlist a hard refactor from a light-to-frontier list, the 1-bit build returned
+    /// options 0, 1, 2 in order — with reasons that contradicted its own ranking.
+    #[test]
+    fn options_are_presented_best_first_for_the_difficulty() {
+        let mut cands = vec![
+            candidate("claude", "haiku", Effort::Low),
+            candidate("claude", "sonnet", Effort::Low),
+            candidate("claude", "opus", Effort::Low),
+        ];
+        cands[0].tier = Tier::Cheap;
+        cands[1].tier = Tier::Mid;
+        cands[2].tier = Tier::Top;
+
+        let first = |demand| {
+            let mut rows = rows(&cands, &Brief::default());
+            order_for(&mut rows, demand);
+            rows.iter()
+                .map(|r| r.model_id.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            first(Demand::Hard)[0],
+            "opus",
+            "hard work leads with capability"
+        );
+        assert_eq!(
+            first(Demand::Easy)[0],
+            "haiku",
+            "easy work leads with the light model"
+        );
+        assert_eq!(
+            first(Demand::Moderate)[0],
+            "sonnet",
+            "and the middle with the middle"
+        );
+
+        // Every option is still offered — this reorders the list, it does not shorten it.
+        assert_eq!(first(Demand::Hard).len(), 3);
+
+        // The tail is ordered by distance too, so the worst fit is last rather than second.
+        assert_eq!(first(Demand::Hard).last().unwrap(), "haiku");
+        assert_eq!(first(Demand::Easy).last().unwrap(), "opus");
+    }
+
+    /// The small build is asked an easier question than the big one. If this regresses it does
+    /// so silently — the answers just get worse.
+    #[test]
+    fn the_small_build_is_asked_for_a_shorter_shortlist() {
+        let small = shortlist_for(&models::LLM_1BIT);
+        let big = shortlist_for(&models::LLM_TERNARY);
+        assert!(
+            small < big,
+            "the 1-bit build should be asked for fewer picks ({small} vs {big})"
+        );
+        assert!(small >= 2, "fewer than two picks is not a ranking");
+        assert_eq!(big, super::super::SHORTLIST);
+    }
+
+    /// The grammar is generated, so it is worth asserting that the generated thing contains
+    /// the constraints it is generated for.
+    #[test]
+    fn the_grammar_binds_every_position() {
+        let cands = [
+            candidate("claude", "opus", Effort::Low),
+            candidate("claude", "opus", Effort::High),
+            candidate("claude", "haiku", Effort::Low),
+        ];
+        let rows = rows(&cands, &Brief::default());
+        let g = rank_grammar(&rows, 2, 1400);
+
+        assert!(g.contains("</think>"), "reasoning must be closed");
+        assert!(
+            g.contains("choice0 ::="),
+            "each position needs its own rule"
+        );
+        assert!(g.contains("choice1 ::="));
+        assert!(g.contains("fit0 ::="), "each position needs its own band");
+        assert!(g.contains("fit1 ::="));
+        assert!(
+            g.contains("index ::= \"0\" | \"1\""),
+            "one index per row: {g}"
+        );
+        assert!(g.contains("effort ::="), "effort is chosen, not indexed");
+        assert!(
+            !g.contains("[ \\t\\n]*"),
+            "an unbounded whitespace rule hangs the sampler"
+        );
+
+        // Reasoning off means no think block at all, not an empty one.
+        let quiet = rank_grammar(&rows, 2, 0);
+        assert!(!quiet.contains("</think>"));
+        assert!(quiet.starts_with("root ::= answer"));
     }
 
     /// Byte offsets come from searching the source, never from the model. This is what
@@ -1278,13 +2140,13 @@ mod tests {
     // Process lifetime
     // -----------------------------------------------------------------------
 
-    /// `CLOSING` is process-wide and refuses *every* run, so the test that raises it has to
-    /// keep other tests out of `supervise` while it does. Held by every test here.
+    /// `CLOSING` is process-wide and refuses *every* session, so a test that raises it has to keep
+    /// the others out of `Session::open` while it does. Held by every test in this section.
     ///
-    /// The registry itself is deliberately **not** guarded: other tests reach the real model
-    /// through `complete_json`, so their children appear in `LIVE` alongside these ones.
-    /// That is exactly the situation a closing app faces, so the tests below identify their
-    /// own child by pid rather than assuming the registry is theirs.
+    /// The registry itself is deliberately **not** guarded: other tests reach the real model, so
+    /// their sessions appear in `LIVE` alongside these ones. That is exactly the situation a
+    /// closing app faces, so the tests below identify their own session by pid rather than
+    /// assuming the registry is theirs.
     static PROCESSES: Mutex<()> = Mutex::new(());
 
     /// Pids currently registered as live.
@@ -1298,331 +2160,294 @@ mod tests {
             if f() {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         false
     }
 
-    fn sh(script: &str) -> Command {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.arg("-c").arg(script).stdin(Stdio::null());
-        cmd
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
     }
 
+    /// A closing app must refuse to map weights rather than start something it is about to kill —
+    /// the race that would otherwise leave gigabytes resident with no window left to show for it.
     #[test]
-    #[cfg(unix)]
-    fn a_supervised_run_captures_both_streams() {
-        let _guard = recover(&PROCESSES);
-        let run = supervise(sh("echo out; echo err >&2"), models::active())
-            .expect("the child should start");
-
-        assert!(run.ok, "a clean exit should be reported as success");
-        assert_eq!(run.stopped, None);
-        assert!(run.stdout.contains("out"));
-        // stderr matters: it is the only diagnostic when a real run fails to load.
-        assert!(run.stderr.contains("err"));
-
-        let failed = supervise(sh("exit 3"), models::active()).expect("the child should start");
-        assert!(!failed.ok);
-        assert_eq!(failed.stopped, None, "a failure is not a deliberate stop");
-    }
-
-    /// The whole point of the registry: a generation in flight when the window closes has to
-    /// die with it, or 7.17 GB of weights stays resident with nothing to show for it.
-    #[test]
-    #[cfg(unix)]
-    fn closing_kills_a_run_in_flight() {
-        let _guard = recover(&PROCESSES);
-        let before = live_pids();
-        let started = std::time::Instant::now();
-        // A child that would far outlive the test, so only being killed can end it.
-        let worker = std::thread::spawn(|| supervise(sh("sleep 30"), models::active()));
-
-        // Its own pid, not merely "something is registered": another test may be running the
-        // real model at the same time.
-        let mut mine = None;
-        assert!(
-            until(5, || {
-                mine = live_pids().into_iter().find(|p| !before.contains(p));
-                mine.is_some()
-            }),
-            "the child was never registered, so nothing could have killed it"
-        );
-        let mine = mine.expect("just checked");
-        assert!(stop_live() >= 1, "the live run should have been found");
-
-        let run = worker.join().expect("the supervising thread").unwrap();
-        assert!(!run.ok, "a killed child must not report success");
-        assert!(
-            !live_pids().contains(&mine),
-            "a finished run must not stay in the registry"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "took {:?} — the child was waited for, not killed",
-            started.elapsed()
-        );
-        // Nothing of ours left running, and an empty sweep is harmless.
-        stop_live();
-    }
-
-    /// The invariant: two builds' weights are never resident at once.
-    ///
-    /// Switching build while a call is in flight is the only way that could happen — the old
-    /// run goes on holding its weights until it finishes, and the next call would map the
-    /// other build alongside it. On a machine where the small build was chosen *because*
-    /// memory is tight, that is both builds at once, which is the thing being prevented.
-    #[test]
-    #[cfg(unix)]
-    fn switching_build_stops_the_run_holding_the_old_one() {
-        use crate::config::LocalModel;
-
-        let _guard = recover(&PROCESSES);
-        let before = live_pids();
-        let started = std::time::Instant::now();
-
-        // Select the small build and start a run against it — `supervise` refuses to spawn a
-        // build that is not the selected one, which is the other half of this invariant.
-        let mut prefs = crate::config::prefs_snapshot();
-        let restore = prefs.local_model;
-        prefs.local_model = LocalModel::OneBit;
-        crate::config::publish(&prefs);
-
-        // A run that would far outlive the test, so only the switch can end it.
-        let old = LocalModel::OneBit.checkpoint();
-        let worker = std::thread::spawn(move || supervise(sh("sleep 30"), old));
-
-        let mut mine = None;
-        assert!(
-            until(5, || {
-                mine = live_pids().into_iter().find(|p| !before.contains(p));
-                mine.is_some()
-            }),
-            "the child was never registered, so nothing could have killed it"
-        );
-
-        // Now switch, exactly as the Models window does: publish first, then unload — the
-        // unload asks which build is selected *now*.
-        prefs.local_model = LocalModel::Ternary;
-        crate::config::publish(&prefs);
-        let stopped = unload_other_builds();
-
-        let run = worker.join().expect("the supervising thread").unwrap();
-        prefs.local_model = restore;
-        crate::config::publish(&prefs);
-
-        assert!(
-            stopped >= 1,
-            "the run holding the old build should be found"
-        );
-        assert_eq!(
-            run.stopped,
-            Some(Stopped::Switched),
-            "the caller has to be told why, or this reads as a broken model"
-        );
-        assert!(!run.ok);
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "took {:?} — the old run was waited out rather than stopped",
-            started.elapsed()
-        );
-
-        // The build we left is on disk and running nothing, which is what its row must say.
-        assert!(!crate::models::phase(old.id).is_busy());
-        stop_live();
-    }
-
-    /// A switch must not stop a run that is holding the build the user just chose. Killing
-    /// everything would be simpler and would turn every switch into a lost ranking.
-    #[test]
-    #[cfg(unix)]
-    fn switching_leaves_the_selected_build_running() {
-        let _guard = recover(&PROCESSES);
-        let before = live_pids();
-        let current = models::active();
-        let worker = std::thread::spawn(move || supervise(sh("sleep 2"), current));
-
-        let mut mine = None;
-        assert!(until(5, || {
-            mine = live_pids().into_iter().find(|p| !before.contains(p));
-            mine.is_some()
-        }));
-
-        assert_eq!(
-            unload_other_builds(),
-            0,
-            "nothing is holding a build other than the selected one"
-        );
-        assert!(
-            live_pids().contains(&mine.expect("just checked")),
-            "the run holding the selected build was killed"
-        );
-
-        stop_live();
-        let _ = worker.join();
-    }
-
-    /// Shutdown also has to close the door behind it: a worker that reaches the spawn a
-    /// moment later must not map the weights again on the way out.
-    #[test]
-    #[cfg(unix)]
-    fn a_closing_app_refuses_to_start_the_model() {
+    fn a_closing_app_refuses_to_load() {
         let _guard = recover(&PROCESSES);
         CLOSING.store(true, Ordering::Relaxed);
 
-        let run = supervise(sh("echo should not run"), models::active());
-        // Restored before any assertion, so a failure here cannot leave the flag raised and
-        // break every later test in the binary.
+        let why = refuse_if_stopping(&models::active()).expect_err("closing must refuse");
+        assert!(why.contains("closing"), "got {why}");
+        assert!(stopping());
+
         CLOSING.store(false, Ordering::Relaxed);
-        let run = run.expect("refusal is not an error");
-
-        assert_eq!(
-            run.stopped,
-            Some(Stopped::Closing),
-            "the run should report that it never started, and why"
-        );
-        assert!(!run.ok);
-        assert!(
-            run.stdout.is_empty(),
-            "nothing should have run: {:?}",
-            run.stdout
-        );
+        assert!(!stopping());
     }
 
-    /// Whether the OS still knows about `pid`. A reaped child is gone from `ps` entirely; a
-    /// zombie would still be listed, which is why [`stop_live`] waits on what it kills.
-    #[cfg(unix)]
-    fn alive(pid: u32) -> bool {
-        Command::new("ps")
-            .args(["-p", &pid.to_string()])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
-    /// The claim this whole section exists to make, checked against the real weights: quit
-    /// mid-generation and the process holding 7.17 GB is gone, not orphaned.
-    ///
-    /// Ignored by default — it needs the download and the runtime.
-    ///
-    /// `cargo test -- --ignored live_model_is_killed --nocapture`
+    /// Switching build must refuse a session that is about to map the one just abandoned, or both
+    /// builds end up resident on a machine that was given the small one because memory is tight.
     #[test]
-    #[cfg(unix)]
-    #[ignore = "needs the downloaded checkpoint and a provisioned runtime"]
-    fn live_model_is_killed_when_the_app_closes() {
+    fn a_session_for_the_abandoned_build_is_refused() {
         let _guard = recover(&PROCESSES);
-        let before = live_pids();
-        let started = std::time::Instant::now();
-        // Long enough to chunk, so the scan is certain to still be generating.
-        let text = "Contact Mario Rossi at mario@example.com about invoice 42. ".repeat(60);
-        let worker = std::thread::spawn(move || detect_pii(&text));
+        let other = if models::active().id == models::LLM_1BIT.id {
+            models::LLM_TERNARY
+        } else {
+            models::LLM_1BIT
+        };
 
-        let mut pid = None;
-        assert!(
-            until(60, || {
-                pid = live_pids().into_iter().find(|p| !before.contains(p));
-                pid.is_some()
-            }),
-            "the model never started, so this test proves nothing"
-        );
-        let pid = pid.expect("just checked");
+        let why = refuse_if_stopping(&other).expect_err("the other build must be refused");
+        assert!(why.contains("switched"), "got {why}");
+        // And the selected one is allowed through.
+        assert!(refuse_if_stopping(&models::active()).is_ok());
+    }
 
-        shutdown();
-        let err = worker
-            .join()
-            .expect("the scanning thread")
-            .expect_err("a scan cannot finish once its model is gone");
-        // Restored so the rest of the binary can still run the model.
-        CLOSING.store(false, Ordering::Relaxed);
+    /// The registry is what makes both the shutdown and the build switch possible, so a session
+    /// has to appear in it while it runs and leave when it ends.
+    #[test]
+    fn the_registry_tracks_a_session_by_pid_and_build() {
+        let _guard = recover(&PROCESSES);
+        let child = Arc::new(Mutex::new(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "sleep 30"])
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("a sleep should start"),
+        ));
+        let pid = recover(&child).id();
 
-        eprintln!("  killed pid {pid} after {:?}: {err}", started.elapsed());
-        assert!(
-            err.contains("closing"),
-            "the reason should say the app is closing, got {err:?}"
-        );
-        assert!(
-            !alive(pid),
-            "pid {pid} outlived the shutdown — the weights are still resident"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(120),
-            "shutdown waited for the generation instead of killing it"
-        );
+        register(pid, models::LLM_1BIT.id, Arc::clone(&child));
+        assert!(live_pids().contains(&pid));
+
+        // Stopping by build id reaches it, and does not touch anything else.
+        let stopped = stop_live_where(|id| id == models::LLM_1BIT.id);
+        assert!(stopped.contains(&models::LLM_1BIT.id), "got {stopped:?}");
+        assert!(until(5, || !alive(pid)), "pid {pid} outlived the stop");
+        assert!(!live_pids().contains(&pid), "it stayed in the registry");
+
+        // Ending it twice is safe: that is the state both the owner's Drop and a switch reach.
+        end(&child);
+        deregister(pid);
     }
 
     /// End-to-end against the real checkpoint and the real runtime. Ignored by default — it
-    /// needs one of the builds downloaded, and takes tens of seconds per call.
+    /// needs a build downloaded, and takes tens of seconds per call.
     ///
     /// `cargo test -- --ignored live_model --nocapture`
     ///
-    /// Runs against whichever build is actually on disk rather than insisting on the default
-    /// one: this is the test that proves the grammar, the template and the reply parser work
-    /// against real weights, and it should not be un-runnable on a machine that has the other
-    /// 3.8 GB sitting right there.
+    /// **Runs against every build that is on disk, not just the selected one.** The 1-bit build
+    /// is the one that used to answer `Haiku 4.5, effort medium` and then indices 2, 3, 4, 5 with
+    /// `fit: 85` on all of them, so a test that only exercised the default would pass while the
+    /// build people choose for a small machine stayed broken. Each build gets its own section of
+    /// output, and a failure names which one it was.
     #[test]
     #[ignore = "needs a downloaded checkpoint and a provisioned runtime"]
     fn live_model_ranks_and_finds_personal_data() {
         use crate::config::LocalModel;
 
-        let downloaded = [LocalModel::Ternary, LocalModel::OneBit]
+        let cached: Vec<LocalModel> = [LocalModel::Ternary, LocalModel::OneBit]
             .into_iter()
-            .find(|m| models::is_cached(&m.checkpoint()));
-        let Some(choice) = downloaded else {
+            .filter(|m| models::is_cached(&m.checkpoint()))
+            .collect();
+        if cached.is_empty() {
             eprintln!("neither build is downloaded — nothing to run against");
             return;
-        };
-        // Every build that is on disk must resolve to a real file through the same path the
-        // app uses. Selecting a build that pstore then cannot locate is the one way this
-        // switch can fail silently, and it costs nothing to check both here.
-        for m in [LocalModel::Ternary, LocalModel::OneBit] {
-            let c = m.checkpoint();
-            if models::is_cached(&c) {
-                let path = hub_path(&c).unwrap_or_else(|e| panic!("{} cached but {e}", c.title));
-                assert!(path.exists(), "{} resolved to {path:?}", c.title);
+        }
+
+        for choice in cached {
+            let checkpoint = choice.checkpoint();
+            // A build that is on disk must resolve to a real file through the same path the app
+            // uses. Selecting one pstore then cannot locate is the one way the switch fails
+            // silently.
+            let path = hub_path(&checkpoint)
+                .unwrap_or_else(|e| panic!("{} cached but {e}", checkpoint.title));
+            assert!(path.exists(), "{} resolved to {path:?}", checkpoint.title);
+
+            let mut prefs = crate::config::prefs_snapshot();
+            prefs.local_model = choice;
+            crate::config::publish(&prefs);
+            eprintln!("\n=== {} ===", checkpoint.title);
+
+            // The full grid the app would build: two models at five efforts each, which is the
+            // shape that used to be ranked by counting.
+            let cands: Vec<super::super::Candidate> = ["haiku", "opus"]
+                .into_iter()
+                .flat_map(|model| {
+                    crate::agents::registry::CLAUDE_EFFORTS
+                        .iter()
+                        .map(move |e| real("claude", model, *e))
+                })
+                .collect();
+
+            // The facts pstore would supply, so the live run exercises the prompt the app builds
+            // rather than a bare list of names.
+            let names: Vec<String> = cands.iter().map(|c| c.model_id.to_string()).collect();
+            let brief = crate::knowledge::resolve(&names, known_models, crate::knowledge::lookup);
+            for k in &brief.known {
+                eprintln!("  {} — from {}", k.model, k.source.label());
+            }
+
+            let started = std::time::Instant::now();
+            let ranking = rank("fix a typo in the README", &cands, Vec::new(), &brief)
+                .unwrap_or_else(|e| panic!("{} could not rank: {e}", checkpoint.title));
+            eprintln!("  ranked in {:.1}s", started.elapsed().as_secs_f32());
+            for c in &ranking.choices {
+                eprintln!(
+                    "  {} · effort {} · fit {} · {}",
+                    c.model_display, c.effort, c.fit, c.rationale
+                );
+            }
+
+            assert_eq!(ranking.considered, cands.len());
+            assert!(!ranking.choices.is_empty());
+
+            // The property the whole rework is for: what comes back is a ranking, not the
+            // options in the order they were listed.
+            assert!(
+                ranking.degenerate.is_none(),
+                "{} listed the options instead of ranking them: {:?}",
+                checkpoint.title,
+                ranking.degenerate
+            );
+            // Distinct picks, and scores that descend — both now enforced by the grammar, so a
+            // failure here means the grammar and the parser disagree.
+            let mut picked: Vec<usize> = ranking.choices.iter().map(|c| c.row_index).collect();
+            let before = picked.len();
+            picked.sort_unstable();
+            picked.dedup();
+            assert_eq!(picked.len(), before, "{} repeated a pick", checkpoint.title);
+            for pair in ranking.choices.windows(2) {
+                assert!(
+                    pair[0].fit > pair[1].fit,
+                    "{}: fit did not descend ({} then {})",
+                    checkpoint.title,
+                    pair[0].fit,
+                    pair[1].fit
+                );
+            }
+
+            // And the routing judgement itself: a typo fix must not want the frontier model.
+            let best = ranking.best().expect("a non-empty shortlist");
+            assert_eq!(
+                best.model_id, "haiku",
+                "{} routed a trivial prompt to {} at effort {}",
+                checkpoint.title, best.model_display, best.effort
+            );
+
+            let src = "Contact Mario Rossi at mario@example.com about invoice 42.";
+            let found = detect_pii(src).expect("the model should scan");
+            for f in &found {
+                eprintln!("  {} = {:?}", f.tag, f.text);
+                // Spans are located in the source, so whatever comes back must be real text.
+                assert_eq!(&src[f.start..f.end], f.text, "span does not match its text");
+            }
+            assert!(
+                found.iter().any(|f| f.text.contains("mario@example.com")),
+                "{}: the address should have been found: {found:?}",
+                checkpoint.title
+            );
+        }
+    }
+
+    /// The regression this whole rework exists for, against the real weights.
+    ///
+    /// `cargo test -- --ignored live_wide_field --nocapture`
+    ///
+    /// Asked to rank fifteen (model, effort) pairs for a hard three-file refactor, the 1-bit
+    /// build answered `Haiku 4.5, effort medium` and then indices 2, 3, 4 and 5 in order,
+    /// scoring all five `fit: 85` with the same reason copy-pasted onto each. It was counting,
+    /// not ranking. This is that prompt, over a wider field than the original, run against every
+    /// build on disk: a hard multi-file refactor must reach for capability, and the answer must
+    /// be a ranking.
+    #[test]
+    #[ignore = "needs a downloaded checkpoint and a provisioned runtime"]
+    fn live_wide_field_is_ranked_not_enumerated() {
+        use crate::agents::registry::{CODEX_EFFORTS, Effort};
+        use crate::config::LocalModel;
+
+        const HARD: &str = "Refactor the authentication layer: move session handling out of \
+                            src/api/handlers.rs into a new src/auth/session.rs, thread the store \
+                            through src/api/mod.rs, and keep the existing 20 ms poll interval \
+                            and every public signature unchanged.";
+
+        let cached: Vec<LocalModel> = [LocalModel::Ternary, LocalModel::OneBit]
+            .into_iter()
+            .filter(|m| models::is_cached(&m.checkpoint()))
+            .collect();
+        if cached.is_empty() {
+            eprintln!("neither build is downloaded — nothing to run against");
+            return;
+        }
+
+        // A realistic field: three agents, six models, twenty-two combinations.
+        let mut cands: Vec<super::super::Candidate> = Vec::new();
+        for model in ["haiku", "sonnet", "opus"] {
+            for e in crate::agents::registry::CLAUDE_EFFORTS {
+                cands.push(real("claude", model, *e));
             }
         }
-
-        let mut prefs = crate::config::prefs_snapshot();
-        prefs.local_model = choice;
-        crate::config::publish(&prefs);
-        eprintln!("running against {}", choice.checkpoint().title);
-
-        let cands = [
-            candidate("claude", "haiku-4.5", Effort::Low),
-            candidate("claude", "opus-5", Effort::High),
-        ];
-
-        let ranking =
-            rank("fix a typo in the README", &cands, Vec::new()).expect("the model should rank");
-        for c in &ranking.choices {
-            eprintln!("  {} · fit {} · {}", c.model_display, c.fit, c.rationale);
+        for e in CODEX_EFFORTS {
+            cands.push(real("codex", "gpt-5.1-codex", *e));
         }
-        assert_eq!(ranking.considered, 2);
-        assert!(!ranking.choices.is_empty());
-        // A typo fix must not come back wanting the frontier model at high effort. This is
-        // the whole premise of routing, checked against the real weights rather than a
-        // fixture.
-        assert_eq!(
-            ranking.best().map(|c| c.model_id),
-            Some("haiku-4.5"),
-            "a trivial prompt was routed to {:?}",
-            ranking.best().map(|c| c.model_id)
-        );
+        for model in ["gemini-3-flash", "gemini-3-pro"] {
+            cands.push(real("gemini", model, Effort::High));
+        }
 
-        let found = detect_pii("Contact Mario Rossi at mario@example.com about invoice 42.")
-            .expect("the model should scan");
-        for f in &found {
-            eprintln!("  {} = {:?}", f.tag, f.text);
+        for choice in cached {
+            let checkpoint = choice.checkpoint();
+            let mut prefs = crate::config::prefs_snapshot();
+            prefs.local_model = choice;
+            crate::config::publish(&prefs);
+            eprintln!(
+                "\n=== {} · {} combinations ===",
+                checkpoint.title,
+                cands.len()
+            );
+
+            let names: Vec<String> = cands.iter().map(|c| c.model_id.to_string()).collect();
+            let brief = crate::knowledge::resolve(&names, known_models, crate::knowledge::lookup);
+            let started = std::time::Instant::now();
+            let ranking = rank(HARD, &cands, Vec::new(), &brief)
+                .unwrap_or_else(|e| panic!("{} could not rank: {e}", checkpoint.title));
+            eprintln!("  ranked in {:.1}s", started.elapsed().as_secs_f32());
+            // The premise of everything below it: a shortlist that looks wrong is usually a
+            // difficulty read that was wrong, and without this the failure is unattributable.
+            match &ranking.demand {
+                Some((label, because)) => eprintln!("  judged {label} — {because}"),
+                None => eprintln!("  no difficulty read"),
+            }
+            for c in &ranking.choices {
+                eprintln!(
+                    "  [{}] {} via {} · effort {} · fit {} · {}",
+                    c.row_index, c.model_display, c.agent_display, c.effort, c.fit, c.rationale
+                );
+            }
+
+            assert!(
+                ranking.degenerate.is_none(),
+                "{} enumerated instead of ranking: {:?}",
+                checkpoint.title,
+                ranking.degenerate
+            );
+            // The judgement itself: this prompt names three files, an invariant to preserve and
+            // every public signature. It is not work for the lightest model available.
+            let best = ranking.best().expect("a non-empty shortlist");
+            assert_ne!(
+                best.model_id, "haiku",
+                "{} sent a hard three-file refactor to the lightest model at effort {}",
+                checkpoint.title, best.effort
+            );
+            assert_ne!(
+                best.model_id, "gemini-3-flash",
+                "{} sent a hard three-file refactor to a light model",
+                checkpoint.title
+            );
         }
-        // Spans are located in the source, so whatever comes back must be real text.
-        let src = "Contact Mario Rossi at mario@example.com about invoice 42.";
-        for f in &found {
-            assert_eq!(&src[f.start..f.end], f.text, "span does not match its text");
-        }
-        assert!(
-            found.iter().any(|f| f.text.contains("mario@example.com")),
-            "the address should have been found: {found:?}"
-        );
     }
 
     /// Every repetition in the grammar has to be bounded. An unbounded rule is a place the
@@ -1631,7 +2456,7 @@ mod tests {
     /// at all. This is cheaper to assert than to rediscover.
     #[test]
     fn the_grammar_has_no_unbounded_repetition() {
-        let g = rank_grammar(15, 5, 1400);
+        let g = rank_grammar(&test_rows(15), 5, 1400);
         for (n, line) in g.lines().enumerate() {
             assert!(
                 !line.contains('*') && !line.contains('+'),
@@ -1648,7 +2473,7 @@ mod tests {
     /// leave `build_choices` to drop a pick the user then cannot account for.
     #[test]
     fn the_grammar_admits_exactly_the_real_indices() {
-        let g = rank_grammar(3, 2, 0);
+        let g = rank_grammar(&test_rows(3), 2, 0);
         let index = g
             .lines()
             .find(|l| l.starts_with("index ::="))
@@ -1660,7 +2485,7 @@ mod tests {
         assert!(!g.contains(END_OF_THOUGHT), "{g}");
 
         // One candidate is still a valid list, and must not produce an empty alternation.
-        assert!(rank_grammar(1, 1, 0).contains("index ::= \"0\""));
+        assert!(rank_grammar(&test_rows(1), 1, 0).contains("index ::= \"0\""));
     }
 
     /// With a budget the reasoning block is *permitted* up to the cap and `</think>` is then
@@ -1668,7 +2493,7 @@ mod tests {
     /// model would think until the token budget ran out, which is the failure this replaced.
     #[test]
     fn a_reasoning_budget_is_a_cap_and_a_forced_close() {
-        let g = rank_grammar(15, 5, 900);
+        let g = rank_grammar(&test_rows(15), 5, 900);
         assert!(
             g.starts_with(&format!("root ::= thought \"{END_OF_THOUGHT}\" answer")),
             "{g}"
@@ -1676,30 +2501,59 @@ mod tests {
         assert!(g.contains("thought ::= [^<]{0,900}"), "{g}");
     }
 
-    /// The array has to come out exactly `want` long, the way `minItems`/`maxItems` used to
-    /// guarantee. Off by one here is a shortlist that is quietly the wrong length.
+    /// The array has to come out exactly `want` long. Off by one here is a shortlist that is
+    /// quietly the wrong length — and since each position now carries its own fit band, the
+    /// count is spelled out in the `answer` rule rather than as a repetition.
     #[test]
     fn the_grammar_asks_for_exactly_the_shortlist_length() {
-        assert!(rank_grammar(15, 5, 0).contains("choice (\",\" choice){4}"));
-        assert!(rank_grammar(15, 1, 0).contains("choice (\",\" choice){0}"));
+        // Counted by the numbered rule names, not by the word "choice" — the JSON key the rule
+        // emits is `"choices"`, which contains it.
+        let positions = |grammar: &str| {
+            let answer = grammar
+                .lines()
+                .find(|l| l.starts_with("answer ::="))
+                .expect("an answer rule")
+                .to_string();
+            (0..8)
+                .filter(|i| answer.contains(&format!("choice{i}")))
+                .count()
+        };
+
+        let five = rank_grammar(&test_rows(15), 5, 0);
+        assert_eq!(positions(&five), 5, "{five}");
+        assert!(five.contains("fit4 ::="), "the fifth band is missing");
+        assert!(!five.contains("fit5 ::="), "a sixth position was generated");
+
+        let one = rank_grammar(&test_rows(15), 1, 0);
+        assert_eq!(positions(&one), 1, "{one}");
+        let answer = one.lines().find(|l| l.starts_with("answer ::=")).unwrap();
+        assert!(
+            !answer.contains("\",\""),
+            "one pick needs no separator: {answer}"
+        );
     }
 
-    /// Sampling follows the task. Reasoning wants the checkpoint's published thinking-mode
-    /// settings; extraction wants greedy decoding, and running it at 0.7 measurably lost a
-    /// personal-data finding.
+    /// Sampling follows the task, and the two kinds of work want opposite settings. Getting this
+    /// wrong is invisible: a personal-data scan at 0.7 does not fail, it quietly drops a finding.
     #[test]
-    fn only_the_reasoning_path_samples_at_temperature() {
-        let schema = json!({"type": "object"});
-        assert!(
-            !Constrain::Schema(&schema).reasons(),
-            "extraction is greedy"
-        );
+    fn each_kind_of_task_samples_the_way_its_work_needs() {
+        let extract = Task::extraction(json!({"type": "object"}), 64);
+        assert_eq!(extract.temperature, 0.0, "extraction must be greedy");
+        assert!(matches!(extract.constrain, Constrain::Schema(_)));
 
-        assert!(Constrain::Grammar(rank_grammar(3, 2, 900)).reasons());
-        assert!(
-            !Constrain::Grammar(rank_grammar(3, 2, 0)).reasons(),
-            "a zero budget means no reasoning, so no temperature either"
+        let judge = Task::judgement(rank_grammar(&test_rows(3), 2, 900), 400);
+        assert_eq!(
+            (judge.temperature, judge.top_p, judge.top_k),
+            (0.7, 0.95, 20),
+            "the checkpoint's published thinking-mode settings"
         );
+        assert!(matches!(judge.constrain, Constrain::Grammar(_)));
+
+        // And the reasoning block only exists on the judgement path.
+        match judge.constrain {
+            Constrain::Grammar(g) => assert!(g.contains(END_OF_THOUGHT)),
+            Constrain::Schema(_) => panic!("a judgement must be able to think"),
+        }
     }
 
     /// The generation budget has to cover the reasoning block as well as the JSON. Undersized,
@@ -1714,7 +2568,7 @@ mod tests {
             "{with} leaves no room for 1400 characters of reasoning"
         );
         // Reasoning off should not pay for a block it will not produce.
-        assert!(without < 250, "{without} tokens for JSON alone");
+        assert!(without < 300, "{without} tokens for JSON alone");
     }
 
     /// Reasoning about a routing decision quotes JSON — braces and all — so the answer has to
@@ -1722,7 +2576,7 @@ mod tests {
     #[test]
     fn the_reasoning_block_is_not_mistaken_for_the_answer() {
         let reply = "The schema wants {\"choices\":[...]} so I will emit\n\
-                     </think>{\"choices\":[{\"index\":3,\"fit\":90,\"reason\":\"ok\"}]}";
+                     </think>{\"choices\":[{\"index\":3,\"effort\":\"low\",\"fit\":90,\"reason\":\"ok\"}]}";
         let v = parse_reply(reply).expect("the answer follows the reasoning");
         let choices = v.get("choices").and_then(Value::as_array).unwrap();
         assert_eq!(choices.len(), 1, "parsed the notes instead of the answer");
@@ -1739,8 +2593,9 @@ mod tests {
         let mut metered = candidate("claude", "fable", Effort::Max);
         metered.metered = true;
         let cands = [candidate("claude", "sonnet", Effort::Low), metered];
+        let rows = rows(&cands, &Brief::default());
 
-        let p = rank_prompt("fix a typo", &cands, 2);
+        let p = rank_prompt("fix a typo", &rows, 2, Demand::Easy, false);
         assert!(
             p.contains("fix a typo"),
             "the prompt itself must be in there"
@@ -1756,11 +2611,9 @@ mod tests {
     /// a few wasted words per line is a real number of seconds.
     #[test]
     fn the_candidate_list_stays_compact() {
-        let cands: Vec<_> = (0..30)
-            .map(|_| candidate("claude", "claude-sonnet-5", Effort::Medium))
-            .collect();
-        let list_bytes =
-            rank_prompt("do a thing", &cands, 5).len() - rank_prompt("do a thing", &[], 5).len();
+        let rows = test_rows(30);
+        let list_bytes = rank_prompt("do a thing", &rows, 5, Demand::Moderate, false).len()
+            - rank_prompt("do a thing", &[], 5, Demand::Moderate, false).len();
         let per_line = list_bytes / 30;
         assert!(
             per_line < 60,

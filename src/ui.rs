@@ -1,11 +1,38 @@
-//! Rendering. All egui drawing lives here; [`crate::app::App`] holds the state.
+//! The window. All egui drawing lives here; [`crate::app::App`] holds the state.
+//!
+//! One of three front ends over the same core — see [`crate`] — and the only one that can show a
+//! side-by-side diff, which is why the review windows (shrink, plan, sanitize) look the way they
+//! do here and unified in [`crate::tui`].
 
 use eframe::egui;
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::agents::detect::Status;
 use crate::app::App;
+use crate::config::Config;
 use crate::store::version::Note;
+
+/// Open the window and run until it closes.
+///
+/// Blocking, and it must be called on the main thread — a platform requirement on macOS rather
+/// than a preference of eframe's.
+pub fn launch(config: Config) -> eframe::Result<()> {
+    let state = App::new(config);
+    let title = crate::app::window_title(&state.config.dir.clone(), None, false);
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1180.0, 780.0])
+            .with_min_inner_size([760.0, 480.0])
+            .with_title(&title),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "pstore",
+        options,
+        Box::new(move |_cc| Ok(Box::new(Ui::new(state)))),
+    )
+}
 
 /// The eframe application: owns [`App`] plus render-only scratch state.
 pub struct Ui {
@@ -569,6 +596,10 @@ impl Ui {
                 ranking.choices.len(),
                 ranking.considered
             ));
+            if let Some((label, because)) = &ranking.demand {
+                ui.label(format!("judged {label}"))
+                    .on_hover_text(format!("what decided it: {because}"));
+            }
             ui.checkbox(&mut self.show_all_candidates, "show all");
             if !ranking.excluded.is_empty() {
                 let text = ranking
@@ -580,6 +611,23 @@ impl Ui {
                 ui.weak(format!("excluded — {text}"));
             }
         });
+
+        // A degenerate answer is populated in every field and wrong in the only one that
+        // matters, so it is said plainly and above the table rather than left to be read out of
+        // it. The small build is where this happens, and the fix is in the Models window.
+        if let Some(why) = &ranking.degenerate {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "⚠ this is a list, not a ranking — {why}. Treat the order as unreliable{}",
+                    if crate::models::active().id == crate::models::LLM_1BIT.id {
+                        "; the ternary build separates these"
+                    } else {
+                        ""
+                    }
+                ),
+            );
+        }
 
         let limit = if self.show_all_candidates {
             usize::MAX
@@ -605,7 +653,7 @@ impl Ui {
                         for c in ranking.choices.iter().take(limit) {
                             ui.label(format!("{:.0}", c.fit));
                             ui.label(c.agent_display);
-                            ui.label(c.model_display);
+                            ui.label(c.model_display.as_ref());
                             let effort = if c.effort_selectable {
                                 c.effort.to_string()
                             } else {
@@ -769,7 +817,7 @@ impl Ui {
         });
         ui.weak("runs the checkpoint as a subprocess; PrismML's fork of llama.cpp");
 
-        let prefs_path = self.app.config.prefs.llama_cli_path.clone();
+        let prefs_path = self.app.config.prefs.llama_path.clone();
         match crate::runtime::locate(prefs_path.as_deref()) {
             Some(rt) => {
                 ui.weak(format!("{} · {}", rt.path.display(), rt.origin));
@@ -796,126 +844,6 @@ impl Ui {
             ui.add(egui::ProgressBar::new(fraction).show_percentage());
         }
         let _ = busy;
-    }
-
-    /// Running the checkpoint as a background service, and pointing agents at it.
-    ///
-    /// Two decisions the user has to be able to see: a resident 27B is gigabytes held until
-    /// they stop it, and wiring an agent puts a file in their repository. Both are stated
-    /// here, both are one click, and both are reversible from the same row.
-    fn serve_row(&mut self, ui: &mut egui::Ui, usable: bool, busy: bool) {
-        ui.horizontal(|ui| {
-            ui.strong("Background server");
-            ui.weak("· OpenAI-compatible, loopback only");
-        });
-        ui.weak(
-            "Runs the selected build as a service so a coding agent can use it instead of a \
-             vendor's API. Your prompts still never leave this machine. It holds the weights \
-             in memory until you stop it.",
-        );
-
-        let serving = crate::serve::status();
-        let starting = self.app.serve_job.is_some();
-
-        match &serving {
-            Some(s) => {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(format!("● serving {} · pid {}", s.title(), s.pid));
-                });
-                ui.horizontal_wrapped(|ui| {
-                    ui.monospace(s.base_url());
-                    copy_button(ui, &s.base_url(), "Copy URL");
-                    ui.weak("model");
-                    ui.monospace(s.model_name());
-                    copy_button(ui, &s.model_name(), "Copy model");
-                });
-            }
-            None if starting => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.weak("starting — mapping the weights…");
-                });
-            }
-            None => {
-                ui.weak("not running");
-            }
-        }
-
-        ui.horizontal_wrapped(|ui| {
-            if serving.is_some() {
-                if ui
-                    .add_enabled(!starting, egui::Button::new("Stop server"))
-                    .on_hover_text("Ends the process and frees the memory it is holding")
-                    .clicked()
-                {
-                    crate::serve::stop();
-                    self.app.status = "background server stopped".into();
-                }
-            } else if ui
-                .add_enabled(
-                    usable && !busy && !starting,
-                    egui::Button::new("Run in background"),
-                )
-                .on_hover_text(
-                    "Start the selected build as a local service. First start maps the \
-                     weights, which takes a few seconds.",
-                )
-                .clicked()
-            {
-                self.app.start_server();
-            }
-
-            // Wiring is only meaningful once there is an endpoint to point at: a config file
-            // naming a port with nothing behind it is worse than no config file.
-            if let Some(s) = &serving {
-                for w in crate::agents::wire::WIRINGS {
-                    let installed = self
-                        .app
-                        .agents
-                        .iter()
-                        .any(|a| a.spec.id == w.agent_id && a.usable());
-                    let wired = w.path(&self.app.config.dir).exists();
-                    let label = if wired {
-                        format!("Unwire {}", w.display)
-                    } else {
-                        format!("Point {} here", w.display)
-                    };
-                    let hover = if wired {
-                        format!("Delete {} — only if pstore wrote it", w.file)
-                    } else {
-                        format!(
-                            "Write {} in this project, pointing {} at {}",
-                            w.file,
-                            w.display,
-                            s.base_url()
-                        )
-                    };
-                    if ui
-                        .add_enabled(installed, egui::Button::new(label).small())
-                        .on_hover_text(if installed {
-                            hover
-                        } else {
-                            format!("{} is not installed on this machine", w.display)
-                        })
-                        .clicked()
-                    {
-                        let outcome = if wired {
-                            crate::agents::wire::revert(w, &self.app.config.dir)
-                        } else {
-                            crate::agents::wire::apply(w, &self.app.config.dir, s)
-                        };
-                        self.app.status = outcome.label(w.display);
-                    }
-                }
-            }
-        });
-
-        if serving.is_some() {
-            ui.weak(
-                "Wiring writes a project-local config file beside your prompts — never your \
-                 global one — and a file pstore did not write is left alone.",
-            );
-        }
     }
 
     fn models_window(&mut self, ctx: &egui::Context) {
@@ -1174,13 +1102,7 @@ impl Ui {
 
                     ui.horizontal(|ui| {
                         ui.label("llama-cli path");
-                        let mut path = self
-                            .app
-                            .config
-                            .prefs
-                            .llama_cli_path
-                            .clone()
-                            .unwrap_or_default();
+                        let mut path = self.app.config.prefs.llama_path.clone().unwrap_or_default();
                         if ui
                             .add(
                                 egui::TextEdit::singleline(&mut path)
@@ -1193,7 +1115,7 @@ impl Ui {
                             )
                             .changed()
                         {
-                            self.app.config.prefs.llama_cli_path =
+                            self.app.config.prefs.llama_path =
                                 (!path.trim().is_empty()).then_some(path);
                             prefs_changed = true;
                         }
@@ -1206,9 +1128,6 @@ impl Ui {
                     crate::config::publish(&self.app.config.prefs);
                     self.app.config.prefs.save(&self.app.config.dir);
                 }
-
-                ui.separator();
-                self.serve_row(ui, usable, busy);
 
                 // Strictly after publishing: the unload asks which build is selected *now*,
                 // and a worker mid-flight is refused against the same freshly-published

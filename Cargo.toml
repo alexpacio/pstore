@@ -5,16 +5,37 @@ edition = "2024"
 description = "Versioned prompt editor that scores the coding-agent models and effort levels installed on your machine"
 license = "Apache-2.0"
 
+# One crate, three front ends. The library is the whole of pstore except its presentation —
+# see src/lib.rs — and the binary is a command-line dispatcher over it.
+[lib]
+name = "pstore"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pstore"
+path = "src/main.rs"
+
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.5", features = ["derive"] }
 dirs = "6.0.0"
-eframe = "0.36.0"
-egui = "0.36.0"
-egui_commonmark = "0.25.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 similar = "3.1.2"
+
+# The window. Optional because the TUI and the CLI are complete front ends without it, and on a
+# headless machine — a server, a container, a remote checkout over ssh — the GUI's dependency tree
+# is the largest thing in the build and none of it can run.
+eframe = { version = "0.36.0", optional = true }
+egui = { version = "0.36.0", optional = true }
+egui_commonmark = { version = "0.25.0", optional = true }
+
+# The terminal. `ratatui` draws, `crossterm` owns the terminal itself — raw mode, the alternate
+# screen, and the key events.
+ratatui = { version = "0.30.1", optional = true, default-features = false, features = [
+  "crossterm",
+] }
+crossterm = { version = "0.29.0", optional = true }
 
 # Everything below serves one job: fetch the model weights and the `llama-cli` that runs
 # them. Optional, so `cargo build --no-default-features` stays fast and dependency-light —
@@ -40,7 +61,8 @@ tar = { version = "0.4.44", optional = true }
 flate2 = { version = "1.1.9", optional = true }
 
 [features]
-default = ["local-llm"]
+default = ["local-llm", "gui", "tui"]
+
 # Local inference: fetch the checkpoint and the llama-cli runtime, and use them.
 local-llm = [
   "dep:ureq",
@@ -49,6 +71,13 @@ local-llm = [
   "dep:flate2",
   "dep:zip",
 ]
+
+# The native window. `cargo build --no-default-features --features local-llm,tui` gives a build
+# with no windowing dependencies at all, which is what a headless machine wants.
+gui = ["dep:eframe", "dep:egui", "dep:egui_commonmark"]
+
+# The terminal interface.
+tui = ["dep:ratatui", "dep:crossterm"]
 
 # The Windows release assets are zips rather than tarballs.
 [target.'cfg(target_os = "windows")'.dependencies]

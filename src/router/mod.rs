@@ -21,10 +21,24 @@
 pub mod hub;
 #[cfg(feature = "local-llm")]
 pub mod llm;
+#[cfg(feature = "local-llm")]
+pub mod session;
+
+use std::borrow::Cow;
 
 use crate::agents::detect::Detected;
 use crate::agents::registry::{Effort, Tier};
 use crate::filter::Filter;
+#[cfg(feature = "local-llm")]
+use crate::knowledge::Brief;
+
+/// A model name, which is either a registry constant or a string read out of an agent's config.
+///
+/// `&'static str` everywhere would be simpler, and was — until pstore started discovering the
+/// model an agent is really configured with (see [`crate::agents::configured`]). Those names are
+/// only known at runtime, and a `Cow` keeps the registry path allocation-free while letting a
+/// discovered name travel the same code.
+pub type Name = Cow<'static, str>;
 
 /// How many candidates the model is asked to return.
 ///
@@ -41,9 +55,9 @@ pub struct Choice {
     /// Agent label for the UI.
     pub agent_display: &'static str,
     /// Model id to pass to the agent, empty when the agent picks its own.
-    pub model_id: &'static str,
+    pub model_id: Name,
     /// Model label for the UI.
-    pub model_display: &'static str,
+    pub model_display: Name,
     /// Weight class, shown as context.
     pub tier: Tier,
     /// Effort level to request.
@@ -58,9 +72,16 @@ pub struct Choice {
     /// Relative token price. **Display only.**
     pub relative_price: f32,
     /// How well the model judged this fits, `0..=100`.
+    ///
+    /// Bounded by position: the grammar gives each rank its own descending band, so the number
+    /// is consistent with the order rather than a free-floating self-assessment. See
+    /// [`llm::fit_band`].
     pub fit: f32,
     /// The model's one-line reason for the placement.
     pub rationale: String,
+    /// Which option in the list the model picked, kept so [`llm::degeneracy`] can tell a
+    /// ranking from an enumeration.
+    pub row_index: usize,
 }
 
 /// A ranked shortlist over the detected agents.
@@ -71,7 +92,28 @@ pub struct Ranking {
     /// How many combinations were offered to the model.
     pub considered: usize,
     /// Agents that were detected but excluded, with the reason.
+    ///
+    /// Two kinds of exclusion arrive here: an agent that cannot run, and one whose model
+    /// nothing could describe. Both belong in the same place — the question they answer is
+    /// "why is that not in the list?".
     pub excluded: Vec<(&'static str, String)>,
+    /// How hard the prompt was judged to be, and the phrase that decided it.
+    ///
+    /// Its own model call, made before ranking — see [`llm::Demand`], which explains why that is
+    /// worth an extra few seconds. Shown because it is the premise of everything below it: a
+    /// shortlist that looks wrong is usually a difficulty read that was wrong.
+    pub demand: Option<(&'static str, String)>,
+    /// How many of the ranked models pstore had to describe to the checkpoint itself.
+    ///
+    /// Provenance rather than trivia: it is the difference between a ranking the checkpoint made
+    /// from its own knowledge and one it made from facts pstore supplied. See
+    /// [`crate::knowledge`].
+    pub described: usize,
+    /// Set when the model listed the options instead of ranking them, with the evidence.
+    ///
+    /// A degenerate answer is populated in every field and wrong in the only one that matters, so
+    /// it cannot be left to look like a result. See [`llm::degeneracy`].
+    pub degenerate: Option<String>,
     /// How long ranking took, model startup included.
     pub elapsed: std::time::Duration,
 }
@@ -105,8 +147,8 @@ impl Ranking {
 pub struct Candidate {
     pub agent_id: &'static str,
     pub agent_display: &'static str,
-    pub model_id: &'static str,
-    pub model_display: &'static str,
+    pub model_id: Name,
+    pub model_display: Name,
     pub tier: Tier,
     pub effort: Effort,
     pub effort_selectable: bool,
@@ -140,8 +182,8 @@ pub fn candidates(
         let selectable = agent.spec.effort_flag.is_supported();
         let mut offered = 0usize;
 
-        for model in agent.spec.scoreable_models() {
-            if !filter.allows_model(agent.spec.id, model.id, model.display, model.metered) {
+        for model in models_of(agent) {
+            if !filter.allows_model(agent.spec.id, &model.id, &model.display, model.metered) {
                 continue;
             }
             for &effort in agent.spec.scoreable_efforts() {
@@ -152,8 +194,8 @@ pub fn candidates(
                 out.push(Candidate {
                     agent_id: agent.spec.id,
                     agent_display: agent.spec.display,
-                    model_id: model.id,
-                    model_display: model.display,
+                    model_id: model.id.clone(),
+                    model_display: model.display.clone(),
                     tier: model.tier,
                     effort,
                     effort_selectable: selectable,
@@ -172,6 +214,99 @@ pub fn candidates(
     (out, excluded)
 }
 
+/// One model an agent could be asked to run, whatever the source of its name.
+struct Offer {
+    id: Name,
+    display: Name,
+    tier: Tier,
+    metered: bool,
+    relative_price: f32,
+}
+
+/// The models to offer for `agent`: its registry table, or the one its own config names.
+///
+/// Three cases, and the third is the one that used to poison rankings:
+///
+/// * the registry lists models — pstore can pass `--model`, so it offers each of them;
+/// * it does not, but the agent's config names a model — that name is offered, unselectable but
+///   real, so the ranker is judging the model the agent will actually run;
+/// * neither — a single nameless offer, which [`crate::knowledge`] then refuses to rank. It is
+///   still *produced* rather than skipped here, so the reason the agent is missing from the
+///   shortlist can be stated instead of the agent just vanishing.
+fn models_of(agent: &Detected) -> Vec<Offer> {
+    if !agent.spec.models.is_empty() {
+        return agent
+            .spec
+            .models
+            .iter()
+            .map(|m| Offer {
+                id: Cow::Borrowed(m.id),
+                display: Cow::Borrowed(m.display),
+                tier: m.tier,
+                metered: m.metered,
+                relative_price: m.relative_price,
+            })
+            .collect();
+    }
+
+    let placeholder = &crate::agents::registry::UNKNOWN_MODEL;
+    let (id, display) = match &agent.configured_model {
+        // Both from the discovered name: the id is what the agent would run, and it is also
+        // the only honest label for it — inventing a prettier display name would mean the UI
+        // showing something that appears in nobody's config.
+        Some(found) => (Cow::Owned(found.clone()), Cow::Owned(found.clone())),
+        None => (
+            Cow::Borrowed(placeholder.id),
+            Cow::Borrowed(placeholder.display),
+        ),
+    };
+    vec![Offer {
+        id,
+        display,
+        // Unknown rather than flattering: a discovered model has no tier pstore can vouch for,
+        // and `Mid` is the claim that biases least.
+        tier: placeholder.tier,
+        metered: placeholder.metered,
+        relative_price: placeholder.relative_price,
+    }]
+}
+
+/// Drop the candidates whose model nothing can describe, and say why.
+///
+/// Only reachable with local inference: without it there is no ranking to protect.
+///
+/// The ranking list and the exclusion list are updated together on purpose: a candidate removed
+/// without a stated reason is an agent that silently disappeared from the shortlist, which is
+/// the bug report "why is Crush never suggested?" and no way to answer it.
+///
+/// Exclusions are recorded once per agent, not once per (model, effort) pair — five efforts of
+/// one nameless model are one problem, and listing it five times would bury the others.
+#[cfg(feature = "local-llm")]
+fn withhold_unknown(
+    candidates: &mut Vec<Candidate>,
+    excluded: &mut Vec<(&'static str, String)>,
+    brief: &Brief,
+) {
+    let mut said: Vec<(&'static str, String)> = Vec::new();
+    candidates.retain(|c| {
+        if brief.permits(&c.model_id) {
+            return true;
+        }
+        let why = brief
+            .unknown
+            .iter()
+            .find(|(m, _)| *m == c.model_id)
+            .map(|(_, why)| why.clone())
+            .unwrap_or_else(|| format!("nothing describes {}", c.model_display));
+        let entry = (c.agent_id, why);
+        if !said.contains(&entry) {
+            said.push(entry);
+        }
+        false
+    });
+    excluded.extend(said);
+}
+
 /// Rank the runnable combinations against `text` with the local model.
 ///
 /// Blocking — call it from a worker thread. Each call spawns `llama-cli`, which maps the
@@ -182,7 +317,10 @@ pub fn candidates(
 /// weights and runtime both come from the Models window, so a first run reports "not
 /// downloaded" instead of stalling on a 7.17 GB transfer nobody asked for.
 pub fn rank(text: &str, detected: &[Detected], filter: &Filter) -> Result<Ranking, String> {
-    let (candidates, excluded) = candidates(detected, filter);
+    // `mut` on both because the local-llm path withholds undescribed models from the field; a
+    // build without inference never reaches that and refuses below instead.
+    #[allow(unused_mut)]
+    let (mut candidates, mut excluded) = candidates(detected, filter);
     if candidates.is_empty() {
         // Two very different problems, and sending the user to the wrong one wastes their
         // time: nothing installed, or everything installed ruled out by their own config.
@@ -198,11 +336,29 @@ pub fn rank(text: &str, detected: &[Detected], filter: &Filter) -> Result<Rankin
 
     #[cfg(feature = "local-llm")]
     {
-        llm::rank(text, &candidates, excluded)
+        // Before the field is ranked, work out what can truthfully be said about each model in
+        // it — and withhold the ones nothing can describe. Ranking a model pstore cannot name
+        // does not produce a worse row; it moves every real row below it.
+        let names: Vec<String> = candidates.iter().map(|c| c.model_id.to_string()).collect();
+        let brief = crate::knowledge::resolve(&names, llm::known_models, crate::knowledge::lookup);
+        withhold_unknown(&mut candidates, &mut excluded, &brief);
+
+        if candidates.is_empty() {
+            return Err(format!(
+                "no model in the field could be identified, so there is nothing to rank — {}",
+                brief
+                    .unknown
+                    .iter()
+                    .map(|(_, why)| why.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        llm::rank(text, &candidates, excluded, &brief)
     }
     #[cfg(not(feature = "local-llm"))]
     {
-        let _ = (text, excluded);
+        let _ = (text, excluded, &mut candidates);
         Err(crate::models::NO_LOCAL_INFERENCE.to_string())
     }
 }
@@ -273,6 +429,12 @@ mod tests {
     }
 
     fn detected(id: &str, status: Status) -> Detected {
+        detected_with(id, status, None)
+    }
+
+    /// A detected agent whose own config names `model`, the way
+    /// [`crate::agents::configured`] would have found it.
+    fn detected_with(id: &str, status: Status, model: Option<&str>) -> Detected {
         let spec = registry::AGENTS
             .iter()
             .find(|a| a.id == id)
@@ -283,6 +445,7 @@ mod tests {
             path: PathBuf::from("/usr/bin/x"),
             version: None,
             has_credentials: true,
+            configured_model: model.map(str::to_string),
         }
     }
 
@@ -332,6 +495,88 @@ mod tests {
         assert!(!excluded[0].1.is_empty(), "an exclusion needs a reason");
     }
 
+    /// An agent that chooses its own model gets that model's real name into the candidate list,
+    /// so the ranker judges what will actually run rather than a placeholder.
+    #[test]
+    fn a_configured_model_reaches_the_candidate_list() {
+        let agents = [detected_with(
+            "crush",
+            Status::Ready,
+            Some("anthropic/claude-sonnet-4-5"),
+        )];
+        let (cands, excluded) = candidates(&agents, &open_filter());
+
+        assert!(excluded.is_empty(), "got {excluded:?}");
+        assert_eq!(cands.len(), 1, "one model, one effort");
+        assert_eq!(cands[0].model_id, "anthropic/claude-sonnet-4-5");
+        assert_eq!(
+            cands[0].model_display, "anthropic/claude-sonnet-4-5",
+            "the label has to be the name that is in the config, not a prettier invention"
+        );
+        assert!(
+            !cands[0].effort_selectable,
+            "pstore still cannot choose this agent's effort"
+        );
+    }
+
+    /// An agent whose config says nothing still produces a candidate — a nameless one — so that
+    /// the reason it is missing from the shortlist can be stated. It is [`withhold_unknown`]
+    /// that keeps it out of the ranking, not silence here.
+    #[test]
+    fn an_agent_that_names_no_model_still_yields_a_nameless_candidate() {
+        let agents = [detected_with("crush", Status::Ready, None)];
+        let (cands, _) = candidates(&agents, &open_filter());
+        assert_eq!(cands.len(), 1);
+        assert!(cands[0].model_id.is_empty(), "got {:?}", cands[0].model_id);
+    }
+
+    /// The poisoning fix, stated as a property: a model nothing can describe does not reach the
+    /// ranker, and the agent it belonged to is accounted for instead of vanishing.
+    #[test]
+    #[cfg(feature = "local-llm")]
+    fn undescribed_models_are_withheld_and_accounted_for() {
+        use crate::knowledge::{Brief, Known, Source};
+
+        let agents = [
+            detected("claude", Status::Ready),
+            detected_with("crush", Status::Ready, None),
+        ];
+        let (mut cands, mut excluded) = candidates(&agents, &open_filter());
+        let before = cands.len();
+        assert!(
+            cands.iter().any(|c| c.agent_id == "crush"),
+            "the nameless candidate should be present before withholding"
+        );
+
+        // Everything Claude offers is described; the nameless one is not.
+        let brief = Brief {
+            known: cands
+                .iter()
+                .filter(|c| c.agent_id == "claude")
+                .map(|c| Known {
+                    model: c.model_id.to_string(),
+                    note: "described".into(),
+                    source: Source::Table,
+                })
+                .collect(),
+            unknown: vec![(String::new(), "its config does not say which".into())],
+        };
+        withhold_unknown(&mut cands, &mut excluded, &brief);
+
+        assert!(cands.len() < before, "nothing was withheld");
+        assert!(
+            cands.iter().all(|c| c.agent_id == "claude"),
+            "an undescribed model reached the ranker"
+        );
+        let crush: Vec<_> = excluded.iter().filter(|(id, _)| *id == "crush").collect();
+        assert_eq!(
+            crush.len(),
+            1,
+            "one problem, stated once — not once per effort level: {excluded:?}"
+        );
+        assert!(crush[0].1.contains("does not say"), "got {:?}", crush[0].1);
+    }
+
     /// Ranking with nothing to rank is a distinct failure from ranking without a model,
     /// and the message has to say which — otherwise the user goes looking for a download
     /// when the real problem is that no agent is installed.
@@ -349,8 +594,8 @@ mod tests {
         let choice = |fit: f32, effort: Effort| Choice {
             agent_id: "claude",
             agent_display: "Claude Code",
-            model_id: "m",
-            model_display: "M",
+            model_id: "m".into(),
+            model_display: "M".into(),
             tier: Tier::Mid,
             effort,
             effort_selectable: true,
@@ -359,6 +604,7 @@ mod tests {
             relative_price: 1.0,
             fit,
             rationale: String::new(),
+            row_index: 0,
         };
         let r = Ranking {
             choices: vec![
@@ -367,8 +613,7 @@ mod tests {
                 choice(50.0, Effort::Low),
             ],
             considered: 3,
-            excluded: Vec::new(),
-            elapsed: std::time::Duration::ZERO,
+            ..Ranking::default()
         };
 
         assert_eq!(r.best().map(|c| c.fit), Some(90.0));

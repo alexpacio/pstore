@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use super::detect::{self, Detected, Unavailable};
-use super::launch::{self, Cancel, Line, Output};
+use super::launch::{self, Cancel, Output};
 use super::registry::Effort;
 use crate::router::{Choice, Ranking};
 
@@ -107,7 +107,7 @@ pub struct Completed {
     /// Agent that answered.
     pub agent_id: &'static str,
     /// Model that answered, empty if the agent chose.
-    pub model_id: &'static str,
+    pub model_id: crate::router::Name,
     /// Effort that was requested.
     pub effort: Effort,
     /// Combined text output.
@@ -175,7 +175,7 @@ pub fn run_with_failover(
     dir: &Path,
     timeout: Duration,
     cancel: Option<&Cancel>,
-    tx: &Sender<Line>,
+    tx: &Sender<String>,
 ) -> Result<Completed, AllFailed> {
     let mut attempts: Vec<(&'static str, String)> = Vec::new();
 
@@ -190,7 +190,7 @@ pub fn run_with_failover(
 
         let effort = candidate.effort_selectable.then_some(candidate.effort);
         let (args, stdin) =
-            launch::headless_args(agent.spec, Some(candidate.model_id), effort, prompt);
+            launch::headless_args(agent.spec, Some(&candidate.model_id), effort, prompt);
 
         let out = match launch::run_streaming(
             &agent.path,
@@ -217,7 +217,7 @@ pub fn run_with_failover(
                 detect::remember_success(dir, candidate.agent_id);
                 return Ok(Completed {
                     agent_id: candidate.agent_id,
-                    model_id: candidate.model_id,
+                    model_id: candidate.model_id.clone(),
                     effort: candidate.effort,
                     text: out.stdout,
                     elapsed: out.elapsed,
@@ -380,8 +380,8 @@ mod tests {
         let mk = |agent: &'static str, model: &'static str, fit: f32| Choice {
             agent_id: agent,
             agent_display: agent,
-            model_id: model,
-            model_display: model,
+            model_id: model.into(),
+            model_display: model.into(),
             tier: Tier::Mid,
             effort: Effort::High,
             effort_selectable: true,
@@ -390,6 +390,7 @@ mod tests {
             relative_price: 1.0,
             fit,
             rationale: String::new(),
+            row_index: 0,
         };
         let ranking = Ranking {
             choices: vec![
@@ -403,11 +404,15 @@ mod tests {
         };
         let picked: Vec<_> = one_per_agent(&ranking)
             .iter()
-            .map(|c| (c.agent_id, c.model_id))
+            .map(|c| (c.agent_id, c.model_id.to_string()))
             .collect();
         assert_eq!(
             picked,
-            vec![("claude", "opus"), ("codex", "gpt"), ("crush", "")],
+            vec![
+                ("claude", "opus".to_string()),
+                ("codex", "gpt".to_string()),
+                ("crush", String::new()),
+            ],
             "one attempt per agent, best model first"
         );
     }
@@ -450,13 +455,7 @@ mod tests {
         .expect("spawning the agent");
         drop(tx);
 
-        let streamed: String = rx
-            .into_iter()
-            .filter_map(|l| match l {
-                Line::Out(t) => Some(t),
-                Line::Err(_) => None,
-            })
-            .collect();
+        let streamed: String = rx.into_iter().collect();
 
         assert!(
             out.ok(),

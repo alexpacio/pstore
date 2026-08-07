@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use super::configured::ModelSource;
+
 /// Cost/capability tier. Informational: shown in the UI, never scored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
@@ -184,6 +186,13 @@ pub struct AgentSpec {
     pub creds: &'static [&'static str],
     /// Models pstore may select. Empty means "whatever the agent is configured with".
     pub models: &'static [ModelSpec],
+    /// Where to look for the model this agent is configured with, when pstore cannot choose.
+    ///
+    /// Only for the agents whose [`Self::models`] is empty: their model lives in their own
+    /// config, and without reading it the ranker would be handed a candidate with no name and
+    /// no properties. See [`crate::agents::configured`], which also explains why a source that
+    /// finds nothing is better than a guess.
+    pub model_config: &'static [ModelSource],
 }
 
 /// Stand-in model for agents that don't let pstore choose one. Scored so those
@@ -220,14 +229,14 @@ impl AgentSpec {
 
 // [instruction_following, coding, math_reasoning, world_knowledge, planning_agentic, creative_synthesis]
 
-const CLAUDE_EFFORTS: &[Effort] = &[
+pub const CLAUDE_EFFORTS: &[Effort] = &[
     Effort::Low,
     Effort::Medium,
     Effort::High,
     Effort::XHigh,
     Effort::Max,
 ];
-const CODEX_EFFORTS: &[Effort] = &[Effort::Low, Effort::Medium, Effort::High, Effort::XHigh];
+pub const CODEX_EFFORTS: &[Effort] = &[Effort::Low, Effort::Medium, Effort::High, Effort::XHigh];
 
 /// Claude Code — the Claude 5 family. `relative_price` follows published input-token
 /// rates (Haiku 4.5 $1, Sonnet 5 $3, Opus 5 $5, Fable 5 $10 per MTok) and is shown
@@ -292,6 +301,63 @@ const GEMINI_MODELS: &[ModelSpec] = &[
     },
 ];
 
+// ---------------------------------------------------------------------------
+// Where the agents that choose their own model write it down
+// ---------------------------------------------------------------------------
+//
+// One block per agent, and every one of them is a *place to look* rather than a format pstore
+// claims to know — see [`crate::agents::configured`]. Several keys each because these names get
+// renamed upstream, and trying the previous spelling costs one lookup in a document already
+// parsed. A source that finds nothing leaves the agent's model unknown, which excludes it from
+// ranking with a stated reason; that is the intended outcome, not a failure.
+
+/// Cursor Agent keeps CLI settings beside the editor's.
+const CURSOR_MODEL: &[ModelSource] = &[ModelSource {
+    file: ".cursor/cli-config.json",
+    keys: &["model", "defaultModel", "editor.model"],
+}];
+
+/// Crush names a model per size class, and the large one is what a prompt from pstore hits.
+const CRUSH_MODEL: &[ModelSource] = &[ModelSource {
+    file: ".config/crush/crush.json",
+    keys: &[
+        "models.large.model",
+        "models.large.id",
+        "model",
+        "default_model",
+    ],
+}];
+
+/// Aider reads a project file if there is one, and falls back to the one in `$HOME`.
+const AIDER_MODEL: &[ModelSource] = &[
+    ModelSource {
+        file: "./.aider.conf.yml",
+        keys: &["model"],
+    },
+    ModelSource {
+        file: ".aider.conf.yml",
+        keys: &["model"],
+    },
+];
+
+/// Goose spells its settings as environment-variable names inside YAML.
+const GOOSE_MODEL: &[ModelSource] = &[ModelSource {
+    file: ".config/goose/config.yaml",
+    keys: &["GOOSE_MODEL", "model"],
+}];
+
+/// Qwen Code is a Gemini-CLI derivative and keeps its settings the same way.
+const QWEN_MODEL: &[ModelSource] = &[ModelSource {
+    file: ".qwen/settings.json",
+    keys: &["model", "model.name", "defaultModel"],
+}];
+
+/// Factory Droid.
+const DROID_MODEL: &[ModelSource] = &[ModelSource {
+    file: ".factory/config.json",
+    keys: &["model", "defaultModel", "custom_models.0.model"],
+}];
+
 /// Every agent pstore knows how to drive.
 pub const AGENTS: &[AgentSpec] = &[
     AgentSpec {
@@ -307,6 +373,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".claude.json", ".claude"],
         models: CLAUDE_MODELS,
+        model_config: &[],
     },
     AgentSpec {
         id: "codex",
@@ -321,6 +388,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".codex/auth.json", ".codex"],
         models: CODEX_MODELS,
+        model_config: &[],
     },
     AgentSpec {
         id: "gemini",
@@ -336,6 +404,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".gemini"],
         models: GEMINI_MODELS,
+        model_config: &[],
     },
     AgentSpec {
         id: "cursor",
@@ -350,45 +419,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".cursor"],
         models: &[],
-    },
-    AgentSpec {
-        id: "opencode",
-        display: "OpenCode",
-        bin: "opencode",
-        headless: &["run"],
-        model_flag: Some("-m"),
-        effort_flag: EffortFlag::Unsupported,
-        efforts: &[],
-        headless_extra: &[],
-        prompt_via: PromptVia::Arg,
-        interactive: &[],
-        creds: &[".local/share/opencode/auth.json", ".config/opencode"],
-        models: &[],
-    },
-    // Rust, ~26 MB, no runtime to install, and it takes a custom OpenAI-compatible provider
-    // — which is what makes it the natural front end for the model pstore already has on
-    // disk. See `crate::agents::wire`, which writes it a project-local config pointing at the
-    // background server.
-    //
-    // No `model_flag`: the model comes from `.zerostack/config.toml`, along with the provider
-    // it belongs to. Passing a bare model name without its provider is how you get an agent
-    // that starts and then cannot route a single turn.
-    // Headless is `-p`, with the prompt as a positional argument — **not** a `run`
-    // subcommand. Most agents here spell it `run`; this one does not, and `zerostack run "…"`
-    // does not fail, it silently sends the word "run" as the first word of the prompt.
-    AgentSpec {
-        id: "zerostack",
-        display: "zerostack",
-        bin: "zerostack",
-        headless: &["-p"],
-        model_flag: None,
-        effort_flag: EffortFlag::Unsupported,
-        efforts: &[],
-        headless_extra: &[],
-        prompt_via: PromptVia::Arg,
-        interactive: &[],
-        creds: &[".config/zerostack", ".local/share/zerostack"],
-        models: &[],
+        model_config: CURSOR_MODEL,
     },
     AgentSpec {
         id: "crush",
@@ -404,6 +435,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".config/crush/crush.json"],
         models: &[],
+        model_config: CRUSH_MODEL,
     },
     AgentSpec {
         id: "aider",
@@ -418,6 +450,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".aider.conf.yml"],
         models: &[],
+        model_config: AIDER_MODEL,
     },
     AgentSpec {
         id: "goose",
@@ -432,6 +465,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &["session"],
         creds: &[".config/goose/config.yaml"],
         models: &[],
+        model_config: GOOSE_MODEL,
     },
     AgentSpec {
         id: "qwen",
@@ -446,6 +480,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".qwen"],
         models: &[],
+        model_config: QWEN_MODEL,
     },
     AgentSpec {
         id: "copilot",
@@ -460,6 +495,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".config/github-copilot"],
         models: &[],
+        model_config: &[],
     },
     AgentSpec {
         id: "droid",
@@ -474,6 +510,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".factory"],
         models: &[],
+        model_config: DROID_MODEL,
     },
     AgentSpec {
         id: "amp",
@@ -488,6 +525,7 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".config/amp"],
         models: &[],
+        model_config: &[],
     },
 ];
 
