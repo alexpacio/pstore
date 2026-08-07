@@ -1,5 +1,6 @@
 //! Detecting, ranking-support for, and running the coding agents installed locally.
 
+pub mod catalog;
 pub mod configured;
 pub mod detect;
 pub mod failover;

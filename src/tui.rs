@@ -685,8 +685,22 @@ impl Tui {
                     Style::default().add_modifier(Modifier::DIM),
                 ),
             ]));
+            // The GUI puts the costs in their own columns with a tooltip each. There is no hover
+            // in a terminal, so they go inline — the numbers matter more than the width they
+            // cost, and a shortlist that hides what a pick spends is the thing being fixed.
+            let mut cost = format!("{:.1}× price", c.relative_price);
+            if c.quota_weight >= 2.0 {
+                cost.push_str(&format!(", {:.0}× quota", c.quota_weight));
+            }
+            if c.metered {
+                cost.push_str(", PAID PER TOKEN");
+            }
             lines.push(Line::from(Span::styled(
                 format!("    {}", c.rationale),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("    {cost}"),
                 Style::default().add_modifier(Modifier::DIM),
             )));
         }

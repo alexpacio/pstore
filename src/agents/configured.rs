@@ -315,6 +315,11 @@ mod tests {
 
     /// Every agent that cannot be told which model to run should have somewhere to look, and
     /// every declared source should name a file and at least one key.
+    ///
+    /// An agent with its own model table (`models` non-empty) may still declare a source: that
+    /// is not two answers to the same question, because the ranker never consults
+    /// `model_config` while `models` is non-empty — see [`super::registry::AgentSpec::model_config`].
+    /// It exists so `pstore agents` can report the live value alongside the static one.
     #[test]
     fn declared_sources_are_well_formed() {
         for agent in super::super::registry::AGENTS {
@@ -331,15 +336,6 @@ mod tests {
                     "{}: {} must be relative to $HOME or the project",
                     agent.id,
                     source.file
-                );
-            }
-            // An agent with its own model table does not need discovery, and declaring both
-            // would leave two answers to the same question.
-            if !agent.models.is_empty() {
-                assert!(
-                    agent.model_config.is_empty(),
-                    "{} lists models and also discovers them",
-                    agent.id
                 );
             }
         }

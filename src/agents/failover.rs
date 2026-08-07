@@ -390,6 +390,9 @@ mod tests {
             relative_price: 1.0,
             fit,
             rationale: String::new(),
+            quota_weight: 1.0,
+            note: String::new(),
+            fact_source: None,
             row_index: 0,
         };
         let ranking = Ranking {

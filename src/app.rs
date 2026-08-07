@@ -1073,6 +1073,9 @@ mod tests {
             relative_price: 1.0,
             fit,
             rationale: String::new(),
+            quota_weight: 1.0,
+            note: String::new(),
+            fact_source: None,
             row_index: 0,
         }
     }
@@ -1337,6 +1340,7 @@ mod tests {
                 has_credentials: true,
                 status: Status::Verified,
                 configured_model: None,
+                models: Vec::new(),
             }],
         });
         assert_eq!(app.agents.len(), 1);

@@ -82,6 +82,14 @@ impl Brief {
         self.known.iter().any(|k| k.model == model)
     }
 
+    /// Where the facts about `model` came from, if pstore has any.
+    ///
+    /// Shown next to a ranked choice so a placement can be accounted for: a pick made from
+    /// pstore's own table is a different kind of claim from one the checkpoint made unaided.
+    pub fn source(&self, model: &str) -> Option<Source> {
+        self.known.iter().find(|k| k.model == model).map(|k| k.source)
+    }
+
     /// The note for `model`, if there is one worth spending tokens on.
     pub fn note(&self, model: &str) -> Option<&str> {
         self.known
@@ -133,8 +141,14 @@ fn why_unknown(model: &str) -> String {
 /// A probe that fails is not fatal. Its failure means "the checkpoint told us nothing", the
 /// lookup still gets its turn, and whatever is really wrong with the model surfaces from the
 /// ranking call itself with a better message than this one could give.
+/// `supplied` answers for models whose own vendor described them — see
+/// [`crate::agents::catalog`]. It is consulted after [`FACTS`] and before the checkpoint, because
+/// pstore's own line is written for ranking and the vendor's is marketing, but a vendor's
+/// description of a model it shipped last week beats a checkpoint that has never heard of it.
+/// Without this, discovering a new model would surface it and then immediately withhold it.
 pub fn resolve(
     models: &[String],
+    supplied: &dyn Fn(&str) -> Option<String>,
     probe: impl FnOnce(&[String]) -> Result<Vec<usize>, String>,
     find: impl Fn(&str) -> Option<String>,
 ) -> Brief {
@@ -142,10 +156,14 @@ pub fn resolve(
     let mut pending: Vec<String> = Vec::new();
 
     for model in dedup(models) {
-        match from_table(&model) {
+        match from_table(&model).map(str::to_string).or_else(|| {
+            supplied(&model)
+                .map(|note| trim_note(&note))
+                .filter(|note| !note.is_empty())
+        }) {
             Some(note) => brief.known.push(Known {
                 model,
-                note: note.to_string(),
+                note,
                 source: Source::Table,
             }),
             // A nameless candidate skips the checkpoint and the network alike: there is no
@@ -729,6 +747,7 @@ mod tests {
                 "opus".into(), // the same model at another effort level
                 "some-internal-deployment".into(),
             ],
+            &|_| None,
             |pending| {
                 asked.borrow_mut().extend_from_slice(pending);
                 Ok(Vec::new()) // knows none of them
@@ -758,6 +777,7 @@ mod tests {
     fn a_model_the_checkpoint_knows_needs_no_telling() {
         let brief = resolve(
             &["mystery-model".into()],
+            &|_| None,
             |_| Ok(vec![0]),
             |_| panic!("a model the checkpoint knows must not be looked up"),
         );
@@ -776,6 +796,7 @@ mod tests {
         let probed = std::cell::Cell::new(false);
         let brief = resolve(
             &[String::new()],
+            &|_| None,
             |_| {
                 probed.set(true);
                 Ok(vec![0])
@@ -803,6 +824,7 @@ mod tests {
     fn a_failing_probe_degrades_to_unknown_rather_than_erroring() {
         let brief = resolve(
             &["opus".into(), "obscure-thing".into()],
+            &|_| None,
             |_| Err("the model is not downloaded".into()),
             |_| None,
         );

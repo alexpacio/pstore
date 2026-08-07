@@ -69,8 +69,21 @@ pub struct Choice {
     /// Relative time-to-answer, `1.0` being the fastest effort. Registry data, not the
     /// model's opinion.
     pub relative_latency: f32,
-    /// Relative token price. **Display only.**
+    /// Relative token price. **Display only** — never scored, and shown so the developer can
+    /// see the spend they are being handed rather than have it decided for them.
     pub relative_price: f32,
+    /// How fast this drains the subscription's allowance, relative to the vendor's lightest
+    /// model. Unlike [`Self::relative_price`], the ranker *is* told this — see
+    /// [`crate::agents::registry::ModelSpec::quota_weight`].
+    pub quota_weight: f32,
+    /// The facts pstore handed the ranker about this model, or empty if it needed none.
+    ///
+    /// Kept on the choice so the UI can show *what the placement was made from*, not just what
+    /// the model concluded. A shortlist is easier to trust — or to correct — when the evidence
+    /// behind each row is visible.
+    pub note: String,
+    /// Where [`Self::note`] came from. `None` when the checkpoint needed no telling.
+    pub fact_source: Option<crate::knowledge::Source>,
     /// How well the model judged this fits, `0..=100`.
     ///
     /// Bounded by position: the grammar gives each rank its own descending band, so the number
@@ -154,6 +167,8 @@ pub struct Candidate {
     pub effort_selectable: bool,
     pub metered: bool,
     pub relative_price: f32,
+    /// How fast this burns the subscription's allowance. See [`ModelSpec::quota_weight`].
+    pub quota_weight: f32,
 }
 
 /// Every combination the detected agents can run **and** policy permits, plus the agents
@@ -201,6 +216,7 @@ pub fn candidates(
                     effort_selectable: selectable,
                     metered: model.metered,
                     relative_price: model.relative_price,
+                    quota_weight: model.quota_weight,
                 });
             }
         }
@@ -221,19 +237,40 @@ struct Offer {
     tier: Tier,
     metered: bool,
     relative_price: f32,
+    quota_weight: f32,
 }
 
-/// The models to offer for `agent`: its registry table, or the one its own config names.
+/// The models to offer for `agent`: its own catalog, the registry table, or the one its config
+/// names.
 ///
-/// Three cases, and the third is the one that used to poison rankings:
+/// Four cases, in descending order of how much pstore can trust the answer:
 ///
-/// * the registry lists models — pstore can pass `--model`, so it offers each of them;
-/// * it does not, but the agent's config names a model — that name is offered, unselectable but
-///   real, so the ranker is judging the model the agent will actually run;
-/// * neither — a single nameless offer, which [`crate::knowledge`] then refuses to rank. It is
-///   still *produced* rather than skipped here, so the reason the agent is missing from the
+/// * the agent publishes a catalog — those are the models it will actually accept, so they win
+///   outright over the registry's hand-written guess at the same list;
+/// * it does not, but the registry lists models — pstore can pass `--model`, so it offers each;
+/// * neither, but the agent's config names a model — that name is offered, unselectable but real,
+///   so the ranker is judging the model the agent will actually run;
+/// * none of the above — a single nameless offer, which [`crate::knowledge`] then refuses to rank.
+///   It is still *produced* rather than skipped here, so the reason the agent is missing from the
 ///   shortlist can be stated instead of the agent just vanishing.
 fn models_of(agent: &Detected) -> Vec<Offer> {
+    // A discovered catalog outranks the table because it cannot be stale: it is what the agent
+    // fetched for itself. The table is what someone wrote down the last time they looked.
+    if !agent.models.is_empty() {
+        return agent
+            .models
+            .iter()
+            .map(|m| Offer {
+                id: Cow::Owned(m.id.clone()),
+                display: Cow::Owned(m.display.clone()),
+                tier: m.tier,
+                metered: false,
+                relative_price: m.relative_price,
+                quota_weight: m.quota_weight,
+            })
+            .collect();
+    }
+
     if !agent.spec.models.is_empty() {
         return agent
             .spec
@@ -245,6 +282,7 @@ fn models_of(agent: &Detected) -> Vec<Offer> {
                 tier: m.tier,
                 metered: m.metered,
                 relative_price: m.relative_price,
+                quota_weight: m.quota_weight,
             })
             .collect();
     }
@@ -268,6 +306,7 @@ fn models_of(agent: &Detected) -> Vec<Offer> {
         tier: placeholder.tier,
         metered: placeholder.metered,
         relative_price: placeholder.relative_price,
+        quota_weight: placeholder.quota_weight,
     }]
 }
 
@@ -340,7 +379,22 @@ pub fn rank(text: &str, detected: &[Detected], filter: &Filter) -> Result<Rankin
         // it — and withhold the ones nothing can describe. Ranking a model pstore cannot name
         // does not produce a worse row; it moves every real row below it.
         let names: Vec<String> = candidates.iter().map(|c| c.model_id.to_string()).collect();
-        let brief = crate::knowledge::resolve(&names, llm::known_models, crate::knowledge::lookup);
+        // Models discovered from an agent's own catalog arrive with the vendor's description
+        // attached; hand it to `resolve` so a model that shipped after pstore's table was written
+        // is still rankable. See [`crate::agents::catalog::CatalogModel::note`].
+        let described = |name: &str| {
+            detected
+                .iter()
+                .flat_map(|d| d.models.iter())
+                .find(|m| m.id == name)
+                .map(|m| m.note.clone())
+        };
+        let brief = crate::knowledge::resolve(
+            &names,
+            &described,
+            llm::known_models,
+            crate::knowledge::lookup,
+        );
         withhold_unknown(&mut candidates, &mut excluded, &brief);
 
         if candidates.is_empty() {
@@ -446,6 +500,7 @@ mod tests {
             version: None,
             has_credentials: true,
             configured_model: model.map(str::to_string),
+            models: Vec::new(),
         }
     }
 
@@ -604,6 +659,9 @@ mod tests {
             relative_price: 1.0,
             fit,
             rationale: String::new(),
+            quota_weight: 1.0,
+            note: String::new(),
+            fact_source: None,
             row_index: 0,
         };
         let r = Ranking {

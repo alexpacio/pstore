@@ -5,6 +5,7 @@
 
 use std::fmt;
 
+use super::catalog::CatalogSource;
 use super::configured::ModelSource;
 
 /// Cost/capability tier. Informational: shown in the UI, never scored.
@@ -154,6 +155,20 @@ pub struct ModelSpec {
     /// interchangeable will quietly bill someone, so the ranker holds metered models back
     /// unless they are clearly needed — see [`crate::router::scoring::METERED_MARGIN`].
     pub metered: bool,
+    /// How fast this model spends a subscription's allowance, relative to the vendor's lightest.
+    ///
+    /// **Not [`Self::relative_price`].** Price is dollars per token on the API, and the ranker is
+    /// forbidden from reading it — spending decisions belong to the developer. This is a different
+    /// fact: on a subscription every one of these models costs the same zero dollars extra, but
+    /// they drain the plan's limits at wildly different rates, and a developer who burns a weekly
+    /// cap on work a light model would have done is blocked whether or not they were billed.
+    ///
+    /// Anthropic publishes no per-model multiplier — only that "Opus costs several times more per
+    /// turn than Sonnet, and Sonnet more than Haiku". These values take published *output-token*
+    /// rates as the documented stand-in for that ordering, normalised so Haiku 4.5 is `1.0`:
+    /// Haiku $5, Sonnet $15, Opus $25, Fable $50 per MTok. Treat them as an ordering pstore can
+    /// defend, not a multiplier Anthropic has stated.
+    pub quota_weight: f32,
 }
 
 /// A coding-agent CLI installed (or installable) on the system.
@@ -186,13 +201,28 @@ pub struct AgentSpec {
     pub creds: &'static [&'static str],
     /// Models pstore may select. Empty means "whatever the agent is configured with".
     pub models: &'static [ModelSpec],
-    /// Where to look for the model this agent is configured with, when pstore cannot choose.
+    /// Where to look for the model this agent is configured with.
     ///
-    /// Only for the agents whose [`Self::models`] is empty: their model lives in their own
-    /// config, and without reading it the ranker would be handed a candidate with no name and
-    /// no properties. See [`crate::agents::configured`], which also explains why a source that
-    /// finds nothing is better than a guess.
+    /// For the agents whose [`Self::models`] is empty, this is load-bearing: their model lives
+    /// in their own config, and without reading it the ranker would be handed a candidate with
+    /// no name and no properties. See [`crate::agents::configured`], which also explains why a
+    /// source that finds nothing is better than a guess.
+    ///
+    /// An agent whose [`Self::models`] is *not* empty may still declare a source here — the
+    /// ranker keeps choosing from the static table (a live config value is never fed into
+    /// scoring or launched with), but `pstore agents` uses it to show what the agent is actually
+    /// running right now, which drifts from a hand-maintained table the moment the vendor ships
+    /// a new default. Codex is the current example: it takes `-m`, so pstore still picks from
+    /// [`CODEX_MODELS`], but its config also names whichever model the interactive CLI last
+    /// selected, and that is worth surfacing rather than silently contradicting.
     pub model_config: &'static [ModelSource],
+    /// Where this agent publishes the model catalog it fetched for itself, when it does.
+    ///
+    /// Takes precedence over [`Self::models`] whenever it yields anything: the agent's own catalog
+    /// is what the agent will actually accept, and the registry table is a hand-written guess at
+    /// the same thing that goes stale the day the vendor ships. The table stays as the fallback
+    /// for when the catalog is missing or unreadable. See [`crate::agents::catalog`].
+    pub catalog: Option<CatalogSource>,
 }
 
 /// Stand-in model for agents that don't let pstore choose one. Scored so those
@@ -203,6 +233,9 @@ pub const UNKNOWN_MODEL: ModelSpec = ModelSpec {
     tier: Tier::Mid,
     relative_price: 3.0,
     metered: false,
+    // A model pstore cannot name gets the mid estimate: assuming it is light would route work to
+    // it for being unknown, which is the same poisoning `knowledge` exists to prevent.
+    quota_weight: 3.0,
 };
 
 impl AgentSpec {
@@ -248,6 +281,7 @@ const CLAUDE_MODELS: &[ModelSpec] = &[
         tier: Tier::Cheap,
         relative_price: 1.0,
         metered: false,
+        quota_weight: 1.0,
     },
     ModelSpec {
         id: "sonnet",
@@ -255,6 +289,7 @@ const CLAUDE_MODELS: &[ModelSpec] = &[
         tier: Tier::Mid,
         relative_price: 3.0,
         metered: false,
+        quota_weight: 3.0,
     },
     ModelSpec {
         id: "opus",
@@ -262,6 +297,7 @@ const CLAUDE_MODELS: &[ModelSpec] = &[
         tier: Tier::Top,
         relative_price: 5.0,
         metered: false,
+        quota_weight: 5.0,
     },
     // The one model here that is not covered by a Claude Code subscription: it is billed
     // per token. Its skill vector also dominates Opus on every dimension, so without
@@ -273,6 +309,7 @@ const CLAUDE_MODELS: &[ModelSpec] = &[
         tier: Tier::Top,
         relative_price: 10.0,
         metered: true,
+        quota_weight: 10.0,
     },
 ];
 
@@ -282,6 +319,7 @@ const CODEX_MODELS: &[ModelSpec] = &[ModelSpec {
     tier: Tier::Top,
     relative_price: 4.0,
     metered: false,
+        quota_weight: 25.0,
 }];
 
 const GEMINI_MODELS: &[ModelSpec] = &[
@@ -291,6 +329,7 @@ const GEMINI_MODELS: &[ModelSpec] = &[
         tier: Tier::Cheap,
         relative_price: 1.2,
         metered: false,
+        quota_weight: 1.0,
     },
     ModelSpec {
         id: "gemini-3-pro",
@@ -298,6 +337,7 @@ const GEMINI_MODELS: &[ModelSpec] = &[
         tier: Tier::Mid,
         relative_price: 3.5,
         metered: false,
+        quota_weight: 3.5,
     },
 ];
 
@@ -358,6 +398,15 @@ const DROID_MODEL: &[ModelSource] = &[ModelSource {
     keys: &["model", "defaultModel", "custom_models.0.model"],
 }];
 
+/// Codex CLI writes the model the interactive session last picked into its own config, in the
+/// same plain `key = "value"` shape `configured::scan_lines` already reads for Aider and Goose.
+/// Unlike those two, Codex also has [`CODEX_MODELS`] — this source is not what the ranker
+/// chooses from, only what `pstore agents` reports as the model currently in effect.
+const CODEX_MODEL: &[ModelSource] = &[ModelSource {
+    file: ".codex/config.toml",
+    keys: &["model"],
+}];
+
 /// Every agent pstore knows how to drive.
 pub const AGENTS: &[AgentSpec] = &[
     AgentSpec {
@@ -374,6 +423,7 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".claude.json", ".claude"],
         models: CLAUDE_MODELS,
         model_config: &[],
+        catalog: None,
     },
     AgentSpec {
         id: "codex",
@@ -388,7 +438,8 @@ pub const AGENTS: &[AgentSpec] = &[
         interactive: &[],
         creds: &[".codex/auth.json", ".codex"],
         models: CODEX_MODELS,
-        model_config: &[],
+        model_config: CODEX_MODEL,
+        catalog: Some(super::catalog::CODEX_CATALOG),
     },
     AgentSpec {
         id: "gemini",
@@ -405,6 +456,7 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".gemini"],
         models: GEMINI_MODELS,
         model_config: &[],
+        catalog: None,
     },
     AgentSpec {
         id: "cursor",
@@ -420,6 +472,7 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".cursor"],
         models: &[],
         model_config: CURSOR_MODEL,
+        catalog: None,
     },
     AgentSpec {
         id: "crush",
@@ -436,6 +489,7 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".config/crush/crush.json"],
         models: &[],
         model_config: CRUSH_MODEL,
+        catalog: None,
     },
     AgentSpec {
         id: "aider",
@@ -451,6 +505,7 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".aider.conf.yml"],
         models: &[],
         model_config: AIDER_MODEL,
+        catalog: None,
     },
     AgentSpec {
         id: "goose",
@@ -466,6 +521,7 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".config/goose/config.yaml"],
         models: &[],
         model_config: GOOSE_MODEL,
+        catalog: None,
     },
     AgentSpec {
         id: "qwen",
@@ -481,6 +537,7 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".qwen"],
         models: &[],
         model_config: QWEN_MODEL,
+        catalog: None,
     },
     AgentSpec {
         id: "copilot",
@@ -496,6 +553,7 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".config/github-copilot"],
         models: &[],
         model_config: &[],
+        catalog: None,
     },
     AgentSpec {
         id: "droid",
@@ -511,6 +569,7 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".factory"],
         models: &[],
         model_config: DROID_MODEL,
+        catalog: None,
     },
     AgentSpec {
         id: "amp",
@@ -526,6 +585,7 @@ pub const AGENTS: &[AgentSpec] = &[
         creds: &[".config/amp"],
         models: &[],
         model_config: &[],
+        catalog: None,
     },
 ];
 

@@ -103,6 +103,12 @@ pub struct Detected {
     /// or because its config did not say — see [`super::configured`]. The second case is what
     /// keeps a nameless candidate out of the ranking.
     pub configured_model: Option<String>,
+    /// The models this agent's own catalog says it can run, best first.
+    ///
+    /// Empty for the agents that publish no catalog, and for a catalog that could not be read —
+    /// both leave [`AgentSpec::models`] in charge. When it is *not* empty it supersedes that
+    /// table, because it is the set the agent itself will accept. See [`super::catalog`].
+    pub models: Vec<super::catalog::CatalogModel>,
 }
 
 impl Detected {
@@ -275,6 +281,13 @@ pub fn detect_in(dir: &Path, probe: &Probe) -> Vec<Detected> {
             // Only for the agents that choose their own model; the rest get theirs from the
             // registry, and asking their config would be a second answer to a settled question.
             configured_model: super::configured::model_for(spec, dir),
+            // What the agent itself says it can run, when it says. Read here rather than at
+            // ranking time for the same reason as the line above: detection is the pass that is
+            // allowed to touch the filesystem.
+            models: spec
+                .catalog
+                .map(|source| super::catalog::read(source, probe.home.as_deref()))
+                .unwrap_or_default(),
         });
     }
     out

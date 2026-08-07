@@ -539,12 +539,16 @@ struct Row {
     tier: crate::agents::registry::Tier,
     metered: bool,
     relative_price: f32,
+    /// How fast this drains the subscription's allowance. See [`crate::agents::registry::ModelSpec::quota_weight`].
+    quota_weight: f32,
     /// Efforts this (agent, model) can actually be asked for, ascending.
     efforts: Vec<crate::agents::registry::Effort>,
     /// Whether pstore can select the effort or is only predicting it.
     effort_selectable: bool,
     /// What pstore can tell the model about this model, or empty if it needs no telling.
     note: String,
+    /// Where that note came from, so a placement can be accounted for in the UI.
+    fact_source: Option<crate::knowledge::Source>,
 }
 
 /// Collapse the candidate grid into one row per (agent, model), preserving order.
@@ -568,9 +572,11 @@ fn rows(candidates: &[super::Candidate], brief: &crate::knowledge::Brief) -> Vec
                 tier: c.tier,
                 metered: c.metered,
                 relative_price: c.relative_price,
+                quota_weight: c.quota_weight,
                 efforts: vec![c.effort],
                 effort_selectable: c.effort_selectable,
                 note: brief.note(&c.model_id).unwrap_or_default().to_string(),
+                fact_source: brief.source(&c.model_id),
             }),
         }
     }
@@ -913,6 +919,17 @@ fn rank_prompt(text: &str, rows: &[Row], want: usize, demand: Demand, retry: boo
             if r.effort_selectable { "" } else { "?" },
             if r.metered { " PAID-PER-TOKEN" } else { "" },
         );
+        // Quota burn, stated only where it is decision-relevant. Every model in this list costs
+        // the same nothing extra on a subscription, so price says nothing useful here — but they
+        // drain the plan's limits at very different rates, and a developer who spends a weekly cap
+        // on work a light model would have done is blocked all the same. Written as a plain
+        // multiple rather than a score so the model weighs it against fit instead of summing it.
+        //
+        // Below 2x it is left off: a marker on nearly every row stops carrying information, and
+        // the difference is not worth trading any fit for.
+        if r.quota_weight >= 2.0 {
+            let _ = write!(list, " burns {:.0}x quota", r.quota_weight);
+        }
         if !r.note.is_empty() {
             let _ = write!(list, "\n   {}", r.note);
         }
@@ -1076,6 +1093,9 @@ fn build_choices(
             metered: row.metered,
             relative_latency: effort.latency_factor(),
             relative_price: row.relative_price,
+            quota_weight: row.quota_weight,
+            note: row.note.clone(),
+            fact_source: row.fact_source,
             fit: item.get("fit").and_then(Value::as_f64).unwrap_or(0.0) as f32,
             rationale: tidy_reason(
                 item.get("reason")
@@ -1514,7 +1534,47 @@ mod tests {
             effort_selectable: true,
             metered: false,
             relative_price: 1.0,
+            quota_weight: 1.0,
         }
+    }
+
+    /// The burn signal has to reach the prompt, because the prompt is the only place it acts —
+    /// pstore never re-sorts what the model emits (see `rank_prompt`'s caller), so a weight that
+    /// stays in the struct changes nothing at all.
+    #[test]
+    fn quota_burn_reaches_the_ranking_prompt() {
+        let heavy = real("claude", "opus", Effort::High);
+        let light = real("claude", "haiku", Effort::Low);
+        assert!(heavy.quota_weight > light.quota_weight, "fixture precondition");
+
+        let rows = rows(&[heavy, light], &Brief::default());
+        let prompt = rank_prompt("refactor this", &rows, 2, Demand::Hard, false);
+
+        assert!(
+            prompt.contains("burns 5x quota"),
+            "the heavy model must be marked:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("burns 1x quota"),
+            "a marker on every row carries no information:\n{prompt}"
+        );
+    }
+
+    /// The one thing the burn signal must not become. `relative_price` is dollars-per-token and
+    /// the ranker is forbidden from seeing it; quota burn is a different fact about an allowance
+    /// already paid for. Letting price leak in under a new name would undo that decision quietly.
+    #[test]
+    fn the_prompt_states_burn_but_never_price() {
+        let rows = rows(&[real("claude", "fable", Effort::Max)], &Brief::default());
+        let prompt = rank_prompt("anything", &rows, 1, Demand::Hard, false);
+
+        assert!(prompt.contains("burns 10x quota"));
+        assert!(
+            !prompt.to_lowercase().contains("price")
+                && !prompt.contains("$")
+                && !prompt.contains("per MTok"),
+            "price must not reach the ranker under any spelling:\n{prompt}"
+        );
     }
 
     /// A candidate carrying the registry's real facts for `model`, so a test that depends on a
@@ -1536,6 +1596,7 @@ mod tests {
             effort_selectable: spec.effort_flag.is_supported(),
             metered: m.metered,
             relative_price: m.relative_price,
+            quota_weight: m.quota_weight,
         }
     }
 
@@ -1887,6 +1948,9 @@ mod tests {
             relative_price: 1.0,
             fit,
             rationale: reason.into(),
+            quota_weight: 1.0,
+            note: String::new(),
+            fact_source: None,
             row_index: index,
         };
 
@@ -2287,7 +2351,7 @@ mod tests {
             // The facts pstore would supply, so the live run exercises the prompt the app builds
             // rather than a bare list of names.
             let names: Vec<String> = cands.iter().map(|c| c.model_id.to_string()).collect();
-            let brief = crate::knowledge::resolve(&names, known_models, crate::knowledge::lookup);
+            let brief = crate::knowledge::resolve(&names, &|_| None, known_models, crate::knowledge::lookup);
             for k in &brief.known {
                 eprintln!("  {} — from {}", k.model, k.source.label());
             }
@@ -2410,7 +2474,7 @@ mod tests {
             );
 
             let names: Vec<String> = cands.iter().map(|c| c.model_id.to_string()).collect();
-            let brief = crate::knowledge::resolve(&names, known_models, crate::knowledge::lookup);
+            let brief = crate::knowledge::resolve(&names, &|_| None, known_models, crate::knowledge::lookup);
             let started = std::time::Instant::now();
             let ranking = rank(HARD, &cands, Vec::new(), &brief)
                 .unwrap_or_else(|e| panic!("{} could not rank: {e}", checkpoint.title));

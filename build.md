@@ -1,0 +1,1 @@
+build **A versioned editor for the prompts you hand to coding agents** — write and revise them like real artifacts, not scratch text. Get inline hints, automatic difficulty/capability scoring to pick the cheapest adequate model, and one-keystroke handoff to a real agent session, from a native window, a terminal UI, or the command line.

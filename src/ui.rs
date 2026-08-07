@@ -639,7 +639,7 @@ impl Ui {
             .max_height(190.0)
             .show(ui, |ui| {
                 egui::Grid::new("ranking-grid")
-                    .num_columns(6)
+                    .num_columns(8)
                     .striped(true)
                     .show(ui, |ui| {
                         ui.strong("fit");
@@ -647,6 +647,18 @@ impl Ui {
                         ui.strong("model");
                         ui.strong("effort");
                         ui.strong("speed");
+                        // Two different costs, deliberately not merged. Price is what a token
+                        // costs on the API; quota is how fast the subscription's allowance goes.
+                        // On a paid plan they point opposite ways — every model costs the same
+                        // nothing extra, and they still are not interchangeable.
+                        ui.strong("price")
+                            .on_hover_text("token price relative to the cheapest model here — shown, never ranked on");
+                        ui.strong("quota")
+                            .on_hover_text(
+                                "how fast this drains the subscription's allowance, relative to \
+                                 the vendor's lightest model. Unlike price, the ranker is told \
+                                 this.",
+                            );
                         ui.strong("why");
                         ui.end_row();
 
@@ -666,19 +678,52 @@ impl Ui {
                             });
                             ui.label(format!("{:.1}×", c.relative_latency))
                                 .on_hover_text("time to answer, relative to the fastest choice");
-                            let mut why = format!("relative token price {:.1}×", c.relative_price);
+                            let price = ui.label(format!("{:.1}×", c.relative_price));
                             if c.metered {
-                                why.push_str(
-                                    "\n\nBilled per token rather than covered by the \
-                                     subscription — the model was told this when ranking.",
+                                // The one price fact that is not merely informational: every
+                                // other model here is already paid for.
+                                price.on_hover_text(
+                                    "Billed per token on top of the subscription — picking this \
+                                     spends money the others do not. The ranker holds metered \
+                                     models back unless they are clearly needed.",
+                                );
+                            } else {
+                                price.on_hover_text(
+                                    "Token price relative to the cheapest model in this list. \
+                                     Shown so you can see the spend; deliberately never scored — \
+                                     that decision is yours, not pstore's.",
                                 );
                             }
+
+                            // Below 2× the ranker is not told either, so showing a number here
+                            // would imply a signal that did not exist.
+                            let quota = if c.quota_weight >= 2.0 {
+                                format!("{:.0}×", c.quota_weight)
+                            } else {
+                                "—".to_string()
+                            };
+                            ui.label(quota).on_hover_text(if c.quota_weight >= 2.0 {
+                                format!(
+                                    "Uses roughly {:.0}× the plan allowance of the lightest model \
+                                     from this vendor. The ranker was told this, so a heavy model \
+                                     placed first was judged worth the burn.",
+                                    c.quota_weight
+                                )
+                            } else {
+                                "Among the lightest models here — no burn warning was given to \
+                                 the ranker."
+                                    .to_string()
+                            });
+
                             let reason = if c.rationale.is_empty() {
                                 "—".to_string()
                             } else {
                                 c.rationale.clone()
                             };
-                            ui.label(reason).on_hover_text(why);
+                            // The rationale is the model's conclusion. The tooltip is the
+                            // evidence it reached that conclusion from — without it a shortlist
+                            // is an assertion, and a wrong row is impossible to argue with.
+                            ui.label(reason).on_hover_text(explain(c));
                             ui.end_row();
                         }
                     });
@@ -1336,6 +1381,69 @@ impl Ui {
     }
 }
 
+/// The evidence behind one ranked choice, as a tooltip.
+///
+/// The `why` column already shows the model's *conclusion*. This is what it concluded **from**,
+/// and the two are worth separating: a shortlist that only asserts is one a developer has to
+/// either accept or discard whole, while one that shows its inputs can be argued with — and the
+/// input that is wrong is usually the interesting part. A pick that looks wrong is most often a
+/// fact that was wrong, or a fact that was missing.
+///
+/// Ordered as the ranking was actually decided: what pstore knew, where that came from, then the
+/// costs the model was and was not told about.
+fn explain(c: &crate::router::Choice) -> String {
+    use crate::knowledge::Source;
+    let mut out = String::new();
+
+    match (&c.note.is_empty(), c.fact_source) {
+        // The usual case: pstore supplied a line and the ranker used it.
+        (false, Some(source)) => out.push_str(&format!(
+            "pstore told the ranker:\n  \"{}\"\n  — from {}\n\n",
+            c.note,
+            source.label()
+        )),
+        // The checkpoint recognised the name, so pstore deliberately said nothing rather than
+        // give it its own guess to contradict.
+        (true, Some(Source::Checkpoint)) => out.push_str(
+            "The local model said it already knows this one, so pstore added nothing — the \
+             placement is its own knowledge.\n\n",
+        ),
+        (true, _) | (false, None) => {}
+    }
+
+    out.push_str(&format!(
+        "Effort {}{}.\nTakes about {:.1}× the fastest option here.\n",
+        c.effort,
+        if c.effort_selectable {
+            ""
+        } else {
+            " (predicted — this agent has no effort flag, so pstore cannot set it)"
+        },
+        c.relative_latency
+    ));
+
+    // Say plainly which cost reached the ranker and which did not. Otherwise the two columns
+    // look like one signal shown twice, and the deliberate asymmetry between them is invisible.
+    if c.quota_weight >= 2.0 {
+        out.push_str(&format!(
+            "Burns about {:.0}× the plan allowance of the lightest model here — the ranker was \
+             told this and placed it here anyway.\n",
+            c.quota_weight
+        ));
+    }
+    out.push_str(&format!(
+        "Token price {:.1}× the cheapest here — shown only; the ranker never sees price.",
+        c.relative_price
+    ));
+    if c.metered {
+        out.push_str(
+            "\n\n⚠ Billed per token on top of the subscription. Every other model in this list \
+             is already paid for.",
+        );
+    }
+    out
+}
+
 /// Render a unified diff with per-line colouring.
 /// A button that puts `text` on the system clipboard.
 ///
@@ -1372,6 +1480,80 @@ fn diff_view(ui: &mut egui::Ui, diff: &str, salt: &str) {
                 };
             }
         });
+}
+
+#[cfg(test)]
+mod explain_tests {
+    use crate::agents::registry::{Effort, Tier};
+    use crate::knowledge::Source;
+    use crate::router::Choice;
+
+    fn choice() -> Choice {
+        Choice {
+            agent_id: "claude",
+            agent_display: "Claude Code",
+            model_id: "opus".into(),
+            model_display: "Opus 5".into(),
+            tier: Tier::Top,
+            effort: Effort::High,
+            effort_selectable: true,
+            metered: false,
+            relative_latency: 2.6,
+            relative_price: 5.0,
+            quota_weight: 5.0,
+            note: "Anthropic's frontier model: best for hard refactors".into(),
+            fact_source: Some(Source::Table),
+            fit: 92.0,
+            rationale: "hard multi-file refactor".into(),
+            row_index: 0,
+        }
+    }
+
+    /// The whole point of the tooltip: the evidence, not a restatement of the conclusion.
+    #[test]
+    fn the_explanation_shows_the_fact_and_where_it_came_from() {
+        let text = super::explain(&choice());
+        assert!(text.contains("best for hard refactors"), "{text}");
+        assert!(text.contains("pstore's table"), "{text}");
+    }
+
+    /// Price and quota are different signals and the asymmetry between them is the point — one
+    /// reached the ranker, the other is deliberately withheld from it. Collapsing them would undo
+    /// `price_does_not_influence_ranking` in the UI while leaving it true in the code.
+    #[test]
+    fn the_explanation_separates_what_the_ranker_saw_from_what_it_did_not() {
+        let text = super::explain(&choice());
+        assert!(text.contains("the ranker was told this"), "quota: {text}");
+        assert!(text.contains("never sees price"), "price: {text}");
+    }
+
+    /// A model the checkpoint already knew is a different provenance claim from one pstore
+    /// described, and saying "pstore told the ranker: \"\"" would be worse than saying nothing.
+    #[test]
+    fn a_model_the_checkpoint_knew_says_so_instead_of_quoting_an_empty_note() {
+        let mut c = choice();
+        c.note = String::new();
+        c.fact_source = Some(Source::Checkpoint);
+        let text = super::explain(&c);
+        assert!(text.contains("already knows this one"), "{text}");
+        assert!(!text.contains("pstore told the ranker"), "{text}");
+    }
+
+    /// A light model must not carry a burn line — a warning on every row stops being a warning.
+    #[test]
+    fn a_light_model_carries_no_burn_line() {
+        let mut c = choice();
+        c.quota_weight = 1.0;
+        assert!(!super::explain(&c).contains("Burns about"));
+    }
+
+    /// The one cost that is not merely informational has to be unmissable.
+    #[test]
+    fn a_metered_model_is_called_out() {
+        let mut c = choice();
+        c.metered = true;
+        assert!(super::explain(&c).contains("Billed per token"));
+    }
 }
 
 #[cfg(test)]

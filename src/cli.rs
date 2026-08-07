@@ -662,7 +662,10 @@ fn pinned(detected: &[crate::agents::detect::Detected], id: &str) -> Result<Rank
     if !found.usable() {
         return Err(format!("{id} is installed but not usable"));
     }
-    let model = found.spec.models.first();
+    // The agent's own catalog first, for the same reason the ranker prefers it: it is the list
+    // the agent will actually accept, where the registry table is a guess at that list.
+    let discovered = found.models.first().map(crate::agents::catalog::as_spec);
+    let model = discovered.as_ref().or_else(|| found.spec.models.first());
     let effort = *found
         .spec
         .scoreable_efforts()
@@ -683,7 +686,12 @@ fn pinned(detected: &[crate::agents::detect::Detected], id: &str) -> Result<Rank
             effort_selectable: found.spec.effort_flag.is_supported(),
             metered: model.is_some_and(|m| m.metered),
             relative_latency: 1.0,
-            relative_price: 1.0,
+            relative_price: model.map_or(1.0, |m| m.relative_price),
+            quota_weight: model.map_or(1.0, |m| m.quota_weight),
+            // Nothing was ranked, so there is no evidence to show — saying so beats implying a
+            // judgement that never happened.
+            note: String::new(),
+            fact_source: None,
             fit: 0.0,
             rationale: "chosen with --agent".into(),
             row_index: 0,
@@ -793,7 +801,19 @@ fn agents(config: &Config, as_json: bool) -> i32 {
                 },
                 "has_credentials": d.has_credentials,
                 "configured_model": d.configured_model,
-                "models": d.spec.models.iter().map(|m| m.id).collect::<Vec<_>>(),
+                // Whether the live value (if any) is one of the ids pstore can already select —
+                // `false` means the agent has moved on to a model the static table doesn't know.
+                "configured_model_known": d.configured_model.as_deref().map(|m| {
+                    d.models.iter().any(|c| c.id == m) || d.spec.models.iter().any(|s| s.id == m)
+                }),
+                // The list pstore will actually rank: the agent's own catalog when it published
+                // one, else the registry table.
+                "models": if d.models.is_empty() {
+                    d.spec.models.iter().map(|m| m.id.to_string()).collect::<Vec<_>>()
+                } else {
+                    d.models.iter().map(|m| m.id.clone()).collect::<Vec<_>>()
+                },
+                "models_from_catalog": !d.models.is_empty(),
                 "efforts": d.spec.scoreable_efforts().iter()
                     .map(|e| e.as_str()).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
@@ -829,9 +849,13 @@ fn agents(config: &Config, as_json: bool) -> i32 {
         if let Some(v) = &d.version {
             println!("    version  {v}");
         }
-        // The model pstore will actually rank for this agent, which for half of them comes from
-        // the agent's own config rather than from the registry.
-        let models = if !d.spec.models.is_empty() {
+        // The model(s) pstore will actually rank for this agent. Three sources, and the listing
+        // says which one it used — a catalog the agent published, pstore's own table, or the
+        // single model the agent's config names.
+        let models = if !d.models.is_empty() {
+            let names: Vec<_> = d.models.iter().map(|m| m.display.as_str()).collect();
+            format!("{} (from its own catalog)", names.join(", "))
+        } else if !d.spec.models.is_empty() {
             d.spec
                 .models
                 .iter()
@@ -845,6 +869,26 @@ fn agents(config: &Config, as_json: bool) -> i32 {
             }
         };
         println!("    models   {models}");
+        // Which of those the agent is set to right now. Only interesting when pstore had a list
+        // to compare against — for an agent whose model comes from its config alone, the line
+        // above already *is* the configured model and repeating it says nothing.
+        let offered_ids: Vec<&str> = if !d.models.is_empty() {
+            d.models.iter().map(|m| m.id.as_str()).collect()
+        } else {
+            d.spec.models.iter().map(|m| m.id).collect()
+        };
+        if !offered_ids.is_empty()
+            && let Some(live) = &d.configured_model
+        {
+            // Not in the list means the two sources disagree: pstore would launch something the
+            // agent is not currently set to. Saying so beats letting the list look authoritative.
+            let note = if offered_ids.contains(&live.as_str()) {
+                ""
+            } else {
+                " — not one of the models above, so pstore would launch a different one"
+            };
+            println!("    running  {live}{note}");
+        }
         let efforts = if d.spec.efforts.is_empty() {
             "not settable by pstore".to_string()
         } else {
@@ -1251,6 +1295,7 @@ mod tests {
             has_credentials: true,
             status: Status::Ready,
             configured_model: None,
+            models: Vec::new(),
         }];
 
         let ranking = pinned(&detected, "claude").expect("claude is installed here");
