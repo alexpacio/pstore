@@ -259,7 +259,7 @@ impl Ui {
             }
 
             if ui
-                .button("Send →")
+                .button("Send")
                 .on_hover_text("Open the prompt in a new terminal window with an interactive agent")
                 .clicked()
             {
