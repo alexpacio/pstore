@@ -77,10 +77,8 @@ pub fn cached(repo_id: &str, filename: &str) -> Result<PathBuf, String> {
     }
 }
 
-#[cfg(feature = "local-llm")]
 pub use real::fetch_reporting;
 
-#[cfg(feature = "local-llm")]
 mod real {
     use super::{cache_root, repo_folder};
     use std::io::{Read, Seek, Write};

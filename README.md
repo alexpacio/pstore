@@ -12,8 +12,8 @@
 | Feature | Description |
 |---------|-------------|
 | **Versioned prompts** | Every save creates a snapshot in `.pstore/versions/`. Full history, diffs, one-click restore — all plain markdown. |
-| **Inline hints** | Select text, type a question, or both — the selection and the question reach the agent as distinct things. Answers land in a panel, never silently in the document. |
-| **Plan** | Rewrites a rough request into a structured instruction for a coding agent: objective, ordered steps, constraints, acceptance criteria. The output *is* the next prompt, not a document to read. |
+| **Inline hints** | Select text, type a question, or both — the selection and the question reach the answerer as distinct things. Answered by the local model or by the ranked coding agent, your pick per question. Answers land in a panel, never silently in the document. |
+| **Plan** | Rewrites a rough request into a structured instruction for a coding agent: objective, ordered steps, constraints, acceptance criteria. Runs on the local model, and asks it for the fields rather than for a document — the headings and their order are pstore's. The output *is* the next prompt, not a document to read. |
 | **Shrink** | Rewrites the selection — or the whole prompt — telegraphically: no articles, no pleasantries, each fact stated once, while code, paths, identifiers and constraints stay verbatim. Arrives as a diff with a size summary and a warning if a file reference or code block went missing. |
 | **Smart routing** | Every (agent, model, effort) combination your machine can run is handed to a local model along with your prompt; it returns a ranked shortlist with a reason for each pick. |
 | **Only models it can describe** | A candidate pstore cannot name and characterise is **withheld from the ranking**, with the reason shown, rather than ranked blind. |
@@ -142,19 +142,19 @@ cargo install --path . --force   # install onto your PATH (~/.cargo/bin/pstore)
 
 **No other prerequisites.** pstore downloads the local model and the runtime that executes it on first use, from the Models window.
 
-**One binary, three front ends**, each behind a build feature so you can leave out what you will not run — all on by default:
+**One binary, three front ends**, each behind a build feature so you can leave out what you will not run — both on by default:
 
 ```bash
 # Headless machine — no windowing dependencies compiled at all
-cargo build --release --no-default-features --features local-llm,tui
+cargo build --release --no-default-features --features tui
 
 # Window only
-cargo build --release --no-default-features --features local-llm,gui
-
-# No local inference: editing, versioning, diffing and agent handoff still work; ranking,
-# planning, shrinking and sanitizing are disabled and say why.
-cargo build --release --no-default-features --features gui,tui
+cargo build --release --no-default-features --features gui
 ```
+
+The local model is **not** a feature. Ranking, planning, shrinking and sanitizing are all
+the local checkpoint, so a build without it is not a smaller pstore — it is a text editor
+that refuses every button.
 
 ---
 

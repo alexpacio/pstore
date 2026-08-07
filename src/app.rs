@@ -4,9 +4,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::agents::detect::Detected;
-use crate::agents::failover::DEFAULT_TIMEOUT;
 use crate::agents::registry;
-use crate::config::Config;
+use crate::config::{Config, HintSource};
 use crate::editor::Buffer;
 use crate::hints::Subject;
 use crate::jobs::{self, Event, Handle, JobId, Kind, Runner};
@@ -29,17 +28,15 @@ pub struct PiiReview {
 
 /// An action waiting on a ranking before it can start.
 ///
-/// Both hint and plan have to pick an agent to run, and picking one now means asking the
+/// A hint answered by an agent has to pick which one, and picking now means asking the
 /// model — seconds, not microseconds. Rather than refuse until the user has ranked
 /// manually, the request is parked here and dispatched when the ranking arrives.
 ///
-/// Shrink is not here: it runs on the local model and needs no agent at all.
+/// Shrink and plan are not here: both run on the local model and need no agent at all.
 #[derive(Debug, Clone)]
 enum Pending {
     /// Ask for a hint about this subject.
     Hint(Subject),
-    /// Turn the open prompt into an agent-ready instruction.
-    Plan,
 }
 
 /// A pending plan awaiting approval.
@@ -131,7 +128,7 @@ pub struct App {
     pub ranking: Option<Ranking>,
     /// What to do once the ranking this job is producing arrives.
     ///
-    /// Hints and plans both need a ranking to choose an agent, and getting one now means
+    /// An agent-answered hint needs a ranking to choose one, and getting it now means
     /// waiting on the model. Rather than make the user press "Score models" first, the
     /// request is remembered and dispatched when the ranking lands.
     pending: Option<Pending>,
@@ -418,7 +415,6 @@ impl App {
             .rank(text, agents, move |t, a| router::rank(t, a, &filter));
         self.status = match self.pending {
             Some(Pending::Hint(_)) => "ranking models for the hint…".into(),
-            Some(Pending::Plan) => "ranking models for the plan…".into(),
             None => "ranking models…".into(),
         };
     }
@@ -533,6 +529,9 @@ impl App {
             self.status = "select some text or type a question first".into();
             return;
         };
+        if self.config.prefs.hint_source == HintSource::Local {
+            return self.launch_hint_locally(subject);
+        }
         if self.agents.is_empty() {
             self.error = Some("no coding agents detected on PATH".into());
             return;
@@ -543,6 +542,24 @@ impl App {
             // No ranking yet: get one, then come back here.
             None => self.rank_then(Some(Pending::Hint(subject))),
         }
+    }
+
+    /// Answer the hint on the local checkpoint.
+    ///
+    /// No ranking first, and no agent needed: there is only one thing that can answer, so
+    /// there is nothing to choose between.
+    fn launch_hint_locally(&mut self, subject: Subject) {
+        let prompt = crate::hints::compose(&subject, &self.buffer.text);
+        let job = self.runner.hint_local(prompt);
+        self.running.push(job.clone());
+        self.hint = Some(HintState {
+            subject,
+            answer: String::new(),
+            job: Some(job.id),
+            answered_by: Some("local model".into()),
+        });
+        self.hint_open = true;
+        self.hint_input.clear();
     }
 
     /// Start the hint agent against an existing ranking.
@@ -623,34 +640,15 @@ impl App {
     }
 
     /// Turn the open prompt into an instruction a coding agent can execute.
+    ///
+    /// Runs on the local checkpoint, so unlike the handoff it needs no installed agent and
+    /// no ranking first — planning rewrites the request, it does not work on the repo.
     pub fn request_plan(&mut self) {
         if self.buffer.text.trim().is_empty() {
             self.status = "nothing to plan".into();
             return;
         }
-        if self.agents.is_empty() {
-            self.error = Some("no coding agents detected on PATH".into());
-            return;
-        }
-        match self.ranking.clone() {
-            Some(ranking) => self.launch_plan(&ranking),
-            None => self.rank_then(Some(Pending::Plan)),
-        }
-    }
-
-    /// Start the planning agent against an existing ranking.
-    fn launch_plan(&mut self, ranking: &Ranking) {
-        let prompt = crate::plan::compose(&self.buffer.text);
-        let job = self.runner.run_agent(
-            Kind::Plan,
-            "plan".into(),
-            prompt,
-            self.agents.clone(),
-            ranking.clone(),
-            self.config.dir.clone(),
-            self.config.dir.clone(),
-            DEFAULT_TIMEOUT,
-        );
+        let job = self.runner.plan(self.buffer.text.clone());
         self.plan_job = Some(job.id);
         self.running.push(job);
         self.plan = None;
@@ -833,6 +831,14 @@ impl App {
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
                 }
+                // A local hint has no `Finished` event to clear its job — the answer came
+                // as a chunk and this is the terminal event.
+                if kind == Kind::Hint
+                    && let Some(h) = self.hint.as_mut()
+                    && h.job == Some(id)
+                {
+                    h.job = None;
+                }
                 self.status = note;
             }
             Event::Scanned { id, scan } => {
@@ -880,6 +886,24 @@ impl App {
                     self.status = "shrink ready for review".into();
                 }
             }
+            Event::Planned { id, text } => {
+                if self.plan_job != Some(id) {
+                    return;
+                }
+                self.plan_job = None;
+                // The schema constrains the shape, not the manners — same cleanup as shrink.
+                let after = crate::shrink::clean(&text);
+                if after.trim().is_empty() {
+                    self.error = Some("the planner returned nothing".into());
+                } else {
+                    self.plan = Some(PlanProposal {
+                        diff: version::diff(&self.buffer.text, &after),
+                        warnings: crate::plan::warnings(&after, &self.buffer.text),
+                        after,
+                    });
+                    self.status = "plan ready for review".into();
+                }
+            }
             Event::Detected { agents, .. } => {
                 let n = agents.len();
                 let usable = agents.iter().filter(|a| a.usable()).count();
@@ -908,48 +932,35 @@ impl App {
                 {
                     match pending {
                         Pending::Hint(subject) => self.launch_hint(subject, &ranking),
-                        Pending::Plan => self.launch_plan(&ranking),
                     }
                 }
             }
-            Event::Finished { id, kind, result } => match kind {
-                Kind::Hint => {
-                    if let Some(h) = self.hint.as_mut()
-                        && h.job == Some(id)
-                    {
-                        h.job = None;
-                        let model = if result.model_id.is_empty() {
-                            "agent default"
-                        } else {
-                            &result.model_id
-                        };
-                        h.answered_by = Some(format!(
-                            "{} · {model} · effort {} ({:.1}s)",
-                            result.agent_id,
-                            result.effort,
-                            result.elapsed.as_secs_f32()
-                        ));
-                    }
-                    self.status = "hint ready".into();
-                }
-                Kind::Plan if self.plan_job == Some(id) => {
-                    self.plan_job = None;
-                    // Same cleanup as shrink: agents ignore "no preamble" the same way
-                    // whatever they were asked to produce.
-                    let after = crate::shrink::clean(&result.text);
-                    if after.trim().is_empty() {
-                        self.error = Some("the planner returned nothing".into());
+            // The hint is the only agent-backed action left; everything else pstore infers
+            // runs on the local checkpoint and reports through its own event.
+            Event::Finished {
+                id,
+                kind: Kind::Hint,
+                result,
+            } => {
+                if let Some(h) = self.hint.as_mut()
+                    && h.job == Some(id)
+                {
+                    h.job = None;
+                    let model = if result.model_id.is_empty() {
+                        "agent default"
                     } else {
-                        self.plan = Some(PlanProposal {
-                            diff: version::diff(&self.buffer.text, &after),
-                            warnings: crate::plan::warnings(&after, &self.buffer.text),
-                            after,
-                        });
-                        self.status = "plan ready for review".into();
-                    }
+                        &result.model_id
+                    };
+                    h.answered_by = Some(format!(
+                        "{} · {model} · effort {} ({:.1}s)",
+                        result.agent_id,
+                        result.effort,
+                        result.elapsed.as_secs_f32()
+                    ));
                 }
-                _ => {}
-            },
+                self.status = "hint ready".into();
+            }
+            Event::Finished { .. } => {}
             Event::Failed { id, kind, error } => {
                 if kind == Kind::Shrink && self.shrink_job == Some(id) {
                     self.shrink_job = None;
@@ -1227,17 +1238,83 @@ mod tests {
                 .is_some_and(|e| e.contains("no coding agents"))
         );
 
-        // Plan and hint are the agent-backed actions, so they are the ones that have to
-        // refuse. Shrink is deliberately not tested here: it runs on the local model and
-        // works with no agent installed at all.
+        // A hint answered by an agent is the action that has to refuse.
         app.error = None;
-        app.request_plan();
+        app.hint_input = "what does this do?".into();
+        app.request_hint();
         assert!(
             app.error
                 .as_deref()
-                .is_some_and(|e| e.contains("no coding agents"))
+                .is_some_and(|e| e.contains("no coding agents")),
+            "got {:?}",
+            app.error
         );
 
+        // Plan must *not* refuse: it runs on the local checkpoint, so an installed agent
+        // has nothing to do with whether it can run. Same for shrink, untested here.
+        app.error = None;
+        app.request_plan();
+        assert_eq!(
+            app.error, None,
+            "planning is local and must not require an agent"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Choosing the local model is also the answer to having no agent installed, so it must
+    /// not go through the check that refuses without one.
+    #[test]
+    fn a_local_hint_needs_no_agent_and_no_ranking() {
+        let cfg = tmp_config("localhint");
+        let dir = cfg.dir.clone();
+        let mut app = App::new(cfg);
+        app.create_prompt("doc");
+        app.buffer.replace_all("some prompt text", "typing");
+        app.agents.clear();
+        app.ranking = None;
+        app.config.prefs.hint_source = HintSource::Local;
+
+        app.hint_input = "is this clear?".into();
+        app.request_hint();
+
+        assert_eq!(app.error, None, "a local hint must not require an agent");
+        let hint = app.hint.as_ref().expect("the hint started");
+        assert!(hint.job.is_some(), "it dispatched without a ranking first");
+        assert_eq!(hint.answered_by.as_deref(), Some("local model"));
+        assert_eq!(app.hint_input, "", "the question box is consumed");
+
+        app.cancel_hint();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The terminal event for a local hint is `Done`, not `Finished` — it has no agent run
+    /// to report. Without this the spinner never stops.
+    #[test]
+    fn a_local_hint_finishes_on_its_done_event() {
+        let cfg = tmp_config("localhintdone");
+        let dir = cfg.dir.clone();
+        let mut app = App::new(cfg);
+        app.hint = Some(HintState {
+            subject: Subject::Question("q".into()),
+            answer: String::new(),
+            job: Some(JobId(7)),
+            answered_by: Some("local model".into()),
+        });
+
+        app.handle(Event::Chunk {
+            id: JobId(7),
+            text: "the answer".into(),
+        });
+        app.handle(Event::Done {
+            id: JobId(7),
+            kind: Kind::Hint,
+            note: "hint ready".into(),
+        });
+
+        let hint = app.hint.as_ref().expect("still there");
+        assert_eq!(hint.answer, "the answer");
+        assert_eq!(hint.job, None, "the job must be cleared");
         std::fs::remove_dir_all(&dir).ok();
     }
 

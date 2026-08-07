@@ -39,7 +39,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::App;
-use crate::config::Config;
+use crate::config::{Config, HintSource};
 use crate::store::version::Note;
 
 /// How long to wait for a key before redrawing anyway.
@@ -398,6 +398,17 @@ impl Tui {
                 }
                 KeyCode::Backspace => {
                     self.input.pop();
+                    true
+                }
+                // Who answers, switched from inside the question box: it is a property of
+                // the question being typed, not a setting to go and find.
+                KeyCode::Char('l') if ctrl && overlay == Overlay::Hint => {
+                    let prefs = &mut self.app.config.prefs;
+                    prefs.hint_source = match prefs.hint_source {
+                        HintSource::Local => HintSource::Agent,
+                        HintSource::Agent => HintSource::Local,
+                    };
+                    prefs.save(&self.app.config.dir);
                     true
                 }
                 KeyCode::Char(c) if !ctrl => {
@@ -786,6 +797,16 @@ impl Tui {
                         },
                         Style::default().add_modifier(Modifier::DIM),
                     )),
+                    Line::from(Span::styled(
+                        format!(
+                            "answered by: {}  (Ctrl+L to switch)",
+                            match self.app.config.prefs.hint_source {
+                                HintSource::Local => "the local model",
+                                HintSource::Agent => "the ranked coding agent",
+                            }
+                        ),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )),
                 ]),
             ),
         };
@@ -962,10 +983,11 @@ fn help_text() -> Text<'static> {
         ),
         (
             "F3",
-            "plan: rewrite it as an instruction for a coding agent",
+            "plan: rewrite it as an instruction for a coding agent (local model)",
         ),
         ("F4", "sanitize: find personal data and offer to mask it"),
         ("Ctrl+H", "ask about the selection, a question, or both"),
+        ("Ctrl+L", "in the hint box: local model or coding agent"),
         ("F8", "send the prompt to the best-ranked agent"),
         ("F6", "what the local model and its runtime are doing"),
         ("F7 / F9", "version history / cycle the right-hand pane"),

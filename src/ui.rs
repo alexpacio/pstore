@@ -9,7 +9,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 
 use crate::agents::detect::Status;
 use crate::app::App;
-use crate::config::Config;
+use crate::config::{Config, HintSource};
 use crate::store::version::Note;
 
 /// Open the window and run until it closes.
@@ -193,7 +193,7 @@ impl Ui {
                 ui.spinner();
                 if ui
                     .button("Stop plan")
-                    .on_hover_text("Kill the agent process and keep the prompt as it is")
+                    .on_hover_text("Stop the local model and keep the prompt as it is")
                     .clicked()
                 {
                     self.app.cancel_plan();
@@ -202,8 +202,9 @@ impl Ui {
                 .button("Plan")
                 .on_hover_text(
                     "Rewrite this into a structured instruction for a coding agent — \
-                     objective, ordered steps, constraints and acceptance criteria. The \
-                     result is the next prompt, not a document to read.",
+                     objective, ordered steps, constraints and acceptance criteria. Runs \
+                     on the local model. The result is the next prompt, not a document to \
+                     read.",
                 )
                 .clicked()
             {
@@ -440,7 +441,16 @@ impl Ui {
 
                 // Mirror the widget's cursor into the buffer so hints know the selection
                 // and insertions land where the caret is.
-                if let Some(range) = output.state.cursor.char_range() {
+                //
+                // Only while the editor has focus. Selecting a passage and then typing a
+                // question about it is the normal way to use hints — see
+                // [`crate::hints::Subject::About`] — and that means the selection has to
+                // survive the click into the question box. Unfocused, the widget reports a
+                // collapsed cursor, so mirroring unconditionally cleared the selection the
+                // instant the user went to type about it.
+                if output.response.has_focus()
+                    && let Some(range) = output.state.cursor.char_range()
+                {
                     self.app.buffer.selection = crate::editor::Selection {
                         start: range.primary.index.into(),
                         end: range.secondary.index.into(),
@@ -478,6 +488,28 @@ impl Ui {
                 .desired_rows(3)
                 .desired_width(f32::INFINITY),
         );
+
+        // Who answers. Next to the Ask button rather than in the Models window because it
+        // is a per-question choice: the local model for "is this constraint clear?", an
+        // agent for anything that needs to have read the code.
+        let mut source = self.app.config.prefs.hint_source;
+        ui.horizontal(|ui| {
+            ui.weak("Answer with:");
+            ui.selectable_value(&mut source, HintSource::Local, "Local model")
+                .on_hover_text(
+                    "Bonsai, on this machine. Costs no quota and sends nothing anywhere, \
+                     but has not read your codebase.",
+                );
+            ui.selectable_value(&mut source, HintSource::Agent, "Coding agent")
+                .on_hover_text(
+                    "The ranked agent, which can read the project. Spends whatever that \
+                     agent costs.",
+                );
+        });
+        if source != self.app.config.prefs.hint_source {
+            self.app.config.prefs.hint_source = source;
+            self.app.config.prefs.save(&self.app.config.dir);
+        }
 
         let running = self.app.hint.as_ref().is_some_and(|h| h.job.is_some());
         ui.horizontal(|ui| {
@@ -922,25 +954,11 @@ impl Ui {
                      anywhere by ranking or sanitising.",
                 );
 
-                // Said once, up front: without local inference compiled in, no download can help,
-                // and every row below would otherwise imply one could.
-                if !crate::models::LOCAL_INFERENCE {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 120, 40),
-                        format!("⚠ {}", crate::models::NO_LOCAL_INFERENCE),
-                    );
-                    ui.label(
-                        "Rebuild with the default features — `cargo build --release` — to \
-                         enable ranking and the personal-data scan. Until then those two \
-                         actions are unavailable; everything else works as normal.",
-                    );
-                }
                 ui.separator();
 
                 self.runtime_row(ui, busy);
                 ui.separator();
 
-                let usable = crate::models::LOCAL_INFERENCE;
                 let snapshot = crate::models::snapshot();
 
                 ui.label(
@@ -998,7 +1016,7 @@ impl Ui {
                         let downloaded = phase.is_downloaded();
                         if ui
                             .add_enabled(
-                                usable && !busy && !downloaded,
+                                !busy && !downloaded,
                                 egui::Button::new("Download").small(),
                             )
                             .on_hover_text(format!("Fetch {} from {}", c.size_label(), c.repo))
@@ -1009,7 +1027,7 @@ impl Ui {
                         let loaded = *phase == crate::models::Phase::Ready;
                         if ui
                             .add_enabled(
-                                usable && !busy && downloaded && !loaded,
+                                !busy && downloaded && !loaded,
                                 egui::Button::new("Load").small(),
                             )
                             .on_hover_text("Build the model in memory now")
@@ -1019,7 +1037,7 @@ impl Ui {
                         }
                         if matches!(phase, crate::models::Phase::Failed(_))
                             && ui
-                                .add_enabled(usable && !busy, egui::Button::new("Retry").small())
+                                .add_enabled(!busy, egui::Button::new("Retry").small())
                                 .clicked()
                         {
                             fetch.push(*c);
@@ -1039,7 +1057,7 @@ impl Ui {
                 ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(
-                            usable && !busy && selected_missing,
+                            !busy && selected_missing,
                             egui::Button::new(format!(
                                 "Download the selected build ({})",
                                 selected.size_label()

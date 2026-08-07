@@ -19,9 +19,7 @@
 //! ranking worse.
 
 pub mod hub;
-#[cfg(feature = "local-llm")]
 pub mod llm;
-#[cfg(feature = "local-llm")]
 pub mod session;
 
 use std::borrow::Cow;
@@ -29,7 +27,6 @@ use std::borrow::Cow;
 use crate::agents::detect::Detected;
 use crate::agents::registry::{Effort, Tier};
 use crate::filter::Filter;
-#[cfg(feature = "local-llm")]
 use crate::knowledge::Brief;
 
 /// A model name, which is either a registry constant or a string read out of an agent's config.
@@ -320,7 +317,6 @@ fn models_of(agent: &Detected) -> Vec<Offer> {
 ///
 /// Exclusions are recorded once per agent, not once per (model, effort) pair — five efforts of
 /// one nameless model are one problem, and listing it five times would bury the others.
-#[cfg(feature = "local-llm")]
 fn withhold_unknown(
     candidates: &mut Vec<Candidate>,
     excluded: &mut Vec<(&'static str, String)>,
@@ -356,9 +352,8 @@ fn withhold_unknown(
 /// weights and runtime both come from the Models window, so a first run reports "not
 /// downloaded" instead of stalling on a 7.17 GB transfer nobody asked for.
 pub fn rank(text: &str, detected: &[Detected], filter: &Filter) -> Result<Ranking, String> {
-    // `mut` on both because the local-llm path withholds undescribed models from the field; a
-    // build without inference never reaches that and refuses below instead.
-    #[allow(unused_mut)]
+    // `mut` on both because ranking withholds undescribed models from the field, moving them
+    // from `candidates` into `excluded` with a stated reason rather than scoring them blind.
     let (mut candidates, mut excluded) = candidates(detected, filter);
     if candidates.is_empty() {
         // Two very different problems, and sending the user to the wrong one wastes their
@@ -373,7 +368,6 @@ pub fn rank(text: &str, detected: &[Detected], filter: &Filter) -> Result<Rankin
         });
     }
 
-    #[cfg(feature = "local-llm")]
     {
         // Before the field is ranked, work out what can truthfully be said about each model in
         // it — and withhold the ones nothing can describe. Ranking a model pstore cannot name
@@ -410,16 +404,10 @@ pub fn rank(text: &str, detected: &[Detected], filter: &Filter) -> Result<Rankin
         }
         llm::rank(text, &candidates, excluded, &brief)
     }
-    #[cfg(not(feature = "local-llm"))]
-    {
-        let _ = (text, excluded, &mut candidates);
-        Err(crate::models::NO_LOCAL_INFERENCE.to_string())
-    }
 }
 
 /// Forget any provisioned state and re-check on the next ranking.
 pub fn reset_classifiers() {
-    #[cfg(feature = "local-llm")]
     llm::reset();
 }
 
@@ -429,7 +417,6 @@ pub fn reset_classifiers() {
 /// Blocks until the processes are gone — milliseconds — and does nothing when none are
 /// running or when the build has no local inference.
 pub fn shutdown_model() {
-    #[cfg(feature = "local-llm")]
     llm::shutdown();
 }
 
@@ -439,13 +426,8 @@ pub fn shutdown_model() {
 /// Call it after publishing the new preference. Returns how many runs were stopped, which is
 /// normally zero — nothing is resident between calls.
 pub fn unload_other_model_builds() -> usize {
-    #[cfg(feature = "local-llm")]
     {
         llm::unload_other_builds()
-    }
-    #[cfg(not(feature = "local-llm"))]
-    {
-        0
     }
 }
 
@@ -454,13 +436,8 @@ pub fn unload_other_model_builds() -> usize {
 /// Returns the reason when either is missing, so the Models window can show it. Blocking;
 /// call from a worker thread.
 pub fn preload_classifiers() -> Result<(), String> {
-    #[cfg(feature = "local-llm")]
     {
         llm::preload()
-    }
-    #[cfg(not(feature = "local-llm"))]
-    {
-        Err(crate::models::NO_LOCAL_INFERENCE.to_string())
     }
 }
 
@@ -588,7 +565,6 @@ mod tests {
     /// The poisoning fix, stated as a property: a model nothing can describe does not reach the
     /// ranker, and the agent it belonged to is accounted for instead of vanishing.
     #[test]
-    #[cfg(feature = "local-llm")]
     fn undescribed_models_are_withheld_and_accounted_for() {
         use crate::knowledge::{Brief, Known, Source};
 
@@ -744,18 +720,4 @@ mod tests {
         );
     }
 
-    /// Without the model there is no ranking at all — not a worse ranking. This is the
-    /// property the whole no-fallback design rests on, so it is asserted rather than
-    /// assumed.
-    #[test]
-    #[cfg(not(feature = "local-llm"))]
-    fn a_build_without_inference_refuses_rather_than_guessing() {
-        let agents = [detected("claude", Status::Ready)];
-        let why = rank("Refactor src/main.rs", &agents, &open_filter())
-            .expect_err("no local inference should mean no ranking");
-        assert!(
-            why.contains("local-llm"),
-            "the reason should name what is missing, got {why:?}"
-        );
-    }
 }

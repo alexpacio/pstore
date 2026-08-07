@@ -39,16 +39,39 @@ pub struct Config {
     pub warnings: Vec<String>,
 }
 
+/// What answers a hint.
+///
+/// The one place pstore lets the same job go either way. Everything else it infers is local
+/// by construction, and the handoff is an agent by construction; a hint is genuinely both
+/// kinds of question depending on what was selected.
+///
+/// Serialised as the strings a person would write in a config file, not as Rust variant
+/// names, because this is a setting people edit by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HintSource {
+    /// The installed coding agent the ranker picks, and **the default**.
+    ///
+    /// A hint is a question about code and the project it lives in, which is what these
+    /// models are strongest at and what the 27B local checkpoint is weakest at.
+    #[default]
+    #[serde(rename = "agent")]
+    Agent,
+    /// The local checkpoint — the same one that ranks, plans, shrinks and sanitises.
+    ///
+    /// Slower per token and less capable, but it spends no quota and the prompt does not
+    /// leave the machine. The right choice when the question is about the *prompt* rather
+    /// than about the codebase, and the only one available with no agent installed.
+    #[serde(rename = "local")]
+    Local,
+}
+
 /// Which build of the local checkpoint to run.
 ///
 /// The two differ in quantisation, not in what they know: same 27B, same context, same
 /// template. What changes is how much of the full-precision model survives, and what it costs
 /// in memory and in seconds — see [`crate::models::LLM_1BIT`] and
 /// [`crate::models::LLM_TERNARY`], which state the trade in full.
-///
-/// Serialised as the strings a person would write in a config file, not as Rust variant
-/// names, because this is a setting people edit by hand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LocalModel {
     /// 3.8 GB, and **the default**: it routes as well as the larger build and is about twice as
     /// fast per token.
@@ -80,6 +103,8 @@ pub struct Prefs {
     /// sensitive, so the hint path takes the quickest candidate scoring within this
     /// many points of the best. `0` always uses the top-scoring candidate.
     pub hint_score_tolerance: f32,
+    /// What answers a hint: the ranked coding agent, or the local checkpoint.
+    pub hint_source: HintSource,
     /// Render the markdown preview instead of the editor.
     pub preview: bool,
     /// Width of the left column, in points.
@@ -140,6 +165,7 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             hint_score_tolerance: 8.0,
+            hint_source: HintSource::default(),
             preview: false,
             sidebar_width: 260.0,
             pinned_agent: None,
@@ -165,6 +191,7 @@ impl Default for Prefs {
 #[serde(default, deny_unknown_fields)]
 struct Layer {
     hint_score_tolerance: Option<f32>,
+    hint_source: Option<HintSource>,
     preview: Option<bool>,
     sidebar_width: Option<f32>,
     pinned_agent: Option<String>,
@@ -195,6 +222,9 @@ impl Layer {
 
     /// Apply this layer over `base`.
     fn apply(self, base: &mut Prefs) {
+        if let Some(v) = self.hint_source {
+            base.hint_source = v;
+        }
         if let Some(v) = self.hint_score_tolerance {
             base.hint_score_tolerance = v;
         }

@@ -22,7 +22,6 @@
 //! it is blocking and belongs on a worker thread.
 
 use std::sync::atomic::AtomicBool;
-#[cfg(feature = "local-llm")]
 use std::sync::atomic::Ordering;
 
 /// The compression instruction.
@@ -64,18 +63,6 @@ pub fn compose(document: &str) -> String {
     format!("{INSTRUCTION}\n\n---\n\n{document}")
 }
 
-/// Without local inference there is nothing to shrink *with*, and no fallback to reach for: a
-/// telegraphic rewrite is a judgement about what each word is carrying, so there is nothing to
-/// approximate it with. Reported, like every other model-dependent feature.
-#[cfg(not(feature = "local-llm"))]
-pub fn run(
-    _text: &str,
-    _cancel: &AtomicBool,
-    _note: &mut dyn FnMut(String),
-) -> Result<String, String> {
-    Err(crate::models::NO_LOCAL_INFERENCE.to_string())
-}
-
 /// Shrink a whole prompt, one model call per chunk.
 ///
 /// Blocking, and slow in units of seconds per chunk — the model is a subprocess that maps
@@ -85,7 +72,6 @@ pub fn run(
 ///
 /// Returns the reason on failure rather than a partial document. Half a shrunk prompt is
 /// not a shorter prompt, it is a truncated one, and it must never reach the diff.
-#[cfg(feature = "local-llm")]
 pub fn run(
     text: &str,
     cancel: &AtomicBool,
@@ -346,18 +332,41 @@ pub fn looks_like_path(token: &str) -> bool {
     if t.len() < 3 || t.starts_with("http") {
         return false;
     }
-    if t.contains('/') && t.chars().any(|c| c.is_ascii_alphanumeric()) {
+    // A slash alone is not a path. English uses it as "or" — `difficulty/capability`,
+    // `read/write`, `and/or` — and treating those as file references means warning that a
+    // path was dropped on rewrites that dropped nothing, on almost every prompt. A real
+    // reference either carries an extension (handled below) or is anchored: rooted at `/`,
+    // relative with `./`, under `~/`, or ending in `/` as a directory.
+    let anchored = t.starts_with('/')
+        || t.starts_with("./")
+        || t.starts_with("../")
+        || t.starts_with("~/")
+        || t.ends_with('/');
+    if anchored && t.chars().any(|c| c.is_ascii_alphanumeric()) {
         return true;
     }
-    // `name.ext` with a plausible extension.
-    match t.rsplit_once('.') {
-        Some((stem, ext)) => {
-            !stem.is_empty()
-                && (1..=5).contains(&ext.len())
-                && ext.chars().all(|c| c.is_ascii_alphanumeric())
+    /// `name.ext` with a plausible extension.
+    fn has_extension(s: &str) -> bool {
+        match s.rsplit_once('.') {
+            Some((stem, ext)) => {
+                !stem.is_empty()
+                    && (1..=5).contains(&ext.len())
+                    && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            }
+            None => false,
         }
-        None => false,
     }
+
+    if t.contains('/') {
+        // The extension lives on the final segment, and a sentence-final `.` is discounted
+        // first: `edit src/main.rs.` names a path. Safe to strip here precisely because the
+        // slash has already ruled out the abbreviations the trailing dot is guarding against.
+        let core = t.trim_end_matches('.');
+        return has_extension(core.rsplit('/').next().unwrap_or(core));
+    }
+    // No slash: strict, and the trailing dot is load-bearing. `e.g.` and a sentence-final
+    // `README.` must not read as file references.
+    has_extension(t)
 }
 
 /// The path a token refers to, with surrounding punctuation removed.
@@ -442,6 +451,21 @@ mod tests {
         assert!(
             !looks_like_path("https://example.com/a.rs"),
             "URLs are not local files"
+        );
+
+        // The bug this guards: a slash is English for "or" at least as often as it is a
+        // path separator. Reading these as file references made `pstore plan` warn that a
+        // path had been dropped on prompts that never named one.
+        for prose in ["difficulty/capability", "read/write", "and/or", "GUI/TUI"] {
+            assert!(!looks_like_path(prose), "{prose} is not a path");
+        }
+
+        // Still paths, without an extension to prove it.
+        assert!(looks_like_path("/usr/local/bin"), "rooted");
+        assert!(looks_like_path("./scripts"), "explicitly relative");
+        assert!(
+            looks_like_path("src/agents/"),
+            "trailing slash is a directory"
         );
     }
 

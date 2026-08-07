@@ -29,9 +29,7 @@
 //! can read next to the shortlist. That is the point of the whole module: a shortlist of four
 //! models pstore understands is worth more than a shortlist of five where one is fiction.
 
-#[cfg(feature = "local-llm")]
 use std::collections::BTreeMap;
-#[cfg(feature = "local-llm")]
 use std::path::PathBuf;
 
 /// Where a model's facts came from. Shown in the UI so a ranking can be accounted for.
@@ -372,7 +370,6 @@ pub fn trim_note(raw: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Where looked-up notes are remembered between runs.
-#[cfg(feature = "local-llm")]
 ///
 /// The user cache directory rather than the project: what a model is does not depend on which
 /// project is open, and re-looking-up the same name once per checkout would be both slower and
@@ -382,7 +379,6 @@ fn cache_path() -> Option<PathBuf> {
 }
 
 /// Notes previously looked up, keyed by lowercase bare name.
-#[cfg(feature = "local-llm")]
 ///
 /// A miss is cached as an empty string, deliberately: a name that is not a public model — a
 /// typo in someone's config, an internal deployment id — must not cost a network round trip on
@@ -394,7 +390,6 @@ fn load_cache() -> BTreeMap<String, String> {
         .unwrap_or_default()
 }
 
-#[cfg(feature = "local-llm")]
 fn save_cache(cache: &BTreeMap<String, String>) {
     let Some(path) = cache_path() else { return };
     if let Some(parent) = path.parent() {
@@ -413,7 +408,6 @@ fn save_cache(cache: &BTreeMap<String, String>) {
 ///
 /// Blocking, with a short timeout: this runs on the ranking worker, and a search engine that
 /// has decided to be slow today must not turn a 13-second ranking into a minute of nothing.
-#[cfg(feature = "local-llm")]
 pub fn lookup(model: &str) -> Option<String> {
     let prefs = crate::config::prefs_snapshot();
     // `allow_model_download` is the wider promise — "pstore makes no network request" — so it
@@ -438,12 +432,6 @@ pub fn lookup(model: &str) -> Option<String> {
     found
 }
 
-/// Without the HTTP client there is no lookup, so an unknown model stays unknown.
-#[cfg(not(feature = "local-llm"))]
-pub fn lookup(_model: &str) -> Option<String> {
-    None
-}
-
 /// Searching the public web for what a model is.
 ///
 /// **This is the one place in pstore where something about the user's setup leaves the
@@ -452,7 +440,6 @@ pub fn lookup(_model: &str) -> Option<String> {
 ///
 /// Two sources, cheapest first. Both are best-effort by nature: an answer that does not arrive,
 /// or does not look like prose, leaves the model unranked rather than ranked on nonsense.
-#[cfg(feature = "local-llm")]
 mod web {
     use std::time::Duration;
 

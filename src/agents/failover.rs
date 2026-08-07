@@ -219,7 +219,12 @@ pub fn run_with_failover(
                     agent_id: candidate.agent_id,
                     model_id: candidate.model_id.clone(),
                     effort: candidate.effort,
-                    text: out.stdout,
+                    // The agent's answer, never the transcript that carried it. An agent
+                    // that reports a final result gets taken at its word — that payload
+                    // excludes the narration it emitted between tool calls. Everything
+                    // else falls back to the concatenated text, which for a plain-text
+                    // agent is simply its stdout.
+                    text: out.result.unwrap_or(out.text),
                     elapsed: out.elapsed,
                     attempts,
                 });
@@ -250,6 +255,7 @@ mod tests {
             timed_out: false,
             cancelled: false,
             elapsed: Duration::from_millis(10),
+            ..Output::default()
         }
     }
 
@@ -262,6 +268,7 @@ mod tests {
             timed_out: false,
             cancelled: false,
             elapsed: Duration::from_millis(5),
+            ..Output::default()
         };
         assert!(classify(&ok).is_none());
     }
@@ -321,6 +328,7 @@ mod tests {
             timed_out: true,
             cancelled: false,
             elapsed: Duration::from_secs(200),
+            ..Output::default()
         };
         assert_eq!(classify(&out), Some(Unavailable::Timeout));
     }
@@ -336,6 +344,7 @@ mod tests {
             timed_out: false,
             cancelled: true,
             elapsed: Duration::from_millis(50),
+            ..Output::default()
         };
         assert_eq!(classify(&out), None);
         assert!(!out.ok(), "a cancelled run is still not a success");
@@ -366,6 +375,7 @@ mod tests {
             timed_out: false,
             cancelled: false,
             elapsed: Duration::from_millis(1),
+            ..Output::default()
         };
         match classify(&out) {
             Some(Unavailable::NotLoggedIn(m)) => assert!(m.contains("please login")),
@@ -467,8 +477,7 @@ mod tests {
             classify(&out),
             out.stderr
         );
-        // The real assertion: our stream-json parsing produced the model's text,
-        // not raw JSON envelopes.
+        // The panel text, which reaches the UI through the channel.
         assert!(
             streamed.contains("PSTORE_OK"),
             "extracted text did not contain the answer.\nextracted: {streamed:?}\nraw stdout: {}",
@@ -477,6 +486,20 @@ mod tests {
         assert!(
             !streamed.contains("\"type\":"),
             "raw JSON leaked into the panel text: {streamed:?}"
+        );
+
+        // The completed run's answer, which is what `plan` reads. Asserting only on the
+        // channel above is what let `plan` ship returning `out.stdout` — the raw
+        // transcript — with the suite fully green.
+        let answer = out.result.clone().unwrap_or_else(|| out.text.clone());
+        assert!(
+            answer.contains("PSTORE_OK"),
+            "the completed run's answer did not contain it.\nanswer: {answer:?}\nraw stdout: {}",
+            out.stdout
+        );
+        assert!(
+            !answer.contains("\"type\":"),
+            "raw JSON leaked into the answer `plan` would print: {answer:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

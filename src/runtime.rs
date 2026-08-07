@@ -253,17 +253,8 @@ pub fn missing_reason(override_path: Option<&str>) -> String {
     }
 }
 
-#[cfg(feature = "local-llm")]
 pub use provision::{download, progress};
 
-/// Provisioning never starts in a build with no local inference, so there is nothing to
-/// report on.
-#[cfg(not(feature = "local-llm"))]
-pub fn progress() -> Phase {
-    Phase::Unknown
-}
-
-#[cfg(feature = "local-llm")]
 mod provision {
     use super::{Asset, BINARY, Origin, PathBuf, Phase, Runtime, asset, managed_dir};
     use std::io::Read;

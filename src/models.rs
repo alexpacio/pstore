@@ -312,21 +312,7 @@ pub fn probe_cache() {
     }
 }
 
-/// Whether this build can run the checkpoint at all.
-///
-/// False in a `--no-default-features` build, which compiles out the Hub client and the
-/// runtime provisioner. The features that need the model — scoring, sanitising, shrink —
-/// are then disabled rather than degraded: there is no second implementation behind them.
-/// The distinction matters to the UI, which should say the support is absent from the
-/// binary rather than imply a download would help.
-pub const LOCAL_INFERENCE: bool = cfg!(feature = "local-llm");
-
-/// What to say when there is nothing to run the weights with.
-pub const NO_LOCAL_INFERENCE: &str =
-    "this build has no local inference support (compiled without the `local-llm` feature)";
-
 /// What the cache says about `c`.
-#[cfg(feature = "local-llm")]
 fn cache_phase(c: &Checkpoint) -> Phase {
     if is_cached(c) {
         Phase::Cached
@@ -335,26 +321,11 @@ fn cache_phase(c: &Checkpoint) -> Phase {
     }
 }
 
-/// Without the Hub client there is nothing to ask, so "not downloaded" would be a claim
-/// this build cannot make — the weights may well be on disk from another build. Report the
-/// thing that is actually true.
-#[cfg(not(feature = "local-llm"))]
-fn cache_phase(_c: &Checkpoint) -> Phase {
-    Phase::Failed(NO_LOCAL_INFERENCE.to_string())
-}
-
 /// Whether every file of `c` is already in the Hugging Face cache.
-#[cfg(feature = "local-llm")]
 pub fn is_cached(c: &Checkpoint) -> bool {
     c.files
         .iter()
         .all(|f| crate::router::hub::cached(c.repo, f).is_ok())
-}
-
-/// No Hub client, so nothing can be confirmed present.
-#[cfg(not(feature = "local-llm"))]
-pub fn is_cached(_c: &Checkpoint) -> bool {
-    false
 }
 
 /// Download every file of `c`, keeping its phase up to date as bytes arrive.
@@ -364,7 +335,6 @@ pub fn is_cached(_c: &Checkpoint) -> bool {
 ///
 /// `cancel` is honoured **mid-transfer**, between one-megabyte chunks, so stopping a 7.17 GB
 /// download is immediate. The partial file is kept and the next attempt resumes from it.
-#[cfg(feature = "local-llm")]
 pub fn download(c: &Checkpoint, cancel: &std::sync::atomic::AtomicBool) -> Result<(), String> {
     use std::sync::atomic::Ordering;
 
@@ -408,14 +378,6 @@ pub fn download(c: &Checkpoint, cancel: &std::sync::atomic::AtomicBool) -> Resul
     }
     set(c.id, Phase::Cached);
     Ok(())
-}
-
-/// Without the `candle` feature there is nothing to run the weights with, so there is
-/// nothing worth downloading either.
-#[cfg(not(feature = "local-llm"))]
-pub fn download(c: &Checkpoint, _cancel: &std::sync::atomic::AtomicBool) -> Result<(), String> {
-    set(c.id, Phase::Failed(NO_LOCAL_INFERENCE.to_string()));
-    Err(NO_LOCAL_INFERENCE.to_string())
 }
 
 #[cfg(test)]

@@ -84,14 +84,11 @@ enum Command {
         json: bool,
     },
 
-    /// Turn a rough prompt into a structured instruction, using an installed agent.
+    /// Turn a rough prompt into a structured instruction, using the local model.
     Plan {
         /// Prompt file, or `-` for stdin.
         #[arg(value_name = "FILE")]
         file: String,
-        /// Use this agent instead of ranking first. An id from `pstore agents`.
-        #[arg(long, value_name = "ID")]
-        agent: Option<String>,
         /// Overwrite the file, taking a version snapshot first.
         #[arg(long, conflicts_with = "json")]
         write: bool,
@@ -237,12 +234,7 @@ pub fn run(args: Args) -> i32 {
         Some(Command::Tui) => tui(config),
         Some(Command::Rank { file, json }) => rank(&config, &file, json),
         Some(Command::Shrink { file, write, json }) => shrink(&config, &file, write, json),
-        Some(Command::Plan {
-            file,
-            agent,
-            write,
-            json,
-        }) => plan(&config, &file, agent.as_deref(), write, json),
+        Some(Command::Plan { file, write, json }) => plan(&config, &file, write, json),
         Some(Command::Sanitize {
             file,
             masked,
@@ -550,7 +542,7 @@ fn shrink(config: &Config, file: &str, write: bool, as_json: bool) -> i32 {
 // plan
 // ---------------------------------------------------------------------------
 
-fn plan(config: &Config, file: &str, agent: Option<&str>, write: bool, as_json: bool) -> i32 {
+fn plan(config: &Config, file: &str, write: bool, as_json: bool) -> i32 {
     let (text, path) = match read_prompt(config, file) {
         Ok(v) => v,
         Err(e) => {
@@ -563,69 +555,19 @@ fn plan(config: &Config, file: &str, agent: Option<&str>, write: bool, as_json: 
         return FAILED;
     }
 
-    let detected = crate::agents::detect::detect_all(&config.dir);
-    // Planning runs on an installed coding agent, not the local checkpoint, so it spends whatever
-    // that agent costs. `--agent` skips the ranking call, which is the slower half of the wait.
-    let ranking = match agent {
-        Some(id) => match pinned(&detected, id) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("pstore: {e}");
-                return FAILED;
-            }
-        },
-        None => {
-            eprintln!("pstore: choosing an agent with the local model…");
-            match crate::router::rank(&text, &detected, &config.prefs.filter) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("pstore: {e}");
-                    return FAILED;
-                }
-            }
-        }
-    };
-    if let Some(best) = ranking.best() {
-        eprintln!(
-            "pstore: planning with {} · {} · effort {}",
-            best.agent_display, best.model_display, best.effort
-        );
-    }
-
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    // Drained on its own thread: the launcher streams into this channel, and nothing reading it
-    // would stall the agent rather than fail it.
-    let drain = std::thread::spawn(move || rx.into_iter().count());
-    let outcome = crate::agents::failover::run_with_failover(
-        &detected,
-        &ranking,
-        &crate::plan::compose(&text),
-        &config.dir,
-        &config.dir,
-        std::time::Duration::from_secs(600),
-        None,
-        &tx,
-    );
-    drop(tx);
-    let _ = drain.join();
-
-    let done = match outcome {
-        Ok(done) => done,
-        Err(failed) => {
-            eprintln!("pstore: {}", failed.summary());
+    eprintln!("pstore: planning with the local model…");
+    let planned = match crate::plan::run(&text) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("pstore: {e}");
             return FAILED;
         }
     };
-    let planned = crate::shrink::clean(&done.text);
     let warnings = crate::plan::warnings(&planned, &text);
 
     if as_json {
         emit(&json!({
             "plan": planned,
-            "agent": done.agent_id,
-            "model": done.model_id,
-            "effort": done.effort.as_str(),
-            "seconds": done.elapsed.as_secs_f32(),
             "warnings": warnings,
         }));
     } else {
@@ -647,58 +589,6 @@ fn plan(config: &Config, file: &str, agent: Option<&str>, write: bool, as_json: 
         }
     }
     0
-}
-
-/// A one-choice ranking naming `id`, for `--agent`.
-///
-/// Built from the registry so the launch parameters are the real ones. The model is the agent's
-/// first, and the effort its lowest: with nothing ranked there is no judgement to honour, and
-/// guessing upwards would spend the user's quota on a decision they did not ask pstore to make.
-fn pinned(detected: &[crate::agents::detect::Detected], id: &str) -> Result<Ranking, String> {
-    let found = detected
-        .iter()
-        .find(|d| d.spec.id == id)
-        .ok_or_else(|| format!("{id} is not installed — see `pstore agents`"))?;
-    if !found.usable() {
-        return Err(format!("{id} is installed but not usable"));
-    }
-    // The agent's own catalog first, for the same reason the ranker prefers it: it is the list
-    // the agent will actually accept, where the registry table is a guess at that list.
-    let discovered = found.models.first().map(crate::agents::catalog::as_spec);
-    let model = discovered.as_ref().or_else(|| found.spec.models.first());
-    let effort = *found
-        .spec
-        .scoreable_efforts()
-        .first()
-        .expect("every agent has an effort");
-
-    Ok(Ranking {
-        choices: vec![crate::router::Choice {
-            agent_id: found.spec.id,
-            agent_display: found.spec.display,
-            model_id: model.map(|m| m.id.into()).unwrap_or_default(),
-            model_display: model
-                .map(|m| m.display.into())
-                .or_else(|| found.configured_model.clone().map(Into::into))
-                .unwrap_or_else(|| "(agent default)".into()),
-            tier: model.map_or(crate::agents::registry::Tier::Mid, |m| m.tier),
-            effort,
-            effort_selectable: found.spec.effort_flag.is_supported(),
-            metered: model.is_some_and(|m| m.metered),
-            relative_latency: 1.0,
-            relative_price: model.map_or(1.0, |m| m.relative_price),
-            quota_weight: model.map_or(1.0, |m| m.quota_weight),
-            // Nothing was ranked, so there is no evidence to show — saying so beats implying a
-            // judgement that never happened.
-            note: String::new(),
-            fact_source: None,
-            fit: 0.0,
-            rationale: "chosen with --agent".into(),
-            row_index: 0,
-        }],
-        considered: 1,
-        ..Ranking::default()
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,40 +1169,5 @@ mod tests {
         assert!(why.contains("absent.md"), "got {why}");
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// `--agent` skips ranking, so the choice it builds has to be launchable: a real registry
-    /// row, with an effort the agent accepts.
-    #[test]
-    fn a_pinned_agent_becomes_a_launchable_choice() {
-        use crate::agents::detect::{Detected, Status};
-
-        let spec = crate::agents::registry::find("claude").unwrap();
-        let detected = vec![Detected {
-            spec,
-            path: PathBuf::from("/usr/bin/claude"),
-            version: None,
-            has_credentials: true,
-            status: Status::Ready,
-            configured_model: None,
-            models: Vec::new(),
-        }];
-
-        let ranking = pinned(&detected, "claude").expect("claude is installed here");
-        let best = ranking.best().expect("one choice");
-        assert_eq!(best.agent_id, "claude");
-        assert!(
-            spec.models.iter().any(|m| m.id == best.model_id),
-            "{} is not a model claude exposes",
-            best.model_id
-        );
-        assert!(
-            spec.scoreable_efforts().contains(&best.effort),
-            "{:?} is not an effort claude accepts",
-            best.effort
-        );
-
-        // An agent that is not there has to say so rather than producing an unlaunchable pick.
-        assert!(pinned(&detected, "codex").is_err());
     }
 }

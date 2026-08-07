@@ -167,6 +167,12 @@ pub struct Task {
     pub temperature: f32,
     pub top_p: f32,
     pub top_k: u32,
+    /// Penalty applied to tokens already generated. `1.0` is off.
+    ///
+    /// Only meaningful where the model *composes* a list. A schema that permits ten steps
+    /// is a shape the model can satisfy by writing one step and then nine copies of it, and
+    /// that is exactly what a compressed checkpoint does when nothing discourages it.
+    pub repeat_penalty: f32,
 }
 
 impl Task {
@@ -181,6 +187,30 @@ impl Task {
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
+            repeat_penalty: 1.0,
+        }
+    }
+
+    /// A call that *writes* something: schema-constrained, but sampled and penalised.
+    ///
+    /// Between [`Self::extraction`] and [`Self::judgement`], and needed because the two
+    /// existing profiles each get half of this wrong. Extraction is greedy, which is right
+    /// when the answer is mostly copied out of the input and catastrophic when it is not:
+    /// asked for ten steps at temperature zero, the checkpoint writes step one and then
+    /// nine verbatim copies of it. Judgement samples correctly but is built on a hand-
+    /// written grammar so it can open a `<think>` block, and there is nothing here worth
+    /// thinking about — the fields are the structure.
+    ///
+    /// So: the schema, the checkpoint's published thinking-mode sampling, and a repetition
+    /// penalty, which is the part that actually stops the loop.
+    pub fn composition(schema: Value, max_output: usize) -> Self {
+        Task {
+            constrain: Constrain::Schema(schema),
+            max_output,
+            temperature: 0.7,
+            top_p: 0.95,
+            top_k: 20,
+            repeat_penalty: 1.15,
         }
     }
 
@@ -196,6 +226,7 @@ impl Task {
             temperature: 0.7,
             top_p: 0.95,
             top_k: 20,
+            repeat_penalty: 1.0,
         }
     }
 }
@@ -1467,6 +1498,161 @@ impl ShrinkPass {
             .map(crate::shrink::clean)
             .ok_or_else(|| "the model's reply had no rewritten prompt".to_string())
     }
+}
+
+/// Room for a plan: several times the request, because planning *adds* structure.
+///
+/// The opposite budget to a shrink, and the floor matters far more than the slope — the
+/// shortest requests are the ones that expand the most. A one-line request still has to
+/// come back as six fields with steps and acceptance criteria, which is a thousand tokens
+/// before the request itself contributes anything.
+///
+/// Undersizing this does not produce a shorter plan. The reply is a single JSON object, so
+/// running out mid-array yields no object at all — the failure is "truncated JSON in the
+/// model's reply", after the whole generation has been paid for.
+/// The floor covers the schema's own worst case — 34 entries of 240 characters plus the
+/// JSON scaffolding, about 3 000 tokens — so a plan can always be finished, and the slope
+/// is what a longer request adds on top by quoting more of itself back.
+fn plan_output_tokens_for(chars: usize) -> usize {
+    let tokens = (chars as f32 / CHARS_PER_TOKEN).ceil() as usize;
+    (tokens + 3072).clamp(3072, 4608)
+}
+
+/// Turn a rough request into an agent-ready instruction, on the local checkpoint.
+///
+/// One call, not a chunked pass: a plan is a single structure over the whole request, and
+/// planning halves of it separately would produce two objectives and two sets of
+/// acceptance criteria. That caps the request at the context ceiling — see
+/// [`crate::plan::run`], which reports an over-long prompt rather than letting llama.cpp
+/// silently drop its tail.
+///
+/// Greedy, like the shrink: the parts that matter most are paths, identifiers and
+/// commands copied out of the request, and there is nothing for temperature to diversify
+/// but the copy.
+pub fn plan(text: &str) -> Result<String, String> {
+    let instruction = crate::plan::INSTRUCTION.len();
+    let output = plan_output_tokens_for(text.len());
+    let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
+    let ctx = fit_context_for(&[(instruction + text.len(), output)], ceiling);
+
+    let session = Session::open(ctx)?;
+    // One field per section, rather than one string containing the whole plan. Asked for the
+    // latter, this checkpoint fills it with an account of the plan it is about to write —
+    // the schema is the only thing that reliably stops that, because it leaves nowhere to
+    // put the preamble. `minItems` on the two load-bearing lists is the same idea: a plan
+    // with no steps and no acceptance criteria is not a short plan, it is not a plan.
+    // Bounded on purpose, and this is load-bearing rather than tidiness. An unbounded array
+    // of unbounded strings is a grammar the model can stay inside forever: it will keep
+    // adding plausible constraints until the token budget runs out, and because the reply is
+    // one JSON object, running out means there is no object at all — the whole generation is
+    // paid for and thrown away as "truncated JSON". The caps are what make the worst case
+    // finite, and `plan_output_tokens_for` is sized to cover it.
+    let entry = json!({"type": "string", "minLength": 1, "maxLength": 240});
+    let list = json!({"type": "array", "maxItems": 6, "items": entry});
+    let steps = json!({"type": "array", "minItems": 1, "maxItems": 10, "items": entry});
+    let criteria = json!({"type": "array", "minItems": 1, "maxItems": 6, "items": entry});
+    let task = Task::composition(
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["objective", "context", "steps", "constraints", "done_when",
+                         "open_questions"],
+            "properties": {
+                "objective": {"type": "string", "minLength": 1, "maxLength": 240},
+                "context": list,
+                "steps": steps,
+                "constraints": list,
+                "done_when": criteria,
+                "open_questions": list,
+            }
+        }),
+        output,
+    );
+
+    let reply = session.run(&task, &crate::plan::compose(text))?;
+    let objective = reply
+        .get("objective")
+        .and_then(Value::as_str)
+        .ok_or("the model's reply had no objective")?;
+    let strings = |key: &str| -> Vec<String> {
+        reply
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let sections: Vec<(&str, Vec<String>)> = crate::plan::FIELDS
+        .iter()
+        .skip(1)
+        .map(|(key, heading)| (*heading, strings(key)))
+        .collect();
+    Ok(crate::plan::render(objective, &sections))
+}
+
+/// Answer a hint on the local checkpoint.
+///
+/// Composed by [`crate::hints::compose`], same as the agent path, so the two differ in who
+/// answers and nothing else.
+///
+/// Sampled rather than greedy, and for the reason [`Task::composition`] exists: an answer
+/// is written, not copied, and at temperature zero this checkpoint restates its first
+/// sentence until the budget runs out.
+pub fn hint(prompt: &str) -> Result<String, String> {
+    let output = HINT_OUTPUT_TOKENS;
+    let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
+    let session = Session::open(fit_context(prompt, output, ceiling))?;
+    let task = Task::composition(
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["answer"],
+            "properties": {"answer": {"type": "string", "minLength": 1, "maxLength": 4000}}
+        }),
+        output,
+    );
+    session
+        .run(&task, prompt)?
+        .get("answer")
+        .and_then(Value::as_str)
+        .map(crate::shrink::clean)
+        .ok_or_else(|| "the model's reply had no answer".to_string())
+}
+
+/// Room for a hint. Bounded because a hint is read in a side panel mid-edit: an answer
+/// longer than this is one the developer will not read, whatever it says.
+const HINT_OUTPUT_TOKENS: usize = 1536;
+
+/// Largest request [`plan`] can take without the context ceiling truncating it.
+///
+/// Found by search rather than by solving the budget by hand: [`plan_output_tokens_for`]
+/// is clamped at both ends, so the relationship between input size and window size is
+/// piecewise, and a closed form for it would be a second copy of the sizing rule free to
+/// drift from the first. This asks the real functions instead.
+pub fn plan_input_chars() -> usize {
+    let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
+    let instruction = crate::plan::INSTRUCTION.len();
+    let fits = |chars: usize| {
+        // `fit_context_for` clamps its answer to the ceiling, so a request that overruns
+        // comes back looking like an exact fit. Compare against the unclamped need.
+        let output = plan_output_tokens_for(chars);
+        let prompt_tokens = ((instruction + chars) as f32 / CHARS_PER_TOKEN).ceil() as usize;
+        prompt_tokens + prompt_tokens / 4 + output + 256 <= ceiling
+    };
+
+    if !fits(0) {
+        return 0;
+    }
+    let (mut lo, mut hi) = (0usize, 1usize << 20);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) { lo = mid } else { hi = mid - 1 }
+    }
+    lo
 }
 
 // ---------------------------------------------------------------------------

@@ -288,19 +288,12 @@ pub fn sanitize(text: &str) -> Result<Scan, String> {
     })
 }
 
-#[cfg(feature = "local-llm")]
 fn model_pass(text: &str) -> Result<Vec<Finding>, String> {
     crate::router::llm::detect_pii(text)
 }
 
-#[cfg(not(feature = "local-llm"))]
-fn model_pass(_text: &str) -> Result<Vec<Finding>, String> {
-    Err(crate::models::NO_LOCAL_INFERENCE.to_string())
-}
-
 /// Re-check the model on the next pass.
 pub fn reset() {
-    #[cfg(feature = "local-llm")]
     crate::router::llm::reset();
 }
 
@@ -479,16 +472,5 @@ mod tests {
     #[test]
     fn nothing_to_scan_is_not_a_model_call() {
         assert!(segments("", CHUNK_CHARS).is_empty());
-    }
-
-    /// A failed scan must not look like a clean one. `sanitize` returns `Err`, never an
-    /// empty plan — "no personal data found" is a claim, and making it without having
-    /// looked is how personal data reaches an agent.
-    #[test]
-    #[cfg(not(feature = "local-llm"))]
-    fn a_failed_scan_is_not_an_empty_plan() {
-        let why = sanitize("Contact Mario Rossi at mario@example.com")
-            .expect_err("no local inference should mean no scan");
-        assert!(why.contains("local-llm"), "got {why:?}");
     }
 }

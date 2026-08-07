@@ -223,6 +223,12 @@ impl Session {
             body["top_p"] = json!(task.top_p);
             body["top_k"] = json!(task.top_k);
         }
+        if task.repeat_penalty > 1.0 {
+            body["repeat_penalty"] = json!(task.repeat_penalty);
+            // The default window is 64 tokens, which is shorter than two entries of a list.
+            // A penalty that cannot see the previous item cannot notice it is being copied.
+            body["repeat_last_n"] = json!(1024);
+        }
         match &task.constrain {
             Constrain::Schema(schema) => body["json_schema"] = (*schema).clone(),
             Constrain::Grammar(gbnf) => body["grammar"] = json!(gbnf),

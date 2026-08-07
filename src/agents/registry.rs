@@ -193,6 +193,23 @@ pub struct AgentSpec {
     pub efforts: &'static [Effort],
     /// Extra arguments for the headless path (streaming/quiet flags).
     pub headless_extra: &'static [&'static str],
+    /// Arguments that put the agent in a mode where it cannot modify the working tree,
+    /// appended after [`Self::headless_extra`] for runs that only produce text.
+    ///
+    /// Additive rather than a replacement: the flags in `headless_extra` are what makes the
+    /// output parseable at all (Claude Code's `--output-format stream-json`), and a
+    /// read-only run still has to be read.
+    ///
+    /// `plan` and `hint` ask an agent to *write about* the code, not to change it. Without
+    /// this they run as ordinary coding agents pointed at the user's repository: aider's
+    /// headless flags include `--yes`, so asking it to plan lets it start editing, and a
+    /// tool-using agent narrates its way through the repo, which lands in the answer.
+    /// `plan.rs`'s "Do not perform the work" is a request to the model; this is the part
+    /// the process actually enforces.
+    ///
+    /// Empty means the CLI offers no such mode, which is the pre-existing behaviour rather
+    /// than a failure — the run still happens.
+    pub readonly_extra: &'static [&'static str],
     /// How the prompt reaches the process in headless mode.
     pub prompt_via: PromptVia,
     /// Arguments for an interactive session, before the prompt.
@@ -418,6 +435,12 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::Flag("--effort"),
         efforts: CLAUDE_EFFORTS,
         headless_extra: &["--output-format", "stream-json", "--verbose"],
+        // `--disallowedTools` is variadic, so it must use the `=` form: written as two
+        // arguments it swallows the prompt that follows it and the run dies with "Input
+        // must be provided". `--permission-mode plan` also blocks the writes, but it makes
+        // the model answer *about* plan mode and drop a file in `~/.claude/plans`, neither
+        // of which belongs in a prompt rewrite. Bash is denied because it can write.
+        readonly_extra: &["--disallowedTools=Write,Edit,NotebookEdit,Bash"],
         prompt_via: PromptVia::Arg,
         interactive: &[],
         creds: &[".claude.json", ".claude"],
@@ -434,6 +457,7 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::ConfigKv("-c", "model_reasoning_effort"),
         efforts: CODEX_EFFORTS,
         headless_extra: &["--skip-git-repo-check"],
+        readonly_extra: &["--sandbox=read-only"],
         prompt_via: PromptVia::Arg,
         interactive: &[],
         creds: &[".codex/auth.json", ".codex"],
@@ -451,6 +475,7 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::Unsupported,
         efforts: &[],
         headless_extra: &[],
+        readonly_extra: &[],
         prompt_via: PromptVia::Arg,
         interactive: &[],
         creds: &[".gemini"],
@@ -467,6 +492,7 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::Unsupported,
         efforts: &[],
         headless_extra: &[],
+        readonly_extra: &[],
         prompt_via: PromptVia::Arg,
         interactive: &[],
         creds: &[".cursor"],
@@ -484,6 +510,7 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::Unsupported,
         efforts: &[],
         headless_extra: &["-q"],
+        readonly_extra: &[],
         prompt_via: PromptVia::Stdin,
         interactive: &[],
         creds: &[".config/crush/crush.json"],
@@ -500,6 +527,7 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::Unsupported,
         efforts: &[],
         headless_extra: &["--no-auto-commits", "--yes"],
+        readonly_extra: &["--chat-mode=ask"],
         prompt_via: PromptVia::Arg,
         interactive: &[],
         creds: &[".aider.conf.yml"],
@@ -516,6 +544,7 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::Unsupported,
         efforts: &[],
         headless_extra: &[],
+        readonly_extra: &[],
         prompt_via: PromptVia::Arg,
         interactive: &["session"],
         creds: &[".config/goose/config.yaml"],
@@ -532,6 +561,7 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::Unsupported,
         efforts: &[],
         headless_extra: &[],
+        readonly_extra: &[],
         prompt_via: PromptVia::Arg,
         interactive: &[],
         creds: &[".qwen"],
@@ -548,6 +578,7 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::Unsupported,
         efforts: &[],
         headless_extra: &[],
+        readonly_extra: &[],
         prompt_via: PromptVia::Arg,
         interactive: &[],
         creds: &[".config/github-copilot"],
@@ -564,6 +595,7 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::Unsupported,
         efforts: &[],
         headless_extra: &[],
+        readonly_extra: &[],
         prompt_via: PromptVia::Arg,
         interactive: &[],
         creds: &[".factory"],
@@ -580,6 +612,7 @@ pub const AGENTS: &[AgentSpec] = &[
         effort_flag: EffortFlag::Unsupported,
         efforts: &[],
         headless_extra: &[],
+        readonly_extra: &[],
         prompt_via: PromptVia::Stdin,
         interactive: &[],
         creds: &[".config/amp"],

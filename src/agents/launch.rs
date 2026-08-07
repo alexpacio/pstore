@@ -12,12 +12,29 @@ use std::time::{Duration, Instant};
 use super::registry::{AgentSpec, Effort, PromptVia};
 
 /// Result of a completed headless run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Output {
     /// Process exit code, or `None` if it was killed.
     pub code: Option<i32>,
-    /// Captured stdout.
+    /// Captured stdout, verbatim.
+    ///
+    /// For an agent speaking `stream-json` this is the JSON transcript, not anything a
+    /// human would read. It stays raw because [`crate::agents::failover::classify`] greps
+    /// it for quota and authentication strings that only appear inside the envelopes —
+    /// use [`Self::text`] or [`Self::result`] for anything user-facing.
     pub stdout: String,
+    /// The assistant text pulled out of `stdout`, concatenated in arrival order.
+    ///
+    /// Everything the agent said, which for a tool-using agent includes the narration
+    /// between tool calls. [`Self::result`] is the better choice when it is populated.
+    pub text: String,
+    /// The agent's final answer, when it reports one as a distinct event.
+    ///
+    /// Claude Code closes a `stream-json` run with `{"type":"result","result":"…"}`. That
+    /// payload is the answer *alone*, with none of the narration that [`Self::text`]
+    /// accumulates, which is what a one-shot transformation like `plan` wants. `None` for
+    /// agents that just print to stdout.
+    pub result: Option<String>,
     /// Captured stderr.
     pub stderr: String,
     /// Whether the run was killed for exceeding its time budget.
@@ -49,6 +66,12 @@ pub fn raised(cancel: Option<&Cancel>) -> bool {
 /// an empty model id or an unsupported effort is silently omitted rather than passed
 /// as a bogus flag.
 ///
+/// Every headless run is also a read-only one, so [`AgentSpec::readonly_extra`] is always
+/// applied. That is the whole distinction between pstore's two ways of running an agent:
+/// headless produces text *about* the code, and the interactive handoff
+/// ([`terminal_command`]) is the one that changes it. An agent with no read-only mode is
+/// launched unchanged.
+///
 /// Returns `None` for the prompt when it should go to stdin instead.
 pub fn headless_args(
     spec: &AgentSpec,
@@ -67,6 +90,7 @@ pub fn headless_args(
         args.extend(spec.effort_flag.args(e));
     }
     args.extend(spec.headless_extra.iter().map(|s| s.to_string()));
+    args.extend(spec.readonly_extra.iter().map(|s| s.to_string()));
 
     match spec.prompt_via {
         PromptVia::Arg => {
@@ -129,9 +153,19 @@ pub fn run_capture(
 
     let (status, timed_out, cancelled) = wait_for(&mut child, started, timeout, None)?;
 
+    // Same per-line fold as the streaming path, so both agree on what the agent said.
+    let stdout = out_handle.join().unwrap_or_default();
+    let mut text = String::new();
+    let mut result = None;
+    for line in stdout.lines() {
+        absorb_line(line, &mut text, &mut result);
+    }
+
     Ok(Output {
         code: status.and_then(|s| s.code()),
-        stdout: out_handle.join().unwrap_or_default(),
+        stdout,
+        text,
+        result,
         stderr: err_handle.join().unwrap_or_default(),
         timed_out,
         cancelled,
@@ -208,18 +242,18 @@ pub fn run_streaming(
     let out_tx = tx.clone();
     let out_handle = std::thread::spawn(move || {
         let mut collected = String::new();
+        let mut text = String::new();
+        let mut result = None;
         if let Some(p) = stdout {
             for line in BufReader::new(p).lines().map_while(Result::ok) {
                 collected.push_str(&line);
                 collected.push('\n');
-                if let Some(text) = extract_text(&line)
-                    && !text.is_empty()
-                {
-                    let _ = out_tx.send(text);
+                if let Some(chunk) = absorb_line(&line, &mut text, &mut result) {
+                    let _ = out_tx.send(chunk);
                 }
             }
         }
-        collected
+        (collected, text, result)
     });
 
     // stderr is collected but never forwarded: it is read for failure classification, not shown
@@ -238,9 +272,13 @@ pub fn run_streaming(
 
     let (status, timed_out, cancelled) = wait_for(&mut child, started, timeout, cancel)?;
 
+    let (stdout, text, result) = out_handle.join().unwrap_or_default();
+
     Ok(Output {
         code: status.and_then(|s| s.code()),
-        stdout: out_handle.join().unwrap_or_default(),
+        stdout,
+        text,
+        result,
         stderr: err_handle.join().unwrap_or_default(),
         timed_out,
         cancelled,
@@ -297,6 +335,61 @@ fn extract_text(line: &str) -> Option<String> {
     }
     // A structural event (init, tool_use, result) with no text to show.
     None
+}
+
+/// Pull the *final answer* out of one stdout line, if this line is the run's result event.
+///
+/// Claude Code ends a `stream-json` run with
+/// `{"type":"result","subtype":"success","result":"…"}`. That is deliberately not part of
+/// [`extract_text`]: the value duplicates text already streamed, so forwarding it to the
+/// panel would print the answer twice. It is worth capturing separately because it is the
+/// answer *without* the narration a tool-using agent emits between tool calls — for
+/// `plan`, that narration is the difference between a pasteable instruction and a
+/// transcript.
+///
+/// An error result is not an answer, so only `success` is taken.
+fn extract_result(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let v = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("result") {
+        return None;
+    }
+    if v.get("subtype")
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s != "success")
+    {
+        return None;
+    }
+    let text = v.get("result").and_then(|r| r.as_str())?;
+    (!text.trim().is_empty()).then(|| text.to_string())
+}
+
+/// Fold one stdout line into the accumulated text and result of a run.
+///
+/// Shared so [`run_capture`] and [`run_streaming`] cannot drift into disagreeing about
+/// what an agent said — the bug that made `plan` return raw JSON was exactly one of the
+/// two paths keeping the parsed text and the other keeping the envelopes.
+fn absorb_line(line: &str, text: &mut String, result: &mut Option<String>) -> Option<String> {
+    if let Some(r) = extract_result(line) {
+        *result = Some(r);
+        return None;
+    }
+    let chunk = extract_text(line)?;
+    if chunk.is_empty() {
+        return None;
+    }
+    text.push_str(&chunk);
+    // A passthrough line is a whole line of a plain-text agent's output, and the line
+    // break is part of what it said — a plan's own list items depend on it. Text lifted
+    // out of a JSON envelope is a fragment of one message and must not gain breaks it
+    // never had. `extract_text` returns the line itself in exactly the passthrough case.
+    if chunk == line {
+        text.push('\n');
+    }
+    Some(chunk)
 }
 
 /// How to open an interactive agent session in a new OS window.
@@ -459,6 +552,128 @@ mod tests {
             "hello",
             "prompt is the final argument"
         );
+    }
+
+    /// The transcript is not the answer.
+    ///
+    /// This is the bug `pstore plan` shipped with: the raw `stream-json` lines were kept
+    /// as the run's output and the parsed text was only ever sent to the streaming
+    /// channel, so `plan` — the one feature reading the completed run rather than the
+    /// channel — printed JSON envelopes at the user. Fold a realistic Claude Code
+    /// transcript, narration and tool call included, and assert on what a caller sees.
+    #[test]
+    fn a_stream_json_transcript_yields_the_answer_not_the_envelopes() {
+        let transcript = [
+            r#"{"type":"system","subtype":"init","session_id":"abc"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me look at the retry logic."}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"fn retry() {}"}]}}"#,
+            r#"{"type":"result","subtype":"success","result":"**Objective**\nRetry count is configurable."}"#,
+        ];
+
+        let mut text = String::new();
+        let mut result = None;
+        for line in transcript {
+            absorb_line(line, &mut text, &mut result);
+        }
+
+        // What `Completed.text` is built from.
+        let answer = result.clone().unwrap_or_else(|| text.clone());
+        assert_eq!(answer, "**Objective**\nRetry count is configurable.");
+        assert!(!answer.contains("\"type\":"), "JSON leaked: {answer:?}");
+        assert!(
+            !answer.contains("Let me look"),
+            "narration between tool calls leaked into the answer: {answer:?}"
+        );
+
+        // The narration is still available for the live panel — it is just not the answer.
+        assert_eq!(text, "Let me look at the retry logic.");
+    }
+
+    /// A plain-text agent has no result event, so the concatenated text is the answer —
+    /// and its line structure is part of what it said.
+    #[test]
+    fn a_plain_text_agent_keeps_its_line_breaks() {
+        let mut text = String::new();
+        let mut result = None;
+        for line in [
+            "**Objective**",
+            "Ship it.",
+            "",
+            "**Steps**",
+            "1. Do the thing.",
+        ] {
+            absorb_line(line, &mut text, &mut result);
+        }
+        assert_eq!(result, None);
+        assert_eq!(
+            text,
+            "**Objective**\nShip it.\n**Steps**\n1. Do the thing.\n"
+        );
+    }
+
+    /// An error result is not an answer; falling back to the narration beats reporting
+    /// the failure message as though it were the plan.
+    #[test]
+    fn an_error_result_is_not_taken_as_the_answer() {
+        let mut text = String::new();
+        let mut result = None;
+        absorb_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}"#,
+            &mut text,
+            &mut result,
+        );
+        absorb_line(
+            r#"{"type":"result","subtype":"error_max_turns","result":"hit the turn limit"}"#,
+            &mut text,
+            &mut result,
+        );
+        assert_eq!(result, None);
+        assert_eq!(text, "partial");
+    }
+
+    /// Planning must not be able to perform the work it is describing.
+    #[test]
+    fn headless_runs_ask_for_the_agents_read_only_mode() {
+        let claude = registry::find("claude").unwrap();
+        let (args, _) = headless_args(claude, Some("haiku"), None, "plan this");
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("--disallowedTools=") && a.contains("Write")),
+            "got {args:?}"
+        );
+
+        // Aider's headless flags include `--yes`, which auto-approves edits.
+        let aider = registry::find("aider").unwrap();
+        let (args, _) = headless_args(aider, None, None, "plan this");
+        assert!(args.iter().any(|a| a == "--chat-mode=ask"), "got {args:?}");
+    }
+
+    /// A read-only flag that takes a list is variadic in at least one agent's CLI
+    /// (`claude --disallowedTools`), and pstore appends the prompt as the last positional
+    /// argument. Written as a separate flag and value, such a flag consumes the prompt and
+    /// the run dies with "Input must be provided". The `=` form is what prevents that, so
+    /// no read-only argument may be a bare flag expecting a following value.
+    #[test]
+    fn read_only_flags_cannot_swallow_the_prompt() {
+        for spec in registry::AGENTS {
+            for arg in spec.readonly_extra {
+                assert!(
+                    arg.contains('='),
+                    "{}: read-only argument {arg:?} must bind its value with `=`",
+                    spec.id
+                );
+            }
+            if spec.prompt_via == PromptVia::Arg {
+                let (args, _) = headless_args(spec, None, None, "THE PROMPT");
+                assert_eq!(
+                    args.last().map(String::as_str),
+                    Some("THE PROMPT"),
+                    "{}: prompt is no longer the final argument: {args:?}",
+                    spec.id
+                );
+            }
+        }
     }
 
     #[test]

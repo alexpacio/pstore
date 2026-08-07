@@ -74,6 +74,8 @@ pub enum Event {
     Scanned { id: JobId, scan: Box<pii::Scan> },
     /// A shrink pass finished; carries the whole rewritten prompt.
     Shrunk { id: JobId, text: String },
+    /// A planning pass finished; carries the whole rewritten prompt.
+    Planned { id: JobId, text: String },
     /// A job with no payload of its own finished; `note` goes to the status bar.
     ///
     /// Model downloads report through here: their detail is on the [`crate::models`]
@@ -96,6 +98,7 @@ impl Event {
             | Event::Detected { id, .. }
             | Event::Scanned { id, .. }
             | Event::Shrunk { id, .. }
+            | Event::Planned { id, .. }
             | Event::Done { id, .. }
             | Event::Cancelled { id, .. } => *id,
         }
@@ -111,6 +114,7 @@ impl Event {
                 | Event::Detected { .. }
                 | Event::Scanned { .. }
                 | Event::Shrunk { .. }
+                | Event::Planned { .. }
                 | Event::Done { .. }
                 | Event::Cancelled { .. }
         )
@@ -419,6 +423,75 @@ impl Runner {
         )
     }
 
+    /// Answer a hint with the local model.
+    ///
+    /// The local path has nothing to stream — one call, one JSON object — so the answer
+    /// arrives as a single [`Event::Chunk`], which is what the panel already accumulates.
+    /// The agent path's incremental chunks and this one land in the same place.
+    pub fn hint_local(&self, prompt: String) -> Handle {
+        self.spawn(Kind::Hint, "hint".into(), move |id, tx, cancel| {
+            let outcome = crate::router::llm::hint(&prompt);
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(Event::Cancelled {
+                    id,
+                    kind: Kind::Hint,
+                });
+                return;
+            }
+            match outcome {
+                Ok(text) => {
+                    let _ = tx.send(Event::Chunk { id, text });
+                    let _ = tx.send(Event::Done {
+                        id,
+                        kind: Kind::Hint,
+                        note: "hint ready".into(),
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(Event::Failed {
+                        id,
+                        kind: Kind::Hint,
+                        error,
+                    });
+                }
+            }
+        })
+    }
+
+    /// Turn `text` into an agent-ready instruction with the local model.
+    ///
+    /// One model call rather than the shrink's several, so there is no point between steps
+    /// at which cancellation can land — it is checked once, after the fact, because a stop
+    /// pressed during the generation still means the user does not want the answer.
+    pub fn plan(&self, text: String) -> Handle {
+        self.spawn(
+            Kind::Plan,
+            "planning the prompt".into(),
+            move |id, tx, cancel| {
+                let outcome = crate::plan::run(&text);
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(Event::Cancelled {
+                        id,
+                        kind: Kind::Plan,
+                    });
+                    return;
+                }
+                match outcome {
+                    Ok(text) => {
+                        let _ = tx.send(Event::Planned { id, text });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Event::Failed {
+                            id,
+                            kind: Kind::Plan,
+                            error,
+                        });
+                    }
+                }
+            },
+        )
+    }
+
     /// Send `prompt` to the ranked agents, streaming output, failing over on error.
     // Plumbing: every argument is a distinct, unrelated input (program, argv,
     // stdin, cwd, timeout, cancellation, sink). Bundling them into a struct
@@ -494,7 +567,6 @@ impl Runner {
 ///
 /// Nothing to do when it is already resolvable — from an override, a system install, a
 /// previous download, or `PATH`.
-#[cfg(feature = "local-llm")]
 fn provision_runtime(tx: &Sender<Event>, id: JobId, cancel: &AtomicBool) -> Result<(), String> {
     let prefs = crate::config::prefs_snapshot();
     if crate::runtime::locate(prefs.llama_path.as_deref()).is_some() {
@@ -512,12 +584,6 @@ fn provision_runtime(tx: &Sender<Event>, id: JobId, cancel: &AtomicBool) -> Resu
     crate::runtime::download(cancel)
         .map(|_| ())
         .map_err(|e| format!("llama-cli: {e}"))
-}
-
-/// Without local inference there is no runtime to provision.
-#[cfg(not(feature = "local-llm"))]
-fn provision_runtime(_tx: &Sender<Event>, _id: JobId, _cancel: &AtomicBool) -> Result<(), String> {
-    Err(crate::models::NO_LOCAL_INFERENCE.to_string())
 }
 
 /// Check whichever of `targets` are on disk, returning one message per failure.
@@ -793,7 +859,6 @@ mod tests {
     ///
     /// Only meaningful with `candle`: without it there is no download path to cancel.
     #[test]
-    #[cfg(feature = "local-llm")]
     fn a_raised_cancel_flag_stops_a_download_before_it_starts() {
         let cancel = Arc::new(AtomicBool::new(true));
         let started = std::time::Instant::now();
