@@ -2,8 +2,10 @@
 name = "pstore"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Versioned prompt editor that scores the coding-agent models and effort levels installed on your machine"
 license = "Apache-2.0"
+repository = "https://github.com/alexpacio/pstore"
 
 # One crate, three front ends. The library is the whole of pstore except its presentation —
 # see src/lib.rs — and the binary is a command-line dispatcher over it.
