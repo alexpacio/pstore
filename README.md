@@ -1,6 +1,6 @@
 # pstore
 
-**A native GUI that makes prompt authoring a first-class activity** — versioned markdown files, inline LLM hints, automatic difficulty/capability scoring to pick the cheapest adequate model, and one-keystroke handoff to a real agent session.
+**A versioned editor for the prompts you hand to coding agents** — write and revise them like real artifacts, not scratch text. Get inline hints, automatic difficulty/capability scoring to pick the cheapest adequate model, and one-keystroke handoff to a real agent session, from a native window, a terminal UI, or the command line.
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust)](https://rust-lang.org)
@@ -26,6 +26,74 @@
 | **Plain files** | Prompts are `.md` in your project. Sidecar in `.pstore/`. Works with git, grep, any editor. |
 
 Nothing is applied unreviewed: shrink, plan and sanitize all arrive as a diff, and accepting is one undo step with the previous text already in version history.
+
+---
+
+## The local model
+
+Routing, planning, shrinking and sanitizing all run on one local checkpoint:
+[**Bonsai 27B**](https://huggingface.co/prism-ml/Bonsai-27B-gguf), from
+[PrismML](https://docs.prismml.com/models/bonsai-27b) — a 27B model (derived from Qwen3.6-27B)
+compressed to binary or ternary weights rather than trained small from the start. Ordinary
+quantization below ~4 bits/weight causes a real model to keep sounding fluent while its
+reasoning, tool calls and multi-step plans quietly stop working — exactly the behaviors pstore's
+own routing, planning and shrinking depend on. Per PrismML's published benchmarks, Bonsai's
+representation holds up far below that line:
+
+| Build | Bits/weight | Size | Benchmark score vs. FP16 |
+| --- | --- | --- | --- |
+| **1-bit** (binary, pstore's default) | 1.125 | ~3.9 GB | 89.5% |
+| **Ternary** | 1.71 | ~5.9–7.2 GB on disk | 94.6% |
+
+**Why 1-bit is the default:** it is the smaller download and the smaller memory footprint, and
+routing accuracy on pstore's own workload holds up well at that size once the prompt is asked the
+right way — see the model's own docs for how it's built. Pick **ternary** instead in the Models
+window or `.pstore/config.json` (`"local_model": "ternary"`) if your machine has memory to spare
+and you want a longer, more separated shortlist.
+
+Weights are cached in the shared Hugging Face location (`~/.cache/huggingface`) and run as a
+short-lived subprocess — nothing stays resident between operations, and nothing about your
+prompt leaves the machine.
+
+> We could not find any documentation from PrismML describing Bonsai's training process as
+> reinforcement learning against Claude or GPT — their published whitepaper attributes the
+> compression to a proprietary weight-transformation method applied to the pretrained Qwen3.6-27B,
+> and the only outside model named anywhere in it is Gemini 3 Flash, used solely as a benchmark
+> judge. If you have a source for the RL claim, it's worth checking before it goes in writing.
+
+### Memory and context sizing
+
+pstore never loads the checkpoint at its native 262K-token context — that would cost several
+gigabytes of KV cache for prompts that are, in every one of pstore's own uses, a few hundred to a
+few thousand tokens. Instead, each operation sizes its own context window from what it is actually
+about to send:
+
+```text
+ctx = round_up(prompt_tokens × 1.25 + max_output_tokens + 256, step), capped at model_context_ceiling
+```
+
+`model_context_ceiling` defaults to 8192 and is a hard cap, not a target — a ranking call
+typically fits in ~1,000–2,000 tokens. The 25% headroom is deliberate: pstore would rather waste a
+few megabytes of context than silently truncate a prompt, which is how you'd end up sanitizing
+text the model never actually saw.
+
+PrismML's own measurements put peak memory (weights + KV cache + activations, FP16 KV, no
+compression) at:
+
+| Build | Weights only | +4K context | +10K context | +100K context |
+| --- | --- | --- | --- | --- |
+| 1-bit | ~3.8 GB | ~5.2 GB | ~5.6 GB | ~11.6 GB |
+| Ternary | ~7.2 GB | ~8.4 GB | ~8.7 GB | ~14.7 GB |
+
+With the 4-bit KV cache pstore actually runs with, that context-dependent growth shrinks roughly
+4×: PrismML report the 1-bit build's 100K-token peak dropping to ~6.8 GB and the ternary build's
+to ~10.1 GB, with the full 262K-token window fitting in ~9.4 GB and ~12.8 GB respectively.
+
+In practice pstore's own calls stay far below all of this — the context-sizing formula above caps
+a ranking or a shrink at `model_context_ceiling` (8,192 tokens by default), so expect peak memory
+close to the "weights only" column, not the wide-context end of it. The larger figures matter if
+you raise `model_context_ceiling` yourself or point `llama_path` at your own PrismML build and run
+it outside pstore.
 
 ---
 
