@@ -50,6 +50,22 @@ pub struct PlanProposal {
     pub diff: String,
 }
 
+/// A pending root cause analysis awaiting approval.
+///
+/// Separate from [`PlanProposal`] despite the same three fields, because the two are not the
+/// same kind of thing to a reader: a plan replaces the prompt with what to do next, and a
+/// postmortem replaces incident notes with the write-up of them. The review windows say
+/// different things for that reason, and merging the state would invite merging those too.
+#[derive(Debug, Clone)]
+pub struct RcaProposal {
+    /// The proposed postmortem.
+    pub after: String,
+    /// Problems detected in the analysis — dropped times, dropped paths, one-note actions.
+    pub warnings: Vec<String>,
+    /// Unified diff for display.
+    pub diff: String,
+}
+
 /// What a shrink pass was asked to compress.
 ///
 /// Captured when the pass starts rather than read back when it finishes: a shrink is
@@ -149,6 +165,10 @@ pub struct App {
     pub plan: Option<PlanProposal>,
     /// Job currently producing a plan.
     pub plan_job: Option<JobId>,
+    /// Pending root cause analysis awaiting approval.
+    pub rca: Option<RcaProposal>,
+    /// Job currently producing a root cause analysis.
+    pub rca_job: Option<JobId>,
     /// Pending PII masking awaiting approval.
     pub pii: Option<PiiReview>,
     /// Job currently scanning for personal data.
@@ -202,6 +222,8 @@ impl App {
             shrink_source: None,
             plan: None,
             plan_job: None,
+            rca: None,
+            rca_job: None,
             pii: None,
             pii_job: None,
             models_open: false,
@@ -247,6 +269,7 @@ impl App {
                 self.pending = None;
                 self.shrink = None;
                 self.plan = None;
+                self.rca = None;
                 self.refresh_history();
                 self.status = format!("opened {}", prompt.name);
             }
@@ -680,6 +703,53 @@ impl App {
         }
     }
 
+    /// Turn the open prompt — incident notes — into a root cause analysis and postmortem.
+    ///
+    /// Runs on the local checkpoint, like shrinking and planning: no installed agent, no
+    /// ranking first, and nothing about the incident leaves the machine. That last part is
+    /// the reason this is worth having at all — incident notes carry hostnames, customer
+    /// counts and stack traces, which is the material least appropriate to hand to a hosted
+    /// model for summarising.
+    pub fn request_rca(&mut self) {
+        if self.buffer.text.trim().is_empty() {
+            self.status = "nothing to analyse".into();
+            return;
+        }
+        let job = self.runner.rca(self.buffer.text.clone());
+        self.rca_job = Some(job.id);
+        self.running.push(job);
+        self.rca = None;
+        self.status = "analysing the incident…".into();
+    }
+
+    /// Accept the proposed analysis, replacing the buffer with it.
+    ///
+    /// The notes it was built from are not lost: the snapshot taken here sits on top of them
+    /// in version history, and the undo it creates is a single step.
+    pub fn accept_rca(&mut self) {
+        let Some(proposal) = self.rca.take() else {
+            return;
+        };
+        self.buffer.replace_all(&proposal.after, "analysis");
+        self.save(Note::Rca);
+        self.status = "postmortem applied".into();
+    }
+
+    /// Discard the proposed analysis.
+    pub fn reject_rca(&mut self) {
+        self.rca = None;
+        self.status = "analysis discarded".into();
+    }
+
+    /// Stop a running analysis job.
+    pub fn cancel_rca(&mut self) {
+        if let Some(id) = self.rca_job
+            && let Some(h) = self.running.iter().find(|h| h.id == id)
+        {
+            h.cancel();
+        }
+    }
+
     /// Apply a proposed shrink as one undo step and one snapshot.
     ///
     /// A shrink of a selection lands back in the range it came from — and only if that range
@@ -904,6 +974,24 @@ impl App {
                     self.status = "plan ready for review".into();
                 }
             }
+            Event::Analysed { id, text } => {
+                if self.rca_job != Some(id) {
+                    return;
+                }
+                self.rca_job = None;
+                // The schema constrains the shape, not the manners — same cleanup as shrink.
+                let after = crate::shrink::clean(&text);
+                if after.trim().is_empty() {
+                    self.error = Some("the analysis came back empty".into());
+                } else {
+                    self.rca = Some(RcaProposal {
+                        diff: version::diff(&self.buffer.text, &after),
+                        warnings: crate::rca::warnings(&after, &self.buffer.text),
+                        after,
+                    });
+                    self.status = "postmortem ready for review".into();
+                }
+            }
             Event::Detected { agents, .. } => {
                 let n = agents.len();
                 let usable = agents.iter().filter(|a| a.usable()).count();
@@ -969,6 +1057,9 @@ impl App {
                 if kind == Kind::Plan && self.plan_job == Some(id) {
                     self.plan_job = None;
                 }
+                if kind == Kind::Rca && self.rca_job == Some(id) {
+                    self.rca_job = None;
+                }
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
                 }
@@ -989,6 +1080,9 @@ impl App {
                 }
                 if kind == Kind::Plan && self.plan_job == Some(id) {
                     self.plan_job = None;
+                }
+                if kind == Kind::Rca && self.rca_job == Some(id) {
+                    self.rca_job = None;
                 }
                 if kind == Kind::Models && self.models_job == Some(id) {
                     self.models_job = None;
@@ -1258,6 +1352,35 @@ mod tests {
             app.error, None,
             "planning is local and must not require an agent"
         );
+
+        // The analysis even more so: the reason it is worth having is that the incident
+        // never leaves the machine, so an agent must not be on its path at all.
+        app.error = None;
+        app.request_rca();
+        assert_eq!(
+            app.error, None,
+            "analysing an incident is local and must not require an agent"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An empty buffer is a request with nothing in it, and the model costs seconds: every
+    /// local action says so in the status bar instead of starting.
+    #[test]
+    fn an_empty_buffer_is_not_analysed() {
+        let cfg = tmp_config("emptyrca");
+        let dir = cfg.dir.clone();
+        let mut app = App::new(cfg);
+        app.create_prompt("notes");
+        app.buffer.replace_all("   \n\n", "typing");
+
+        app.request_rca();
+        assert!(
+            app.rca_job.is_none(),
+            "an empty buffer started a model call"
+        );
+        assert!(app.status.contains("nothing to analyse"), "{}", app.status);
 
         std::fs::remove_dir_all(&dir).ok();
     }

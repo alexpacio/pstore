@@ -12,8 +12,8 @@
 //!
 //! Two differences from the window, both about what a terminal can do well:
 //!
-//! * **Diffs are unified, not side by side.** Every proposal — shrink, plan, sanitize — arrives as
-//!   the same unified diff the version history shows, in one scrollable pane.
+//! * **Diffs are unified, not side by side.** Every proposal — shrink, plan, rca, sanitize —
+//!   arrives as the same unified diff the version history shows, in one scrollable pane.
 //! * **Panes rather than floating windows.** The right-hand pane is one of the ranking, the
 //!   version history, or a hint answer, cycled with a key; a review takes over the centre.
 //!
@@ -108,11 +108,12 @@ enum Overlay {
     Hint,
 }
 
-/// Which proposal is under review. All three are accept-or-reject over a unified diff.
+/// Which proposal is under review. All four are accept-or-reject over a unified diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Review {
     Shrink,
     Plan,
+    Rca,
     Sanitize,
 }
 
@@ -221,6 +222,8 @@ impl Tui {
             Some(Overlay::Review(Review::Shrink))
         } else if self.app.plan.is_some() {
             Some(Overlay::Review(Review::Plan))
+        } else if self.app.rca.is_some() {
+            Some(Overlay::Review(Review::Rca))
         } else if self.app.pii.is_some() {
             Some(Overlay::Review(Review::Sanitize))
         } else {
@@ -306,6 +309,7 @@ impl Tui {
             (KeyCode::F(7), _) => self.side = Side::History,
             (KeyCode::F(8), _) => self.app.send_to_agent(),
             (KeyCode::F(9), _) => self.side = self.side.next(),
+            (KeyCode::F(10), _) => self.app.request_rca(),
             (KeyCode::Esc, _) => {
                 // Nothing to close: stop whatever is running, which is the other thing Esc is
                 // for in every editor.
@@ -339,6 +343,7 @@ impl Tui {
                     match review {
                         Review::Shrink => self.app.accept_shrink(),
                         Review::Plan => self.app.accept_plan(),
+                        Review::Rca => self.app.accept_rca(),
                         Review::Sanitize => self.app.accept_sanitize(),
                     }
                     self.overlay = None;
@@ -350,6 +355,7 @@ impl Tui {
                         // way — nothing has been applied yet.
                         Review::Shrink => self.app.shrink = None,
                         Review::Plan => self.app.reject_plan(),
+                        Review::Rca => self.app.reject_rca(),
                         Review::Sanitize => self.app.pii = None,
                     }
                     self.overlay = None;
@@ -494,6 +500,8 @@ impl Tui {
             self.app.cancel_sanitize();
         } else if self.app.plan_job.is_some() {
             self.app.cancel_plan();
+        } else if self.app.rca_job.is_some() {
+            self.app.cancel_rca();
         } else if self.app.models_job.is_some() {
             self.app.cancel_models();
         }
@@ -752,6 +760,7 @@ impl Tui {
         let busy = self.app.models_job.is_some()
             || self.app.shrink_job.is_some()
             || self.app.plan_job.is_some()
+            || self.app.rca_job.is_some()
             || self.app.pii_job.is_some();
         let prefix = if busy { "… " } else { "" };
         frame.render_widget(
@@ -767,8 +776,8 @@ impl Tui {
             Some(Overlay::NewPrompt) | Some(Overlay::Hint) => "Enter confirm · Esc cancel",
             Some(_) => "Esc close",
             None => {
-                "F1 help · F2 shrink · F3 plan · F4 sanitize · F5 rank · F6 models · F9 pane · \
-                 ^S save · ^N new · ^H hint · ^Q quit"
+                "F1 help · F2 shrink · F3 plan · F4 sanitize · F5 rank · F6 models · \
+                 F9 pane · F10 rca · ^S save · ^N new · ^H hint · ^Q quit"
             }
         };
         frame.render_widget(
@@ -844,6 +853,14 @@ impl Tui {
                 warn_lines(&mut lines, &p.warnings);
                 lines.extend(p.diff.lines().map(diff_line));
                 "plan — accept?"
+            }
+            Review::Rca => {
+                let Some(p) = &self.app.rca else {
+                    return ("rca".into(), Text::default());
+                };
+                warn_lines(&mut lines, &p.warnings);
+                lines.extend(p.diff.lines().map(diff_line));
+                "postmortem — accept?"
             }
             Review::Sanitize => {
                 let Some(p) = &self.app.pii else {
@@ -986,6 +1003,10 @@ fn help_text() -> Text<'static> {
             "plan: rewrite it as an instruction for a coding agent (local model)",
         ),
         ("F4", "sanitize: find personal data and offer to mask it"),
+        (
+            "F10",
+            "rca: turn incident notes into a postmortem and action items (local model)",
+        ),
         ("Ctrl+H", "ask about the selection, a question, or both"),
         ("Ctrl+L", "in the hint box: local model or coding agent"),
         ("F8", "send the prompt to the best-ranked agent"),
@@ -1009,7 +1030,7 @@ fn help_text() -> Text<'static> {
         .collect();
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Ranking, shrinking, planning and sanitising all run the same code as the window; the \
+        "Ranking, shrinking, planning, analysing an incident and sanitising all run the same code as \
          model runs on this machine and nothing about your prompt leaves it.",
         Style::default().add_modifier(Modifier::DIM),
     )));
@@ -1297,6 +1318,28 @@ mod tests {
         // Rejecting drops the proposal and closes the overlay.
         tui.on_key(press(KeyCode::Char('r')));
         assert!(tui.app.plan.is_none());
+        assert_eq!(tui.overlay, None);
+
+        // Every kind of proposal goes through the same overlay, so a new one that forgot to
+        // register here would be produced by a worker and then never shown.
+        tui.app.rca = Some(crate::app::RcaProposal {
+            after: "**Summary**\nIt broke.".into(),
+            warnings: vec!["times dropped from the timeline: 09:20".into()],
+            diff: "-notes\n+postmortem\n".into(),
+        });
+        tui.sync_overlay();
+        assert_eq!(tui.overlay, Some(Overlay::Review(Review::Rca)));
+        let (title, body) = tui.review_text(Review::Rca);
+        assert!(title.contains("postmortem"), "{title}");
+        let rendered: String = body
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("09:20"), "{rendered}");
+        tui.on_key(press(KeyCode::Char('r')));
+        assert!(tui.app.rca.is_none());
         assert_eq!(tui.overlay, None);
     }
 

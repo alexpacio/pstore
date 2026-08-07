@@ -79,6 +79,7 @@ impl eframe::App for Ui {
 
         self.shrink_window(&ctx);
         self.plan_window(&ctx);
+        self.rca_window(&ctx);
         self.pii_window(&ctx);
         self.models_window(&ctx);
         self.error_window(&ctx);
@@ -87,6 +88,7 @@ impl eframe::App for Ui {
         // while anything runs.
         if self.app.shrink_job.is_some()
             || self.app.plan_job.is_some()
+            || self.app.rca_job.is_some()
             || self.app.pii_job.is_some()
             || self.app.hint.as_ref().is_some_and(|h| h.job.is_some())
             || crate::models::any_busy()
@@ -209,6 +211,29 @@ impl Ui {
                 .clicked()
             {
                 self.app.request_plan();
+            }
+
+            let analysing = self.app.rca_job.is_some();
+            if analysing {
+                ui.spinner();
+                if ui
+                    .button("Stop RCA")
+                    .on_hover_text("Stop the local model and keep the notes as they are")
+                    .clicked()
+                {
+                    self.app.cancel_rca();
+                }
+            } else if ui
+                .button("RCA")
+                .on_hover_text(
+                    "Turn incident notes into a root cause analysis and postmortem — impact, \
+                     timeline, root cause, detection, resolution and the action items that \
+                     follow. Runs on the local model, so hostnames, customer numbers and \
+                     stack traces stay on this machine.",
+                )
+                .clicked()
+            {
+                self.app.request_rca();
             }
 
             let scanning = self.app.pii_job.is_some();
@@ -833,6 +858,82 @@ impl Ui {
             self.app.accept_plan();
         } else if reject || !open {
             self.app.reject_plan();
+        }
+    }
+
+    /// Review a produced postmortem.
+    ///
+    /// The same accept-or-discard shape as the plan window, saying the opposite thing about
+    /// what it holds: this one *is* a document to read, and the likeliest next step is the
+    /// copy button rather than the replace button — a postmortem's destination is usually an
+    /// incident ticket or a wiki page, not the prompt folder.
+    fn rca_window(&mut self, ctx: &egui::Context) {
+        let Some(proposal) = self.app.rca.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut accept = false;
+        let mut reject = false;
+
+        egui::Window::new("Review postmortem")
+            .open(&mut open)
+            .default_width(760.0)
+            .default_height(600.0)
+            .show(ctx, |ui| {
+                ui.strong("A root cause analysis, written from your notes and nothing else");
+                ui.weak(
+                    "Read it against the notes before it goes anywhere: the model was told to \
+                     leave what it could not establish in Open questions, and a postmortem is \
+                     read by people who were not there.",
+                );
+                for w in &proposal.warnings {
+                    ui.colored_label(egui::Color32::from_rgb(200, 120, 40), format!("⚠ {w}"));
+                }
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    copy_button(ui, &proposal.after, "Copy postmortem");
+                    let items = crate::rca::action_items(&proposal.after).join("\n");
+                    copy_button(ui, &items, "Copy action items");
+                    ui.weak(format!("{} characters", proposal.after.len()));
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .id_salt("rca-text")
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        ui.monospace(&proposal.after);
+                    });
+
+                ui.separator();
+                ui.collapsing("Diff against the notes", |ui| {
+                    diff_view(ui, &proposal.diff, "rca-diff");
+                });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Replace prompt")
+                        .on_hover_text(
+                            "Overwrite the open prompt with the postmortem. The notes stay in \
+                             version history.",
+                        )
+                        .clicked()
+                    {
+                        accept = true;
+                    }
+                    if ui.button("Discard").clicked() {
+                        reject = true;
+                    }
+                    ui.weak("Accepting is a single undo step.");
+                });
+            });
+
+        if accept {
+            self.app.accept_rca();
+        } else if reject || !open {
+            self.app.reject_rca();
         }
     }
 

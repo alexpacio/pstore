@@ -31,6 +31,8 @@ pub enum Kind {
     Shrink,
     /// Turning the prompt into an agent-ready instruction.
     Plan,
+    /// Turning incident notes into a root cause analysis and postmortem.
+    Rca,
     /// Classifying the prompt and ranking the field.
     Rank,
     /// Re-probing installed agents.
@@ -76,6 +78,8 @@ pub enum Event {
     Shrunk { id: JobId, text: String },
     /// A planning pass finished; carries the whole rewritten prompt.
     Planned { id: JobId, text: String },
+    /// An incident analysis finished; carries the whole postmortem.
+    Analysed { id: JobId, text: String },
     /// A job with no payload of its own finished; `note` goes to the status bar.
     ///
     /// Model downloads report through here: their detail is on the [`crate::models`]
@@ -99,6 +103,7 @@ impl Event {
             | Event::Scanned { id, .. }
             | Event::Shrunk { id, .. }
             | Event::Planned { id, .. }
+            | Event::Analysed { id, .. }
             | Event::Done { id, .. }
             | Event::Cancelled { id, .. } => *id,
         }
@@ -115,6 +120,7 @@ impl Event {
                 | Event::Scanned { .. }
                 | Event::Shrunk { .. }
                 | Event::Planned { .. }
+                | Event::Analysed { .. }
                 | Event::Done { .. }
                 | Event::Cancelled { .. }
         )
@@ -484,6 +490,40 @@ impl Runner {
                         let _ = tx.send(Event::Failed {
                             id,
                             kind: Kind::Plan,
+                            error,
+                        });
+                    }
+                }
+            },
+        )
+    }
+
+    /// Turn `text` into a root cause analysis and postmortem with the local model.
+    ///
+    /// One model call, so cancellation lands the same way [`plan`](Self::plan) handles it:
+    /// checked once after the fact, because a stop pressed during the generation still means
+    /// the user does not want the answer.
+    pub fn rca(&self, text: String) -> Handle {
+        self.spawn(
+            Kind::Rca,
+            "analysing the incident".into(),
+            move |id, tx, cancel| {
+                let outcome = crate::rca::run(&text);
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(Event::Cancelled {
+                        id,
+                        kind: Kind::Rca,
+                    });
+                    return;
+                }
+                match outcome {
+                    Ok(text) => {
+                        let _ = tx.send(Event::Analysed { id, text });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Event::Failed {
+                            id,
+                            kind: Kind::Rca,
                             error,
                         });
                     }

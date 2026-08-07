@@ -97,6 +97,22 @@ enum Command {
         json: bool,
     },
 
+    /// Turn incident notes into a root cause analysis, postmortem and action items.
+    Rca {
+        /// Notes file, or `-` for stdin.
+        #[arg(value_name = "FILE")]
+        file: String,
+        /// Overwrite the file, taking a version snapshot first.
+        #[arg(long, conflicts_with = "json")]
+        write: bool,
+        /// Print only the action items, one per line.
+        #[arg(long, conflicts_with = "write")]
+        actions: bool,
+        /// Emit JSON rather than the postmortem.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Find personal data in a prompt and report or mask it.
     Sanitize {
         /// Prompt file, or `-` for stdin.
@@ -235,6 +251,12 @@ pub fn run(args: Args) -> i32 {
         Some(Command::Rank { file, json }) => rank(&config, &file, json),
         Some(Command::Shrink { file, write, json }) => shrink(&config, &file, write, json),
         Some(Command::Plan { file, write, json }) => plan(&config, &file, write, json),
+        Some(Command::Rca {
+            file,
+            write,
+            actions,
+            json,
+        }) => rca(&config, &file, write, actions, json),
         Some(Command::Sanitize {
             file,
             masked,
@@ -586,6 +608,73 @@ fn plan(config: &Config, file: &str, write: bool, as_json: bool) -> i32 {
             }
         } else {
             println!("{planned}");
+        }
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// rca
+// ---------------------------------------------------------------------------
+
+/// Analyse incident notes into a postmortem.
+///
+/// `--actions` exists because that is the part with somewhere else to go: the postmortem is
+/// read by people, and the action items are cut into tickets, usually by a script that wants
+/// one per line and nothing else. It refuses `--write` for the obvious reason — replacing
+/// incident notes with only the action items would drop the analysis that justifies them.
+fn rca(config: &Config, file: &str, write: bool, actions: bool, as_json: bool) -> i32 {
+    let (text, path) = match read_prompt(config, file) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pstore: {e}");
+            return FAILED;
+        }
+    };
+    if write && path.is_none() {
+        eprintln!("pstore: --write needs a file, not stdin");
+        return FAILED;
+    }
+
+    eprintln!("pstore: analysing the incident with the local model…");
+    let analysis = match crate::rca::run(&text) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("pstore: {e}");
+            return FAILED;
+        }
+    };
+    let warnings = crate::rca::warnings(&analysis, &text);
+    let items = crate::rca::action_items(&analysis);
+
+    if as_json {
+        emit(&json!({
+            "postmortem": analysis,
+            "action_items": items,
+            "warnings": warnings,
+        }));
+    } else {
+        // Warnings go to stderr even when the document goes to stdout: a redirected
+        // postmortem that dropped half the timeline should still say so on the terminal.
+        for w in &warnings {
+            eprintln!("pstore: warning — {w}");
+        }
+        if write {
+            if let Err(e) = write_prompt(
+                config,
+                path.as_ref().expect("checked above"),
+                &analysis,
+                Note::Rca,
+            ) {
+                eprintln!("pstore: {e}");
+                return FAILED;
+            }
+        } else if actions {
+            for item in &items {
+                println!("{item}");
+            }
+        } else {
+            println!("{analysis}");
         }
     }
     0
@@ -1108,6 +1197,7 @@ mod tests {
             vec!["rank", "p.md"],
             vec!["shrink", "p.md"],
             vec!["plan", "p.md"],
+            vec!["rca", "p.md"],
             vec!["sanitize", "p.md"],
             vec!["agents"],
             vec!["models"],
@@ -1128,7 +1218,7 @@ mod tests {
     /// says "print this instead", and it must refuse stdin rather than write somewhere arbitrary.
     #[test]
     fn write_and_json_are_mutually_exclusive() {
-        for cmd in ["shrink", "sanitize", "plan"] {
+        for cmd in ["shrink", "sanitize", "plan", "rca"] {
             assert!(
                 Args::try_parse_from(["pstore", cmd, "p.md", "--write", "--json"]).is_err(),
                 "{cmd} allowed --write with --json"

@@ -14,6 +14,7 @@
 | **Versioned prompts** | Every save creates a snapshot in `.pstore/versions/`. Full history, diffs, one-click restore — all plain markdown. |
 | **Inline hints** | Select text, type a question, or both — the selection and the question reach the answerer as distinct things. Answered by the local model or by the ranked coding agent, your pick per question. Answers land in a panel, never silently in the document. |
 | **Plan** | Rewrites a rough request into a structured instruction for a coding agent: objective, ordered steps, constraints, acceptance criteria. Runs on the local model, and asks it for the fields rather than for a document — the headings and their order are pstore's. The output *is* the next prompt, not a document to read. |
+| **RCA** | Turns incident notes into a root cause analysis and postmortem — impact, timeline, root cause, contributing factors, detection, resolution, action items and what is still unknown. Blameless by instruction, and **checked for invention**: a section the notes never established says so rather than being filled in, and any figure in the write-up that the notes did not give is reported back to you before you read it. Each action item is tagged `prevent`/`detect`/`mitigate` — enforced by the schema, not asked for — and `pstore rca --actions` prints just those, one per line. Runs on the local model, so hostnames, customer numbers and stack traces stay on the machine. |
 | **Shrink** | Rewrites the selection — or the whole prompt — telegraphically: no articles, no pleasantries, each fact stated once, while code, paths, identifiers and constraints stay verbatim. Arrives as a diff with a size summary and a warning if a file reference or code block went missing. |
 | **Smart routing** | Every (agent, model, effort) combination your machine can run is handed to a local model along with your prompt; it returns a ranked shortlist with a reason for each pick. |
 | **Only models it can describe** | A candidate pstore cannot name and characterise is **withheld from the ranking**, with the reason shown, rather than ranked blind. |
@@ -25,13 +26,13 @@
 | **Copy anything** | Every produced artefact — hint, shrink, plan, masked prompt — has a copy button. The workflow ends in a paste. |
 | **Plain files** | Prompts are `.md` in your project. Sidecar in `.pstore/`. Works with git, grep, any editor. |
 
-Nothing is applied unreviewed: shrink, plan and sanitize all arrive as a diff, and accepting is one undo step with the previous text already in version history.
+Nothing is applied unreviewed: shrink, plan, RCA and sanitize all arrive as a diff, and accepting is one undo step with the previous text already in version history.
 
 ---
 
 ## The local model
 
-Routing, planning, shrinking and sanitizing all run on one local checkpoint:
+Routing, planning, incident analysis, shrinking and sanitizing all run on one local checkpoint:
 [**Bonsai 27B**](https://huggingface.co/prism-ml/Bonsai-27B-gguf), from
 [PrismML](https://docs.prismml.com/models/bonsai-27b) — a 27B model (derived from Qwen3.6-27B)
 compressed to binary or ternary weights rather than trained small from the start. Ordinary
@@ -152,7 +153,7 @@ cargo build --release --no-default-features --features tui
 cargo build --release --no-default-features --features gui
 ```
 
-The local model is **not** a feature. Ranking, planning, shrinking and sanitizing are all
+The local model is **not** a feature. Ranking, planning, analysing an incident, shrinking and sanitizing are all
 the local checkpoint, so a build without it is not a smaller pstore — it is a text editor
 that refuses every button.
 
@@ -180,6 +181,8 @@ pstore shrink refactor.md            # telegraphic rewrite to stdout
 pstore shrink refactor.md --write    # ...or in place, snapshotting the previous version
 pstore plan refactor.md              # structured instruction, via an installed agent
 pstore plan refactor.md --agent claude   # skip the ranking call and use this one
+pstore rca incident.md               # root cause analysis and postmortem, to stdout
+pstore rca incident.md --actions     # just the action items, one per line, for the ticket tracker
 pstore sanitize refactor.md          # what personal data is in here, and what would mask it
 pstore sanitize refactor.md --masked # the masked prompt, ready to pipe
 
@@ -204,6 +207,7 @@ Launch with `pstore tui`. Full-screen terminal interface, same operations as the
 | Save (creates a version) | `Ctrl+S` |
 | Rank the installed models | `Ctrl+R` or `F5` |
 | Shrink · Plan · Sanitize | `F2` · `F3` · `F4` |
+| Root cause analysis | `F10` |
 | Ask about the selection or a question | `Ctrl+H` |
 | Undo / Redo | `Ctrl+Z` / `Ctrl+Y` |
 | Accept / reject a proposal | `a` / `r` |
@@ -217,7 +221,7 @@ Launch with `pstore tui`. Full-screen terminal interface, same operations as the
 
 ### Using the GUI
 
-Launch with `pstore` (no subcommand). Native window with a sidebar of prompts, an editor, and an action bar: **Score models** · **Shrink** · **Plan** · **Sanitize** · **Send →** · **Hint…** · **Models…**
+Launch with `pstore` (no subcommand). Native window with a sidebar of prompts, an editor, and an action bar: **Score models** · **Shrink** · **Plan** · **RCA** · **Sanitize** · **Send →** · **Hint…** · **Models…**
 
 | Action | Key |
 | --- | --- |

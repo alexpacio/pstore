@@ -1574,24 +1574,186 @@ pub fn plan(text: &str) -> Result<String, String> {
         .get("objective")
         .and_then(Value::as_str)
         .ok_or("the model's reply had no objective")?;
-    let strings = |key: &str| -> Vec<String> {
-        reply
-            .get(key)
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
     let sections: Vec<(&str, Vec<String>)> = crate::plan::FIELDS
         .iter()
         .skip(1)
-        .map(|(key, heading)| (*heading, strings(key)))
+        .map(|(key, heading)| (*heading, strings(&reply, key)))
         .collect();
     Ok(crate::plan::render(objective, &sections))
+}
+
+/// One field of a fill-in-the-fields reply, as a list of strings.
+///
+/// A missing or malformed list reads as empty rather than as an error: the schema already
+/// requires the ones that have to be there, so what reaches this is an optional section the
+/// model had nothing to put in.
+fn strings(reply: &Value, key: &str) -> Vec<String> {
+    reply
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Room for a postmortem: the largest output pstore asks this checkpoint for.
+///
+/// Nine fields rather than the planner's six, and the floor is what almost always applies —
+/// incident notes are pasted, so the input is long and the output is a fixed-size document
+/// over it rather than something that grows with it.
+///
+/// The floor covers the schema's own worst case, and the two are meant to be read together:
+/// every field filled to its cap is 13 450 characters, about 4 490 tokens at
+/// [`CHARS_PER_TOKEN`], with the JSON scaffolding around nine keys on top. Undersizing it
+/// fails the way [`plan_output_tokens_for`] describes — one JSON object, so running out
+/// mid-array yields no object at all, after the whole generation has been paid for.
+///
+/// The caps in [`rca`] cannot be loosened without raising this, and this cannot be raised
+/// far: it is subtracted from the same ceiling the notes have to fit inside, and notes are
+/// the longest input pstore takes. [`rca_input_chars`] is where that trade-off shows up.
+///
+/// A constant, unlike [`plan_output_tokens_for`], and the difference is the point. A plan
+/// quotes its request back, so a longer request earns a longer plan. A postmortem does not:
+/// the schema's caps are the same whatever the notes weigh, so scaling this with the input
+/// would reserve room the model is not permitted to use — and every token reserved here is
+/// one the notes cannot have.
+const RCA_OUTPUT_TOKENS: usize = 4864;
+
+/// Turn incident notes into a root cause analysis and postmortem, on the local checkpoint.
+///
+/// One call over the whole of the notes, for the reason [`plan`] is: an incident has one
+/// timeline and one root cause, and analysing halves of it separately would produce two of
+/// each. [`crate::rca::run`] refuses notes too long for that rather than letting llama.cpp
+/// drop their tail — which here would silently truncate the incident itself.
+///
+/// Greedy. What matters most in a postmortem is the material copied out of the notes —
+/// times, hostnames, error strings, measured quantities — and there is nothing for
+/// temperature to diversify but the copy.
+pub fn rca(text: &str) -> Result<String, String> {
+    let instruction = crate::rca::INSTRUCTION.len();
+    let output = RCA_OUTPUT_TOKENS;
+    let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
+    let ctx = fit_context_for(&[(instruction + text.len(), output)], ceiling);
+
+    let session = Session::open(ctx)?;
+    // One field per section, and bounded at both ends, for the reasons spelled out in
+    // `plan`. Two differences from the planner's schema, both learned from what came back:
+    //
+    // The entries are longer. A `maxLength` under a constrained grammar is not a hint — the
+    // closing quote is forced at the limit, mid-word — and 240 characters, ample for "edit
+    // src/net/retry.rs", cuts an entry naming a service, a time and an error string in half.
+    // The instruction asks for entries under 200 so that the cap is headroom rather than the
+    // thing shaping the answer.
+    //
+    // And `minItems` marks only the three sections whose absence would make this something
+    // other than a postmortem. `resolution` is deliberately *not* among them: notes that stop
+    // while the incident is still burning have no resolution to record, and requiring one
+    // makes the model write the fix it thinks ought to happen as though it already had.
+    // Per field rather than one size for all of them, because the ceiling makes it a real
+    // budget: everything allowed here has to be generatable inside `output`, and `output` has
+    // to leave room for notes worth analysing. A timeline entry carrying a time, a host and
+    // an error string needs the room; an action item is a sentence.
+    let entry = |chars: usize| json!({"type": "string", "minLength": 1, "maxLength": chars});
+    let list =
+        |max: usize, chars: usize| json!({"type": "array", "maxItems": max, "items": entry(chars)});
+    let required = |min: usize, max: usize, chars: usize| json!({"type": "array", "minItems": min, "maxItems": max, "items": entry(chars)});
+    let task = Task::composition(
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["summary", "impact", "timeline", "root_cause", "contributing_factors",
+                         "detection", "resolution", "action_items", "open_questions"],
+            "properties": {
+                "summary": entry(1200),
+                "impact": list(4, 300),
+                "timeline": required(1, 12, 300),
+                "root_cause": required(1, 4, 400),
+                "contributing_factors": list(5, 250),
+                "detection": list(4, 250),
+                "resolution": list(4, 250),
+                // The one field whose shape is enforced rather than requested. Asked in prose
+                // to begin each item with 'prevent:', 'detect:' or 'mitigate:', this
+                // checkpoint complies on short notes and quietly stops on long ones — and
+                // the prefix is what the list is sorted and exported by, so losing it costs
+                // more than a formatting slip. An enum is not advice: the grammar cannot
+                // emit anything else.
+                "action_items": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["buys", "task"],
+                        "properties": {
+                            "buys": {"enum": ["prevent", "detect", "mitigate"]},
+                            "task": entry(200),
+                        }
+                    }
+                },
+                "open_questions": list(5, 200),
+            }
+        }),
+        output,
+    );
+
+    let reply = session.run(&task, &crate::rca::compose(text))?;
+    let summary = reply
+        .get("summary")
+        .and_then(Value::as_str)
+        .ok_or("the model's reply had no summary")?;
+    let sections: Vec<(&str, Vec<String>)> = crate::rca::FIELDS
+        .iter()
+        .skip(1)
+        .map(|(key, heading)| {
+            let items = match *key {
+                "action_items" => action_items(&reply),
+                _ => strings(&reply, key),
+            };
+            (*heading, items)
+        })
+        .collect();
+    Ok(crate::rca::render(summary, &sections))
+}
+
+/// The action items, flattened back to the `buys: task` line the document is written in.
+///
+/// The split into two fields exists to make the grammar enforce the prefix; nothing
+/// downstream wants the pair. An item missing either half is dropped rather than rendered
+/// half-formed — the schema requires both, so this is only reachable if that stops being
+/// true.
+fn action_items(reply: &Value) -> Vec<String> {
+    reply
+        .get("action_items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let buys = item.get("buys").and_then(Value::as_str)?;
+                    let task = item.get("task").and_then(Value::as_str)?;
+                    Some(format!("{buys}: {}", task.trim()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Largest set of notes [`rca`] can take without the context ceiling truncating it.
+///
+/// Found by search rather than by hand, for the reason [`plan_input_chars`] is.
+pub fn rca_input_chars() -> usize {
+    let ceiling = crate::config::prefs_snapshot().model_context_ceiling;
+    let instruction = crate::rca::INSTRUCTION.len();
+    let fits = |chars: usize| {
+        let prompt_tokens = ((instruction + chars) as f32 / CHARS_PER_TOKEN).ceil() as usize;
+        prompt_tokens + prompt_tokens / 4 + RCA_OUTPUT_TOKENS + 256 <= ceiling
+    };
+    search_input_chars(fits)
 }
 
 /// Answer a hint on the local checkpoint.
@@ -1643,7 +1805,15 @@ pub fn plan_input_chars() -> usize {
         let prompt_tokens = ((instruction + chars) as f32 / CHARS_PER_TOKEN).ceil() as usize;
         prompt_tokens + prompt_tokens / 4 + output + 256 <= ceiling
     };
+    search_input_chars(fits)
+}
 
+/// The largest input `fits` still accepts.
+///
+/// Shared by [`plan_input_chars`] and [`rca_input_chars`], which differ only in the budget
+/// they hand in. `fits` must be monotonic — true for every size below its answer — which the
+/// sizing rules are: a longer input never needs a smaller window.
+fn search_input_chars(fits: impl Fn(usize) -> bool) -> usize {
     if !fits(0) {
         return 0;
     }
@@ -1731,7 +1901,10 @@ mod tests {
     fn quota_burn_reaches_the_ranking_prompt() {
         let heavy = real("claude", "opus", Effort::High);
         let light = real("claude", "haiku", Effort::Low);
-        assert!(heavy.quota_weight > light.quota_weight, "fixture precondition");
+        assert!(
+            heavy.quota_weight > light.quota_weight,
+            "fixture precondition"
+        );
 
         let rows = rows(&[heavy, light], &Brief::default());
         let prompt = rank_prompt("refactor this", &rows, 2, Demand::Hard, false);
@@ -2537,7 +2710,12 @@ mod tests {
             // The facts pstore would supply, so the live run exercises the prompt the app builds
             // rather than a bare list of names.
             let names: Vec<String> = cands.iter().map(|c| c.model_id.to_string()).collect();
-            let brief = crate::knowledge::resolve(&names, &|_| None, known_models, crate::knowledge::lookup);
+            let brief = crate::knowledge::resolve(
+                &names,
+                &|_| None,
+                known_models,
+                crate::knowledge::lookup,
+            );
             for k in &brief.known {
                 eprintln!("  {} — from {}", k.model, k.source.label());
             }
@@ -2660,7 +2838,12 @@ mod tests {
             );
 
             let names: Vec<String> = cands.iter().map(|c| c.model_id.to_string()).collect();
-            let brief = crate::knowledge::resolve(&names, &|_| None, known_models, crate::knowledge::lookup);
+            let brief = crate::knowledge::resolve(
+                &names,
+                &|_| None,
+                known_models,
+                crate::knowledge::lookup,
+            );
             let started = std::time::Instant::now();
             let ranking = rank(HARD, &cands, Vec::new(), &brief)
                 .unwrap_or_else(|e| panic!("{} could not rank: {e}", checkpoint.title));

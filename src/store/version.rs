@@ -30,6 +30,8 @@ pub enum Note {
     Shrink,
     /// Result of the planner being accepted.
     Plan,
+    /// Result of an incident analysis being accepted.
+    Rca,
     /// State captured immediately before restoring an older version.
     Restore,
     /// A hint was inserted into the document.
@@ -46,6 +48,7 @@ impl Note {
             Note::Autosave => "autosave",
             Note::Shrink => "shrunk",
             Note::Plan => "planned",
+            Note::Rca => "postmortem",
             Note::Restore => "pre-restore",
             Note::Hint => "hint",
             Note::Sanitize => "masked",

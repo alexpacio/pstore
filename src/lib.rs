@@ -14,9 +14,10 @@
 //! state a front end needs and every operation one can perform, and it does not name a widget
 //! toolkit: it owns the buffer, the version store, the job runner and the proposals awaiting
 //! review, and it advances by being handed [`jobs::Event`]s. A front end renders that state and
-//! calls those methods. Nothing about ranking, shrinking, planning, sanitising, launching an agent
-//! or reading a config file is reachable only from one of them — which is what makes
-//! `pstore rank` and the Score models button the same code path with the same answer.
+//! calls those methods. Nothing about ranking, shrinking, planning, analysing an incident,
+//! sanitising, launching an agent or reading a config file is reachable only from one of them —
+//! which is what makes `pstore rank` and the Score models button the same code path with the
+//! same answer.
 //!
 //! What is *not* shared is presentation, and deliberately: a GUI can show a side-by-side diff, a
 //! terminal shows a unified one, and a CLI prints JSON when asked. That is the only layer where
@@ -34,6 +35,7 @@ pub mod knowledge;
 pub mod models;
 pub mod pii;
 pub mod plan;
+pub mod rca;
 pub mod router;
 pub mod runtime;
 pub mod shrink;

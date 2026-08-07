@@ -352,6 +352,12 @@ pub fn looks_like_path(token: &str) -> bool {
                 !stem.is_empty()
                     && (1..=5).contains(&ext.len())
                     && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                    // A decimal number is not a file. `4.10`, `2.1` and `99.2` all satisfy
+                    // stem-dot-extension, and prompts carrying measurements — latencies,
+                    // percentages, version-less figures — are full of them, so without this
+                    // every such number reads as a dropped file reference.
+                    && !(stem.bytes().all(|b| b.is_ascii_digit())
+                        && ext.bytes().all(|b| b.is_ascii_digit()))
             }
             None => false,
         }
@@ -459,6 +465,17 @@ mod tests {
         for prose in ["difficulty/capability", "read/write", "and/or", "GUI/TUI"] {
             assert!(!looks_like_path(prose), "{prose} is not a path");
         }
+
+        // The bug this guards: a measurement has the shape of `name.ext`. Telemetry pasted
+        // into a prompt is mostly numbers, and reading them as files made every rewrite
+        // report a dozen dropped paths that were never paths.
+        for number in ["4.10", "2.1", "99.2", "0.01", "44.2"] {
+            assert!(!looks_like_path(number), "{number} is a number, not a path");
+        }
+        // A version-like name is still a file, and a numeric stem is fine with a real
+        // extension — only the all-digits-both-sides case is a measurement.
+        assert!(looks_like_path("v2.rs"), "numeric stem, real extension");
+        assert!(looks_like_path("2026.log"));
 
         // Still paths, without an extension to prove it.
         assert!(looks_like_path("/usr/local/bin"), "rooted");
