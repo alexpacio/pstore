@@ -16,7 +16,7 @@
 | **Plan** | Rewrites a rough request into a structured instruction for a coding agent: objective, ordered steps, constraints, acceptance criteria. Runs on the local model, and asks it for the fields rather than for a document — the headings and their order are pstore's. The output *is* the next prompt, not a document to read. |
 | **RCA** | Turns incident notes into a root cause analysis and postmortem — impact, timeline, root cause, contributing factors, detection, resolution, action items and what is still unknown. Blameless by instruction, and **checked for invention**: a section the notes never established says so rather than being filled in, and any figure in the write-up that the notes did not give is reported back to you before you read it. Each action item is tagged `prevent`/`detect`/`mitigate` — enforced by the schema, not asked for — and `pstore rca --actions` prints just those, one per line. Runs on the local model, so hostnames, customer numbers and stack traces stay on the machine. |
 | **Shrink** | Rewrites the selection — or the whole prompt — telegraphically: no articles, no pleasantries, each fact stated once, while code, paths, identifiers and constraints stay verbatim. Arrives as a diff with a size summary and a warning if a file reference or code block went missing. |
-| **Smart routing** | Every (agent, model, effort) combination your machine can run is handed to a local model along with your prompt; it returns a ranked shortlist with a reason for each pick. |
+| **Smart routing** | Your prompt is first judged on two axes — how hard the work is, and how much of the codebase it changes. Every (agent, model, effort) combination your machine can run is then handed to a local model along with the prompt and that verdict; it returns a ranked shortlist with a reason for each pick. Difficulty picks the weight class and breadth picks how long it should think, so a wide-but-trivial rename and a narrow-but-subtle race condition route differently. |
 | **Only models it can describe** | A candidate pstore cannot name and characterise is **withheld from the ranking**, with the reason shown, rather than ranked blind. |
 | **PII sanitizer** | Finds names, addresses, IBANs, tax codes and card numbers and swaps them for placeholders — before the prompt reaches an agent. |
 | **One local model** | A single checkpoint — your pick of two sizes — runs everything pstore infers, as a subprocess on your machine. Nothing about your prompt leaves it. |
@@ -175,7 +175,7 @@ pstore tui ~/my-prompts
 Every command that produces a result takes `--json`; nothing but the result goes to stdout, so progress notes and warnings stay on stderr and a pipe stays clean.
 
 ```bash
-pstore rank refactor.md              # ranked shortlist, with the difficulty verdict
+pstore rank refactor.md              # ranked shortlist, with the difficulty and breadth verdict
 pstore rank refactor.md --json | jq -r .best.model
 pstore shrink refactor.md            # telegraphic rewrite to stdout
 pstore shrink refactor.md --write    # ...or in place, snapshotting the previous version

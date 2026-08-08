@@ -438,8 +438,12 @@ fn ranking_json(ranking: &Ranking) -> Value {
         })
     };
     json!({
-        "difficulty": ranking.demand.as_ref().map(|(label, _)| *label),
-        "difficulty_because": ranking.demand.as_ref().map(|(_, why)| why.clone()),
+        "difficulty": ranking.judged.as_ref().map(|j| j.demand),
+        "difficulty_because": ranking.judged.as_ref().map(|j| j.because.clone()),
+        // Both halves of the judgement, and what they came to. `difficulty` keeps its name and
+        // its values, so a script reading it goes on working.
+        "breadth": ranking.judged.as_ref().map(|j| j.breadth),
+        "target_effort": ranking.judged.as_ref().map(|j| j.effort.as_str()),
         "best": ranking.best().map(choice),
         "choices": ranking.choices.iter().map(choice).collect::<Vec<_>>(),
         "considered": ranking.considered,
@@ -462,15 +466,8 @@ fn print_ranking(ranking: &Ranking) {
     );
     // The premise of everything below: a shortlist that looks wrong is usually a difficulty read
     // that was wrong, and this is the line that lets someone see which.
-    if let Some((label, because)) = &ranking.demand {
-        println!(
-            "judged {label}{}",
-            if because.is_empty() {
-                String::new()
-            } else {
-                format!(" — {because}")
-            }
-        );
+    if let Some(judged) = &ranking.judged {
+        println!("judged {}{}", judged.summary(), judged.because_suffix());
     }
     if let Some(why) = &ranking.degenerate {
         println!("\n!! this is a list, not a ranking — {why}");
@@ -1225,6 +1222,139 @@ mod tests {
             );
             assert!(Args::try_parse_from(["pstore", cmd, "p.md", "--write"]).is_ok());
         }
+    }
+
+    fn a_choice() -> crate::router::Choice {
+        use crate::agents::registry::{Effort, Tier};
+        crate::router::Choice {
+            agent_id: "claude",
+            agent_display: "Claude Code",
+            model_id: "opus".into(),
+            model_display: "Opus 5".into(),
+            tier: Tier::Top,
+            effort: Effort::XHigh,
+            effort_selectable: true,
+            metered: false,
+            relative_latency: 2.6,
+            relative_price: 5.0,
+            quota_weight: 5.0,
+            note: "frontier model".into(),
+            fact_source: Some(crate::knowledge::Source::Table),
+            fit: 92.0,
+            rationale: "hard multi-file refactor".into(),
+            row_index: 0,
+        }
+    }
+
+    fn a_ranking() -> Ranking {
+        use crate::agents::registry::Effort;
+        Ranking {
+            choices: vec![a_choice()],
+            considered: 39,
+            described: 9,
+            excluded: vec![("crush", "its config names no model".into())],
+            judged: Some(crate::router::Judgement {
+                demand: "hard",
+                breadth: "a few files",
+                effort: Effort::XHigh,
+                because: "a subtle concurrency bug".into(),
+            }),
+            degenerate: None,
+            elapsed: std::time::Duration::from_millis(1500),
+        }
+    }
+
+    /// `--json` is the scripting contract — the README pipes it into `jq` — so the keys other
+    /// programs read have to be there, and `best` has to be the choice a script would launch.
+    #[test]
+    fn the_ranking_json_carries_every_field_a_script_reads() {
+        let v = ranking_json(&a_ranking());
+
+        for key in [
+            "difficulty",
+            "difficulty_because",
+            "breadth",
+            "target_effort",
+            "best",
+            "choices",
+            "considered",
+            "described",
+            "excluded",
+            "degenerate",
+            "seconds",
+        ] {
+            assert!(v.get(key).is_some(), "{key} is missing from {v}");
+        }
+
+        // `best` is the top of `choices`, not a separately computed pick — a script reading
+        // `.best.model` and one reading `.choices[0].model` must not disagree.
+        assert_eq!(v["best"], v["choices"][0]);
+        assert_eq!(v["best"]["model"], "opus");
+        assert_eq!(v["best"]["agent"], "claude");
+        assert_eq!(v["best"]["effort"], "xhigh");
+        assert_eq!(v["best"]["metered"], false);
+        assert_eq!(v["best"]["fit"], 92.0);
+
+        assert_eq!(v["considered"], 39);
+        assert_eq!(v["described"], 9);
+        assert_eq!(v["excluded"][0]["agent"], "crush");
+
+        // Present and null rather than absent, so a consumer can tell "sound" from "old pstore".
+        assert!(v["degenerate"].is_null(), "{v}");
+    }
+
+    /// Both halves of the judgement reach the JSON, and each is one of the values it is
+    /// documented to take — a script switching on `difficulty` should never meet a fourth one.
+    #[test]
+    fn the_ranking_json_states_both_axes_of_the_judgement() {
+        use crate::agents::registry::Effort;
+        let v = ranking_json(&a_ranking());
+
+        assert_eq!(v["difficulty"], "hard");
+        assert_eq!(v["difficulty_because"], "a subtle concurrency bug");
+        assert_eq!(v["target_effort"], "xhigh");
+        assert_eq!(v["breadth"], "a few files");
+
+        // Whatever the judgement says, the values stay inside their known sets.
+        for (demand, breadth) in [
+            ("easy", "one edit"),
+            ("moderate", "a few files"),
+            ("hard", "many files"),
+        ] {
+            let mut r = a_ranking();
+            r.judged = Some(crate::router::Judgement {
+                demand,
+                breadth,
+                effort: Effort::Low,
+                because: String::new(),
+            });
+            let v = ranking_json(&r);
+            assert_eq!(v["difficulty"], demand);
+            assert_eq!(v["breadth"], breadth);
+            assert!(
+                Effort::ALL.iter().any(|e| v["target_effort"] == e.as_str()),
+                "target_effort left the ladder: {v}"
+            );
+        }
+    }
+
+    /// A ranking with nothing in it still has to produce the same keys. A script that reads
+    /// `.best.model` should find `null`, not a missing key or a crash — this is the shape
+    /// `pstore rank` emits when every agent was filtered out.
+    #[test]
+    fn an_empty_ranking_still_has_the_shape() {
+        let v = ranking_json(&Ranking::default());
+
+        assert!(v["best"].is_null(), "{v}");
+        assert_eq!(v["choices"].as_array().map(Vec::len), Some(0));
+        assert!(
+            v["difficulty"].is_null(),
+            "an unjudged prompt has no difficulty: {v}"
+        );
+        assert!(v["breadth"].is_null(), "{v}");
+        assert!(v["target_effort"].is_null(), "{v}");
+        assert!(v["degenerate"].is_null(), "{v}");
+        assert_eq!(v["considered"], 0);
     }
 
     /// A bare prompt name is looked for in the prompt folder as well as the working directory,

@@ -50,7 +50,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{Value, json};
 
 use super::session::Session;
-use crate::agents::registry::Tier;
+use crate::agents::registry::{Effort, Tier};
 use crate::models;
 use crate::runtime;
 
@@ -211,6 +211,32 @@ impl Task {
             top_p: 0.95,
             top_k: 20,
             repeat_penalty: 1.15,
+        }
+    }
+
+    /// A call that classifies against a hand-written grammar: greedy, no reasoning.
+    ///
+    /// [`Self::extraction`] is the same sampling and the better thing to write, and it is what
+    /// this should be — except that a JSON Schema is compiled by the runtime into a grammar
+    /// pstore does not control, and that grammar has a whitespace rule in it. The module header
+    /// records what an unbounded whitespace rule does; the difficulty call hit it. Asked for
+    /// three fields inside 80 tokens, the checkpoint spent them on runs of tabs between the
+    /// fields and the reply came back truncated with no JSON in it at all — which fails the whole
+    /// ranking, because the difficulty is the first call it makes.
+    ///
+    /// A grammar written here has no whitespace rule and **fixes the field order**, which the
+    /// schema path also gets wrong: `serde_json` sorts a map's keys, so the properties reach the
+    /// converter alphabetically and `because` was emitted before the two labels it exists to
+    /// justify. Under greedy sampling each field conditions the next, so that is not a cosmetic
+    /// difference — it is the model committing to a sentence and then picking labels to match it.
+    pub fn classification(grammar: String, max_output: usize) -> Self {
+        Task {
+            constrain: Constrain::Grammar(grammar),
+            max_output,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            repeat_penalty: 1.0,
         }
     }
 
@@ -455,14 +481,15 @@ fn shortlist_for(checkpoint: &models::Checkpoint) -> usize {
 pub enum Demand {
     /// A typo, a rename, a comment, one small well-specified edit.
     Easy,
-    /// Ordinary work in one or two files.
+    /// Ordinary work: something to get right, but nothing to work out first.
     Moderate,
-    /// Several files, an invariant or public API to preserve, or code to understand first.
+    /// The approach is not clear from the request: the cause has to be found, a design has to
+    /// be chosen, or a guarantee has to be preserved that the change could silently break.
     Hard,
 }
 
 impl Demand {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Demand::Easy => "easy",
             Demand::Moderate => "moderate",
@@ -470,32 +497,127 @@ impl Demand {
         }
     }
 
+    /// Which weight class this difficulty calls for.
+    fn tier(self) -> Tier {
+        match self {
+            Demand::Easy => Tier::Cheap,
+            Demand::Moderate => Tier::Mid,
+            Demand::Hard => Tier::Top,
+        }
+    }
+
     /// What ranking should do about it, spelled out for the model that has to act on it.
+    ///
+    /// **Tier only.** Effort used to be named here too ("at low effort", "at high effort"), which
+    /// made it a property of the difficulty alone — and difficulty alone cannot tell a one-line
+    /// deadlock fix from a repo-wide async conversion, so `xhigh` and `max` were never asked for
+    /// by any prompt at all. Effort now comes from [`target_effort`], which reads breadth as well,
+    /// and is stated as its own rule.
     fn instruction(self) -> &'static str {
         match self {
             Demand::Easy => {
-                "Rank the LIGHTEST adequate model FIRST, at low effort. A frontier model is the \
-                 wrong answer here: it costs latency this prompt does not need."
+                "Rank the LIGHTEST adequate model FIRST. A frontier model is the wrong answer \
+                 here: it costs latency and quota this prompt does not need."
             }
             Demand::Moderate => {
-                "Rank a mid-tier model FIRST, at low or medium effort. Neither the lightest \
-                 model nor the frontier one is right for this."
+                "Rank a mid-tier model FIRST. Neither the lightest model nor the frontier one is \
+                 right for this."
             }
             Demand::Hard => {
-                "Rank the most CAPABLE model FIRST, at high effort. A light model is the wrong \
-                 answer here even though it is cheaper and faster — put it last if at all."
+                "Rank the most CAPABLE model FIRST. A light model is the wrong answer here even \
+                 though it is cheaper and faster — put it last if at all."
             }
         }
     }
 }
 
-/// Judge how much capability `text` demands.
+/// How much of the codebase a request reaches across, judged alongside [`Demand`].
 ///
-/// Greedy and without reasoning: this is one classification with one right answer, and the whole
-/// point of asking it separately is that it is the cheap half. `because` is asked for because a
-/// model that has to justify a label picks it more carefully — and because it is worth showing
-/// the user why their prompt was routed the way it was.
-pub fn judge_demand(session: &Session, text: &str) -> Result<(Demand, String), String> {
+/// **Why difficulty was not enough.** The two questions a routing decision needs answered are
+/// *how good does the model have to be* and *how long should it think*, and difficulty only
+/// answers the first. "Fix the race condition in the distributed lock renewal" and "convert the
+/// whole IO layer to async" are both hard, and one is a paragraph of work while the other is a
+/// week of it. With difficulty as the only input, [`Effort::XHigh`] and [`Effort::Max`] were
+/// unreachable: no prompt could ask for them, because nothing in the judgement distinguished the
+/// two cases. Breadth is what separates them — see [`target_effort`].
+///
+/// It is asked for in the same call and the same reply as the difficulty, so it costs a handful
+/// of output tokens rather than a second model load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Breadth {
+    /// One place: one function, or one file, however many lines that takes.
+    OneEdit,
+    /// A handful of files, or one feature end to end.
+    FewFiles,
+    /// More than a handful, a whole subsystem, or too many to know without reading the code.
+    ManyFiles,
+}
+
+impl Breadth {
+    /// The spelling the grammar admits and the prompt defines, and the one `judge_demand` reads
+    /// back. All three come from here so they cannot drift apart.
+    fn as_str(self) -> &'static str {
+        match self {
+            Breadth::OneEdit => "one_edit",
+            Breadth::FewFiles => "few_files",
+            Breadth::ManyFiles => "many_files",
+        }
+    }
+
+    /// How to say it to a person, for the line every front end shows above the shortlist.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Breadth::OneEdit => "one edit",
+            Breadth::FewFiles => "a few files",
+            Breadth::ManyFiles => "many files",
+        }
+    }
+}
+
+/// The effort level the shortlist should aim for.
+///
+/// **The whole reason breadth is judged at all.** Difficulty picks the weight class; the two
+/// together pick how long that model should think. Reading down a column shows what breadth buys
+/// and across a row what difficulty buys:
+///
+/// | | one edit | a few files | many files |
+/// | --- | --- | --- | --- |
+/// | **easy** | low | low | medium |
+/// | **moderate** | low | medium | high |
+/// | **hard** | high | xhigh | max |
+///
+/// Two properties worth stating, because both were bugs before this table existed:
+///
+/// * **every level is reachable.** `xhigh` and `max` were dead code in the routing sense — the
+///   registry offered them, the grammar admitted them, and no judgement ever called for one.
+/// * **the easy row never leaves the fast end.** A verbose request for a one-word fix is still a
+///   one-word fix, and paying `high` for it is the failure this whole path exists to prevent.
+pub fn target_effort(demand: Demand, breadth: Breadth) -> Effort {
+    use Breadth::*;
+    use Demand::*;
+    match (demand, breadth) {
+        (Easy, OneEdit | FewFiles) => Effort::Low,
+        (Easy, ManyFiles) => Effort::Medium,
+        (Moderate, OneEdit) => Effort::Low,
+        (Moderate, FewFiles) => Effort::Medium,
+        (Moderate, ManyFiles) => Effort::High,
+        (Hard, OneEdit) => Effort::High,
+        (Hard, FewFiles) => Effort::XHigh,
+        (Hard, ManyFiles) => Effort::Max,
+    }
+}
+
+/// Judge how much capability `text` demands, and how far it reaches.
+///
+/// Greedy and without reasoning: these are classifications with one right answer each, and the
+/// whole point of asking them separately from the ranking is that they are the cheap half. Both
+/// come back in one reply — they are read off the same request, and a second call to ask "and how
+/// many files?" would double the cheap half's cost to learn something the first pass already had
+/// in front of it.
+///
+/// `because` is asked for because a model that has to justify a label picks it more carefully —
+/// and because it is worth showing the user why their prompt was routed the way it was.
+pub fn judge_demand(session: &Session, text: &str) -> Result<(Demand, Breadth, String), String> {
     let reply = session.run(&demand_task(), &demand_prompt(text))?;
     let demand = match reply.get("difficulty").and_then(Value::as_str) {
         Some("easy") => Demand::Easy,
@@ -504,6 +626,12 @@ pub fn judge_demand(session: &Session, text: &str) -> Result<(Demand, String), S
         // future one slips through.
         _ => Demand::Moderate,
     };
+    let breadth = match reply.get("breadth").and_then(Value::as_str) {
+        Some("one_edit") => Breadth::OneEdit,
+        Some("many_files") => Breadth::ManyFiles,
+        // Same reasoning as above: the middle is the answer that costs least when it is wrong.
+        _ => Breadth::FewFiles,
+    };
     let because = tidy(
         reply
             .get("because")
@@ -511,7 +639,7 @@ pub fn judge_demand(session: &Session, text: &str) -> Result<(Demand, String), S
             .unwrap_or_default(),
         BECAUSE_CHARS,
     );
-    Ok((demand, because))
+    Ok((demand, breadth, because))
 }
 
 /// Longest phrase the model may give for *why* it judged the prompt as it did.
@@ -520,35 +648,100 @@ pub fn judge_demand(session: &Session, text: &str) -> Result<(Demand, String), S
 /// "a single typo in the README, which is a one" reads as pstore having mangled it.
 const BECAUSE_CHARS: usize = 70;
 
-/// Room for the difficulty reply: a word and a short phrase.
-const DEMAND_OUTPUT: usize = 64;
+/// Room for the difficulty reply: two labels and a short phrase, emitted dense.
+///
+/// Generous against what [`demand_grammar`] can actually produce — two words and
+/// [`BECAUSE_CHARS`] characters is well under this — because the cost of overshooting is a
+/// fraction of a second and the cost of undershooting is no ranking at all.
+const DEMAND_OUTPUT: usize = 96;
 
-fn demand_task() -> Task {
-    Task::extraction(
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["difficulty", "because"],
-            "properties": {
-                "difficulty": {"type": "string", "enum": ["easy", "moderate", "hard"]},
-                "because": {"type": "string", "minLength": 1, "maxLength": BECAUSE_CHARS}
-            }
-        }),
-        DEMAND_OUTPUT,
+/// The grammar for the difficulty reply.
+///
+/// Written out rather than compiled from a schema, for the two reasons in
+/// [`Task::classification`]: no whitespace rule, and an order pstore chooses.
+///
+/// **The order is breadth, then difficulty, then the justification**, and it is the order the
+/// model answers in. Breadth goes first because it is the countable one — "how many places
+/// change" is read off the request, where "how hard is it" is a judgement about work nobody has
+/// done yet — and under greedy sampling the first field is the one answered on its own merits.
+/// With difficulty first the two collapsed onto each other: in a sweep of thirty prompts every
+/// single request judged `hard` was then called `many_files`, including a one-line lock-renewal
+/// fix, and `few_files` was chosen once in thirty.
+fn demand_grammar() -> String {
+    let alternatives = |values: &[&str]| {
+        values
+            .iter()
+            .map(|v| format!("\"{v}\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let breadth = alternatives(&[
+        Breadth::OneEdit.as_str(),
+        Breadth::FewFiles.as_str(),
+        Breadth::ManyFiles.as_str(),
+    ]);
+    let difficulty = alternatives(&[
+        Demand::Easy.as_str(),
+        Demand::Moderate.as_str(),
+        Demand::Hard.as_str(),
+    ]);
+    format!(
+        "root ::= \"{{\\\"breadth\\\":\\\"\" breadth \"\\\",\\\"difficulty\\\":\\\"\" difficulty \
+         \"\\\",\\\"because\\\":\\\"\" because \"\\\"}}\"\n\
+         breadth ::= {breadth}\n\
+         difficulty ::= {difficulty}\n\
+         because ::= [^\"\\\\\\n]{{1,{BECAUSE_CHARS}}}\n"
     )
 }
 
+fn demand_task() -> Task {
+    Task::classification(demand_grammar(), DEMAND_OUTPUT)
+}
+
+/// Ask for both halves of the routing judgement in one reply.
+///
+/// Every line below the definitions is there because the definitions alone got something wrong in
+/// a measured sweep, and each one names the mistake it exists to prevent:
+///
+/// * **"Count the places that change, not the places you would read."** Without it, breadth was
+///   an echo of difficulty — anything `hard` came back `many_files`, because reading a subsystem
+///   to find a one-line bug felt like reaching across it.
+/// * **"needing to read code first does not make it hard."** The definition once said `hard`
+///   covered "code that has to be understood before it can be changed", which sounds
+///   discriminating and matches everything: memoizing one function came back `hard` because it
+///   "implies understanding" the loader. Difficulty is about whether the *approach* is known, not
+///   about whether the file has been opened.
+/// * **length is not difficulty, brevity is not ease.** A polite four-sentence request to fix one
+///   misspelled word is a one-word edit; "fix the race condition in the distributed lock renewal"
+///   is eleven words and is the hardest thing in a codebase to get right.
 fn demand_prompt(text: &str) -> String {
     format!(
-        "How much capability does this coding request need?\n\
+        "Judge this coding request on two separate things.\n\
          \n\
-         - easy: a typo, a rename, a comment, or one small well-specified edit.\n\
-         - moderate: ordinary work in one or two files.\n\
-         - hard: several files, an invariant or public API that must not change, or code that \
-         has to be understood before it can be changed.\n\
+         breadth — how many places in the code change?\n\
+         - one_edit: one place — one function, or one file — however many lines that \
+         takes.\n\
+         - few_files: a handful of files, two to five, or one feature end to end.\n\
+         - many_files: more than a handful, a whole subsystem, or too many to know without \
+         reading the code.\n\
+         Count the places that CHANGE, not the places you would read to find them.\n\
          \n\
-         Answer with the label and, in under ten words, the thing about the request that decided \
-         it.\n\
+         difficulty — how good does the model have to be?\n\
+         - easy: the change itself is obvious. A typo, a rename, a comment, a constant.\n\
+         - moderate: the approach is clear and it just has to be done correctly. Ordinary \
+         feature work, a located bug, tests for known behaviour.\n\
+         - hard: the approach is NOT clear from the request. The cause has to be found, a design \
+         has to be chosen, or a guarantee has to be preserved that the change could silently \
+         break.\n\
+         Needing to read some code first does not make a request hard — almost every request \
+         needs that.\n\
+         \n\
+         The two are independent. A change confined to one place can still be hard, and a change \
+         spread over a hundred files can still be easy. Judge each on its own.\n\
+         \n\
+         Judge the WORK the request implies, not how long the request is.\n\
+         \n\
+         Then say, in under ten words, the thing about the request that decided it.\n\
          \n\
          <request>\n{text}\n</request>\n"
     )
@@ -632,18 +825,20 @@ fn rows(candidates: &[super::Candidate], brief: &crate::knowledge::Brief) -> Vec
 ///
 /// The sort is stable, so rows of equal tier keep the order the registry gave them and the result
 /// does not depend on how a `HashMap` felt that day.
+///
+/// **Ties break downwards.** A `moderate` prompt puts light and frontier the same distance from
+/// mid, and something has to separate them or the answer depends on which agent the user happens
+/// to have installed first. The lighter one goes above, because the two mistakes are not
+/// symmetrical: routing moderate work to a light model costs a retry, and routing it to a
+/// frontier model at 25× quota burn costs an allowance the developer needs later in the week.
 fn order_for(rows: &mut [Row], demand: Demand) {
-    let wanted = match demand {
-        Demand::Easy => Tier::Cheap,
-        Demand::Moderate => Tier::Mid,
-        Demand::Hard => Tier::Top,
-    };
     let rank_of = |t: Tier| match t {
         Tier::Cheap => 0i32,
         Tier::Mid => 1,
         Tier::Top => 2,
     };
-    rows.sort_by_key(|r| (rank_of(r.tier) - rank_of(wanted)).abs());
+    let wanted = rank_of(demand.tier());
+    rows.sort_by_key(|r| ((rank_of(r.tier) - wanted).abs(), rank_of(r.tier)));
 }
 
 /// Rank `candidates` against `text`.
@@ -652,9 +847,15 @@ fn order_for(rows: &mut [Row], demand: Demand) {
 /// model string. An index either maps onto a real launch configuration or is rejected; a
 /// name could be plausible and wrong, and pstore would then try to launch it.
 ///
-/// Expect **seconds**: ~13 s with reasoning off and ~30–40 s with it, scaling with the
-/// candidate list. This is the call the whole "one invocation per user action" rule exists to
-/// ration — and the reason a degenerate answer is retried **once** and no more.
+/// Expect **seconds**, and where they go is worth knowing before optimising anything here.
+/// Measured on the 1-bit build over a nine-model field: mapping the weights 0.7 s, the difficulty
+/// call 7 s (368 prompt tokens, 34 generated), and the ranking call 40 s — of which 9.7 s is
+/// evaluating its 729-token prompt and **30.7 s is generating the reply**. Generation dominates,
+/// so the reasoning block is the only lever that moves the total; it is off by default now, which
+/// takes a ranking from ~36 s to ~17 s. See [`crate::config::Prefs::model_reasoning_budget`].
+///
+/// This is the call the whole "one invocation per user action" rule exists to ration — and the
+/// reason a degenerate answer is retried **once** and no more.
 pub fn rank(
     text: &str,
     candidates: &[super::Candidate],
@@ -666,17 +867,18 @@ pub fn rank(
     let want = shortlist_for(&models::active()).min(rows.len());
     let prefs = crate::config::prefs_snapshot();
     let budget = prefs.model_reasoning_budget;
-    let grammar = rank_grammar(&rows, want, budget);
-    let task = Task::judgement(grammar, rank_output_tokens(want, budget));
+    let max_output = rank_output_tokens(want, budget);
 
     // The window covers both calls, because one session serves both. Sized against the *retry*
     // wording of the ranking prompt, which is the longest this operation can send — a window that
-    // fits only the first attempt would silently truncate the second.
-    let widest = rank_prompt(text, &rows, want, Demand::Moderate, true);
+    // fits only the first attempt would silently truncate the second. The difficulty and breadth
+    // it is sized with are placeholders: they change a handful of words, never the length that
+    // matters, and the real ones are not known until the first call has run.
+    let widest = rank_prompt(text, &rows, want, Demand::Moderate, Breadth::FewFiles, true);
     let ctx = fit_context_for(
         &[
             (demand_prompt(text).len(), DEMAND_OUTPUT),
-            (widest.len(), task.max_output),
+            (widest.len(), max_output),
         ],
         prefs.model_context_ceiling,
     );
@@ -685,11 +887,16 @@ pub fn rank(
 
     // The cheap judgement first, so the expensive one has one thing to do rather than two. See
     // [`Demand`] for the live failure that motivates the split.
-    let (demand, because) = judge_demand(&session, text)?;
+    let (demand, breadth, because) = judge_demand(&session, text)?;
     // ...and then the options are presented in the order that judgement implies. See
     // [`order_for`]: on a small model this is the difference between a ranking and the first
     // three rows of the list.
     order_for(&mut rows, demand);
+
+    // The grammar is built here rather than above because the effort it anchors the top pick to
+    // is not known until the judgement has been made. See [`rank_grammar`].
+    let effort = target_effort(demand, breadth);
+    let task = Task::judgement(rank_grammar(&rows, want, effort, budget), max_output);
 
     // Two attempts at most. A ranking call is tens of seconds, so this is not a retry loop that
     // can be widened later without someone noticing — and a second degenerate answer is reported
@@ -697,7 +904,8 @@ pub fn rank(
     let mut degenerate = None;
     let mut choices = Vec::new();
     for attempt in 0..2 {
-        let reply = session.run(&task, &rank_prompt(text, &rows, want, demand, attempt > 0))?;
+        let prompt = rank_prompt(text, &rows, want, demand, breadth, attempt > 0);
+        let reply = session.run(&task, &prompt)?;
         choices = build_choices(&reply, &rows, candidates)?;
 
         degenerate = degeneracy(&choices, rows.len());
@@ -711,7 +919,12 @@ pub fn rank(
         choices,
         considered: candidates.len(),
         excluded,
-        demand: Some((demand.as_str(), because)),
+        judged: Some(super::Judgement {
+            demand: demand.as_str(),
+            breadth: breadth.label(),
+            effort,
+            because,
+        }),
         described: brief
             .known
             .iter()
@@ -847,9 +1060,17 @@ fn digits_in_range(lo: u32, hi: u32) -> String {
 ///   should never have to.
 /// * **Each position has its own `fit` band**, so the scores descend by construction. See
 ///   [`fit_band`] for the two live failures that instruction could not prevent on its own.
+/// * **The top pick's `effort` is bounded to the target and its neighbours**, for the same
+///   reason. The prompt asks for the effort [`target_effort`] computed; asking was not enough —
+///   over a sweep of eighteen prompts the checkpoint answered `low` on ten of them, including
+///   every prompt it had itself judged `moderate`, because `low` is the first alternative in the
+///   rule and nothing forbade it. One step either side leaves it room to disagree by a level, which is the
+///   most disagreement a self-assessment at this size can support. Later positions keep the full
+///   alternation: they are alternatives, and an alternative at the same effort as the pick above
+///   is not one.
 /// * **Every repetition is bounded.** `{0,n}` throughout, so a run cannot become unbounded by
 ///   any path through the grammar.
-fn rank_grammar(rows: &[Row], want: usize, reasoning_budget: usize) -> String {
+fn rank_grammar(rows: &[Row], want: usize, target: Effort, reasoning_budget: usize) -> String {
     use std::fmt::Write;
 
     // The template has already opened the block, so the grammar only has to close it.
@@ -881,11 +1102,29 @@ fn rank_grammar(rows: &[Row], want: usize, reasoning_budget: usize) -> String {
         }
     }
     efforts.sort_unstable();
-    let effort_rule = efforts
+    let alternation = |set: &[Effort]| {
+        set.iter()
+            .map(|e| format!("\"\\\"{e}\\\"\""))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let effort_rule = alternation(&efforts);
+
+    // The top pick's band: the target and one step either side, intersected with what the field
+    // actually offers. Intersected rather than assumed, because a machine with only Gemini
+    // installed offers one effort in total, and a rule matching nothing at all would make the
+    // whole reply unrepresentable — the sampler cannot answer, so there is no ranking rather than
+    // an unanchored one.
+    let near_target: Vec<Effort> = efforts
         .iter()
-        .map(|e| format!("\"\\\"{e}\\\"\""))
-        .collect::<Vec<_>>()
-        .join(" | ");
+        .copied()
+        .filter(|e| (step_of(*e) - step_of(target)).abs() <= 1)
+        .collect();
+    let effort0_rule = if near_target.is_empty() {
+        effort_rule.clone()
+    } else {
+        alternation(&near_target)
+    };
 
     // Positional choice rules, so each pick carries its own descending band.
     let mut answer = String::from("answer ::= \"{\\\"choices\\\":[\"");
@@ -896,9 +1135,12 @@ fn rank_grammar(rows: &[Row], want: usize, reasoning_budget: usize) -> String {
         }
         let _ = write!(answer, " choice{position}");
         let (lo, hi) = fit_band(position);
+        // Only the top pick is anchored. It is the one pstore would actually launch, and the
+        // ones below it are there to show the shape of the field.
+        let effort_ref = if position == 0 { "effort0" } else { "effort" };
         let _ = write!(
             choices,
-            "choice{position} ::= \"{{\\\"index\\\":\" index \",\\\"effort\\\":\" effort \
+            "choice{position} ::= \"{{\\\"index\\\":\" index \",\\\"effort\\\":\" {effort_ref} \
              \",\\\"fit\\\":\" fit{position} \",\\\"reason\\\":\" reason \"}}\"\n\
              fit{position} ::= {}\n",
             digits_in_range(lo, hi)
@@ -912,8 +1154,15 @@ fn rank_grammar(rows: &[Row], want: usize, reasoning_budget: usize) -> String {
          {choices}\
          index ::= {index}\n\
          effort ::= {effort_rule}\n\
+         effort0 ::= {effort0_rule}\n\
          reason ::= \"\\\"\" [^\"\\\\\\n]{{0,{REASON_CHARS}}} \"\\\"\"\n"
     )
+}
+
+/// Where an effort sits on the ladder, so "one step either side" is arithmetic rather than a
+/// hand-written table that would go stale the moment a level is added.
+fn step_of(effort: Effort) -> i32 {
+    Effort::ALL.iter().position(|e| *e == effort).unwrap_or(0) as i32
 }
 
 /// Build the ranking prompt.
@@ -930,7 +1179,14 @@ fn rank_grammar(rows: &[Row], want: usize, reasoning_budget: usize) -> String {
 /// * **`PAID-PER-TOKEN`** — the exception. "Included in subscription" was dropped because it is
 ///   the default, and saying so thirty times cost more than the one line that flags the
 ///   exception.
-fn rank_prompt(text: &str, rows: &[Row], want: usize, demand: Demand, retry: bool) -> String {
+fn rank_prompt(
+    text: &str,
+    rows: &[Row],
+    want: usize,
+    demand: Demand,
+    breadth: Breadth,
+    retry: bool,
+) -> String {
     use std::fmt::Write;
 
     let mut list = String::new();
@@ -969,6 +1225,13 @@ fn rank_prompt(text: &str, rows: &[Row], want: usize, demand: Demand, retry: boo
     // Only on the second attempt, and only naming the thing that went wrong. A prompt that
     // always carried this would spend tokens teaching the model to avoid a mistake it was not
     // making, and on a small checkpoint that is its own kind of noise.
+    //
+    // **Appended, not inserted**, and that placement is worth the awkwardness of it coming after
+    // the request. `cache_prompt` reuses an exact prefix, so a correction spliced into the middle
+    // of the prompt invalidates everything after it and the retry re-evaluates all ~730 tokens —
+    // ten seconds, to say one sentence the model has already read the context for. Appended, the
+    // retry shares the whole prompt with the attempt it is correcting and pays only for the
+    // sentence.
     let insist = if retry {
         "\nThe previous answer repeated itself. Each pick must be a DIFFERENT option, with a \
          different reason naming what distinguishes it.\n"
@@ -979,11 +1242,12 @@ fn rank_prompt(text: &str, rows: &[Row], want: usize, demand: Demand, retry: boo
     format!(
         "Pick the {want} best options for the prompt below, best first.\n\
          \n\
-         This prompt has already been judged **{difficulty}**.\n\
+         This prompt has already been judged **{difficulty}**, reaching across **{reach}**.\n\
          {act}\n\
          \n\
          Rules:\n\
-         - Choose an `effort` from the ones listed for that option.\n\
+         - Ask for **{effort}** effort, or the nearest an option offers. That is what this \
+         difficulty and this much code together need — do not spend more, and do not spend less.\n\
          - PAID-PER-TOKEN costs extra money; rank one high only if clearly better than \
          every other option here.\n\
          - `?` after the effort means it cannot be set, only predicted.\n\
@@ -992,14 +1256,16 @@ fn rank_prompt(text: &str, rows: &[Row], want: usize, demand: Demand, retry: boo
          it. Never rank an option first while saying it is risky or insufficient.\n\
          - A different reason for each: say what distinguishes it from the pick above.\n\
          - Pick each option at most once.\n\
-         {insist}\
          \n\
          Options:{list}\n\
          \n\
          Prompt to route:\n\
-         <prompt>\n{text}\n</prompt>\n",
+         <prompt>\n{text}\n</prompt>\n\
+         {insist}",
         difficulty = demand.as_str(),
+        reach = breadth.label(),
         act = demand.instruction(),
+        effort = target_effort(demand, breadth).as_str(),
     )
 }
 
@@ -1019,12 +1285,11 @@ fn snap_effort(
     if row.efforts.contains(&asked) {
         return asked;
     }
-    let position = |e: Effort| Effort::ALL.iter().position(|c| *c == e).unwrap_or(0) as i32;
-    let target = position(asked);
+    let target = step_of(asked);
     row.efforts
         .iter()
         .copied()
-        .min_by_key(|e| (position(*e) - target).abs())
+        .min_by_key(|e| (step_of(*e) - target).abs())
         .unwrap_or(Effort::High)
 }
 
@@ -1907,7 +2172,14 @@ mod tests {
         );
 
         let rows = rows(&[heavy, light], &Brief::default());
-        let prompt = rank_prompt("refactor this", &rows, 2, Demand::Hard, false);
+        let prompt = rank_prompt(
+            "refactor this",
+            &rows,
+            2,
+            Demand::Hard,
+            Breadth::FewFiles,
+            false,
+        );
 
         assert!(
             prompt.contains("burns 5x quota"),
@@ -1925,7 +2197,7 @@ mod tests {
     #[test]
     fn the_prompt_states_burn_but_never_price() {
         let rows = rows(&[real("claude", "fable", Effort::Max)], &Brief::default());
-        let prompt = rank_prompt("anything", &rows, 1, Demand::Hard, false);
+        let prompt = rank_prompt("anything", &rows, 1, Demand::Hard, Breadth::FewFiles, false);
 
         assert!(prompt.contains("burns 10x quota"));
         assert!(
@@ -2208,7 +2480,14 @@ mod tests {
         let rows = rows(&cands, &brief);
         assert_eq!(rows[0].note, "frontier model, best for hard refactors");
 
-        let prompt = rank_prompt("do a thing", &rows, 1, Demand::Hard, false);
+        let prompt = rank_prompt(
+            "do a thing",
+            &rows,
+            1,
+            Demand::Hard,
+            Breadth::FewFiles,
+            false,
+        );
         assert!(
             prompt.contains("frontier model, best for hard refactors"),
             "the note is missing from the prompt: {prompt}"
@@ -2216,7 +2495,15 @@ mod tests {
         // And the retry instruction is only added when there is something to correct.
         assert!(!prompt.contains("repeated itself"));
         assert!(
-            rank_prompt("do a thing", &rows, 1, Demand::Hard, true).contains("repeated itself")
+            rank_prompt(
+                "do a thing",
+                &rows,
+                1,
+                Demand::Hard,
+                Breadth::FewFiles,
+                true
+            )
+            .contains("repeated itself")
         );
     }
 
@@ -2384,13 +2671,203 @@ mod tests {
         let cands = [candidate("claude", "opus", Effort::High)];
         let rows = rows(&cands, &Brief::default());
         for d in all {
-            let p = rank_prompt("x", &rows, 1, d, false);
+            let p = rank_prompt("x", &rows, 1, d, Breadth::FewFiles, false);
             assert!(p.contains(d.as_str()), "{d:?} is not stated in the prompt");
             assert!(
                 p.contains(d.instruction()),
                 "{d:?} does not tell the ranker what to do"
             );
         }
+
+        // The instruction picks the weight class and says nothing about effort. Effort is
+        // `target_effort`'s to decide, and a level named in two places is a level that can
+        // disagree with itself — which is how `xhigh` and `max` came to be unreachable.
+        for d in all {
+            for level in Effort::ALL {
+                assert!(
+                    !d.instruction().contains(level.as_str()),
+                    "{d:?} names an effort level ({level}) the breadth judgement has not seen yet"
+                );
+            }
+        }
+    }
+
+    /// Difficulty picks the model, breadth picks how long it thinks — and the whole reason
+    /// breadth is asked for at all is that difficulty alone could not reach the top of the
+    /// ladder. `xhigh` and `max` were offered by the registry, admitted by the grammar, and
+    /// requested by nothing.
+    #[test]
+    fn every_effort_level_is_reachable_from_some_judgement() {
+        let all = [Demand::Easy, Demand::Moderate, Demand::Hard];
+        let breadths = [Breadth::OneEdit, Breadth::FewFiles, Breadth::ManyFiles];
+
+        let mut reached: Vec<Effort> = all
+            .iter()
+            .flat_map(|d| breadths.iter().map(|b| target_effort(*d, *b)))
+            .collect();
+        reached.sort_unstable();
+        reached.dedup();
+        assert_eq!(
+            reached,
+            Effort::ALL.to_vec(),
+            "some effort level cannot be asked for by any prompt"
+        );
+
+        // Monotone in both arguments: harder never thinks less, and wider never thinks less.
+        // Without this the table could reach every level and still be nonsense.
+        for (i, d) in all.iter().enumerate() {
+            for (j, b) in breadths.iter().enumerate() {
+                if let Some(harder) = all.get(i + 1) {
+                    assert!(
+                        target_effort(*harder, *b) >= target_effort(*d, *b),
+                        "{harder:?} thinks less than {d:?} at {b:?}"
+                    );
+                }
+                if let Some(wider) = breadths.get(j + 1) {
+                    assert!(
+                        target_effort(*d, *wider) >= target_effort(*d, *b),
+                        "{wider:?} thinks less than {b:?} at {d:?}"
+                    );
+                }
+            }
+        }
+
+        // The one row that must never leave the fast end: a verbose request for a one-word fix
+        // is still a one-word fix, and paying `high` for it is what this path exists to prevent.
+        assert!(
+            breadths
+                .iter()
+                .all(|b| target_effort(Demand::Easy, *b) <= Effort::Medium),
+            "easy work was sent away to think"
+        );
+    }
+
+    /// The retry has to be the first attempt's prompt **plus** a suffix, never a different prompt.
+    /// `cache_prompt` reuses an exact prefix and nothing less, so a correction spliced into the
+    /// middle costs a full re-evaluation of ~730 tokens — about ten seconds — to say one sentence.
+    /// Appended, the retry pays for the sentence alone.
+    #[test]
+    fn the_retry_prompt_only_adds_to_the_first_one() {
+        let cands = [
+            candidate("claude", "opus", Effort::High),
+            candidate("claude", "haiku", Effort::Low),
+        ];
+        let rows = rows(&cands, &Brief::default());
+
+        let first = rank_prompt(
+            "do a thing",
+            &rows,
+            2,
+            Demand::Hard,
+            Breadth::FewFiles,
+            false,
+        );
+        let again = rank_prompt(
+            "do a thing",
+            &rows,
+            2,
+            Demand::Hard,
+            Breadth::FewFiles,
+            true,
+        );
+
+        assert!(
+            again.starts_with(&first),
+            "the retry diverges from the first attempt instead of extending it, so every token \
+             is re-evaluated:\n--- first ---\n{first}\n--- retry ---\n{again}"
+        );
+        assert!(again.len() > first.len(), "the retry says nothing new");
+        assert!(again.contains("repeated itself"), "{again}");
+        assert!(!first.contains("repeated itself"), "{first}");
+    }
+
+    /// Both axes and what they came to have to reach the ranking prompt. The target effort in
+    /// particular: the grammar anchors the top pick to it, and a prompt that did not also ask
+    /// for it would leave the model constrained towards a level it was never told about.
+    #[test]
+    fn the_prompt_states_both_judgements_and_the_effort_they_imply() {
+        let cands = [candidate("claude", "opus", Effort::XHigh)];
+        let rows = rows(&cands, &Brief::default());
+
+        let p = rank_prompt("x", &rows, 1, Demand::Hard, Breadth::FewFiles, false);
+        assert!(p.contains("hard"), "{p}");
+        assert!(p.contains(Breadth::FewFiles.label()), "{p}");
+        assert!(
+            p.contains("**xhigh** effort"),
+            "the target effort is not asked for: {p}"
+        );
+
+        // A different breadth at the same difficulty has to change what is asked for, or the
+        // second judgement is decoration.
+        let wider = rank_prompt("x", &rows, 1, Demand::Hard, Breadth::ManyFiles, false);
+        assert!(wider.contains("**max** effort"), "{wider}");
+        assert!(wider.contains(Breadth::ManyFiles.label()), "{wider}");
+    }
+
+    /// The parser and the grammar have to agree on every spelling. They are two lists of the
+    /// same strings in different places, and a mismatch is silent: the sampler emits a label the
+    /// `match` in `judge_demand` does not recognise, and every prompt comes back `moderate` and
+    /// `few_files` — a routing feature that has quietly stopped routing.
+    #[test]
+    fn the_difficulty_grammar_admits_exactly_what_the_parser_reads() {
+        let g = demand_grammar();
+
+        for label in [Demand::Easy, Demand::Moderate, Demand::Hard].map(Demand::as_str) {
+            assert!(g.contains(&format!("\"{label}\"")), "{label} missing: {g}");
+        }
+        for label in [Breadth::OneEdit, Breadth::FewFiles, Breadth::ManyFiles].map(Breadth::as_str)
+        {
+            assert!(g.contains(&format!("\"{label}\"")), "{label} missing: {g}");
+        }
+
+        // Breadth is answered first, and that is the point of writing this grammar by hand:
+        // greedy sampling makes each field condition the next, and with difficulty first the
+        // two collapsed onto each other.
+        let root = g.lines().next().expect("a root rule");
+        let breadth_at = root.find("breadth").expect("breadth in the root rule");
+        let difficulty_at = root
+            .find("difficulty")
+            .expect("difficulty in the root rule");
+        let because_at = root.find("because").expect("because in the root rule");
+        assert!(
+            breadth_at < difficulty_at && difficulty_at < because_at,
+            "the fields are answered in the wrong order: {root}"
+        );
+
+        // The trap the whole module is written around, and the one the schema path walked into:
+        // an unbounded run of anything is somewhere the sampler can sit until the budget is gone.
+        for (n, line) in g.lines().enumerate() {
+            assert!(
+                !line.contains('*') && !line.contains('+'),
+                "line {n} can repeat without bound: {line}"
+            );
+        }
+        assert!(!g.contains(" ws"), "no whitespace rule: {g}");
+    }
+
+    /// Both halves of the judgement are asked for, both are defined, and the prompt says they
+    /// are independent. That last line is not padding: without it the two collapsed, and every
+    /// request judged `hard` came back `many_files` — including a one-line lock-renewal fix.
+    #[test]
+    fn the_difficulty_prompt_defines_both_axes_separately() {
+        let p = demand_prompt("rename a thing");
+
+        for label in [Demand::Easy, Demand::Moderate, Demand::Hard].map(Demand::as_str) {
+            assert!(p.contains(label), "{label} is not defined: {p}");
+        }
+        for label in [Breadth::OneEdit, Breadth::FewFiles, Breadth::ManyFiles].map(Breadth::as_str)
+        {
+            assert!(p.contains(label), "{label} is not defined: {p}");
+        }
+        assert!(p.contains("rename a thing"), "the request is missing: {p}");
+        assert!(
+            p.contains("independent"),
+            "nothing stops the two judgements collapsing onto each other: {p}"
+        );
+        assert!(
+            p.contains("not how long the request is"),
+            "a polite four-sentence request for a typo fix will be read as work: {p}"
+        );
     }
 
     /// A small model reads the top of the list, so the top of the list has to be the answer.
@@ -2437,6 +2914,81 @@ mod tests {
         // The tail is ordered by distance too, so the worst fit is last rather than second.
         assert_eq!(first(Demand::Hard).last().unwrap(), "haiku");
         assert_eq!(first(Demand::Easy).last().unwrap(), "opus");
+
+        // Light and frontier are the same distance from mid, so `moderate` would otherwise be
+        // decided by whichever agent the user installed first. The lighter one goes above: the
+        // two mistakes are not symmetrical, and a frontier model at 25x quota burn on ordinary
+        // work costs an allowance that is needed later in the week.
+        assert_eq!(
+            first(Demand::Moderate),
+            vec!["sonnet", "haiku", "opus"],
+            "a tie in tier distance has to break downwards, not by registry order"
+        );
+    }
+
+    /// The top pick's effort is bounded by the grammar rather than only asked for. Asking was
+    /// tried: across a baseline sweep the checkpoint answered `low` for ten of eighteen prompts
+    /// including a repo-wide migration, because `low` is the first alternative in the rule and
+    /// nothing forbade it.
+    #[test]
+    fn the_grammar_anchors_the_top_picks_effort_to_the_target() {
+        let cands: Vec<super::super::Candidate> = Effort::ALL
+            .iter()
+            .map(|e| candidate("claude", "opus", *e))
+            .collect();
+        let rows = rows(&cands, &Brief::default());
+
+        let effort0 = |g: &str| {
+            g.lines()
+                .find(|l| l.starts_with("effort0 ::="))
+                .expect("a rule for the top pick's effort")
+                .to_string()
+        };
+
+        // The target and one step either side, and nothing else.
+        let g = rank_grammar(&rows, 3, Effort::XHigh, 0);
+        let top = effort0(&g);
+        assert!(
+            top.contains("high") && top.contains("xhigh") && top.contains("max"),
+            "{top}"
+        );
+        assert!(!top.contains("\\\"low\\\""), "low is two steps away: {top}");
+        assert!(!top.contains("medium"), "medium is two steps away: {top}");
+
+        // At the bottom of the ladder the band is simply shorter — it is not wrapped or shifted.
+        let low = effort0(&rank_grammar(&rows, 3, Effort::Low, 0));
+        assert!(low.contains("low") && low.contains("medium"), "{low}");
+        assert!(!low.contains("high"), "{low}");
+
+        // Later positions keep the full alternation: they are alternatives, and an alternative
+        // at the same effort as the pick above it is not one.
+        let full = g
+            .lines()
+            .find(|l| l.starts_with("effort ::="))
+            .expect("a rule for the rest");
+        assert!(full.contains("low") && full.contains("max"), "{full}");
+        assert!(g.contains("choice0 ::=") && g.contains(" effort0 "), "{g}");
+        assert!(g.contains("choice1 ::=") && g.contains(" effort "), "{g}");
+    }
+
+    /// A field that offers nothing near the target must still be rankable. Gemini cannot be told
+    /// an effort at all, so a machine with only Gemini installed offers exactly one level — and a
+    /// rule matching none of it would make the whole reply unrepresentable, which is not a worse
+    /// ranking but no ranking at all.
+    #[test]
+    fn an_effort_target_nothing_offers_falls_back_to_the_whole_field() {
+        let cands = [candidate("gemini", "flash", Effort::High)];
+        let rows = rows(&cands, &Brief::default());
+
+        let g = rank_grammar(&rows, 1, Effort::Low, 0);
+        let top = g
+            .lines()
+            .find(|l| l.starts_with("effort0 ::="))
+            .expect("a rule for the top pick's effort");
+        assert!(
+            top.contains("high"),
+            "the one effort on offer has to stay representable: {top}"
+        );
     }
 
     /// The small build is asked an easier question than the big one. If this regresses it does
@@ -2463,7 +3015,7 @@ mod tests {
             candidate("claude", "haiku", Effort::Low),
         ];
         let rows = rows(&cands, &Brief::default());
-        let g = rank_grammar(&rows, 2, 1400);
+        let g = rank_grammar(&rows, 2, Effort::High, 1400);
 
         assert!(g.contains("</think>"), "reasoning must be closed");
         assert!(
@@ -2484,7 +3036,7 @@ mod tests {
         );
 
         // Reasoning off means no think block at all, not an empty one.
-        let quiet = rank_grammar(&rows, 2, 0);
+        let quiet = rank_grammar(&rows, 2, Effort::High, 0);
         assert!(!quiet.contains("</think>"));
         assert!(quiet.starts_with("root ::= answer"));
     }
@@ -2826,6 +3378,9 @@ mod tests {
             cands.push(real("gemini", model, Effort::High));
         }
 
+        let mut failures: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
         for choice in cached {
             let checkpoint = choice.checkpoint();
             let mut prefs = crate::config::prefs_snapshot();
@@ -2850,8 +3405,8 @@ mod tests {
             eprintln!("  ranked in {:.1}s", started.elapsed().as_secs_f32());
             // The premise of everything below it: a shortlist that looks wrong is usually a
             // difficulty read that was wrong, and without this the failure is unattributable.
-            match &ranking.demand {
-                Some((label, because)) => eprintln!("  judged {label} — {because}"),
+            match &ranking.judged {
+                Some(j) => eprintln!("  judged {} — {}", j.summary(), j.because),
                 None => eprintln!("  no difficulty read"),
             }
             for c in &ranking.choices {
@@ -2861,26 +3416,64 @@ mod tests {
                 );
             }
 
-            assert!(
+            // Collected rather than asserted one at a time. The point of running every build on
+            // disk is to learn how each of them does, and `assert!` inside the loop throws that
+            // away: the first build to fail ends the run, and the build that is actually the
+            // default goes untested. Ternary is first in the list, so a ternary regression used
+            // to hide the 1-bit result entirely.
+            let mut check = |ok: bool, what: String| {
+                checked += 1;
+                if !ok {
+                    failures.push(format!("{}: {what}", checkpoint.title));
+                }
+            };
+
+            check(
                 ranking.degenerate.is_none(),
-                "{} enumerated instead of ranking: {:?}",
-                checkpoint.title,
-                ranking.degenerate
+                format!("enumerated instead of ranking ({:?})", ranking.degenerate),
             );
             // The judgement itself: this prompt names three files, an invariant to preserve and
             // every public signature. It is not work for the lightest model available.
             let best = ranking.best().expect("a non-empty shortlist");
-            assert_ne!(
-                best.model_id, "haiku",
-                "{} sent a hard three-file refactor to the lightest model at effort {}",
-                checkpoint.title, best.effort
+            check(
+                best.model_id != "haiku",
+                format!(
+                    "sent a hard three-file refactor to the lightest model at effort {}",
+                    best.effort
+                ),
             );
-            assert_ne!(
-                best.model_id, "gemini-3-flash",
-                "{} sent a hard three-file refactor to a light model",
-                checkpoint.title
+            check(
+                best.model_id != "gemini-3-flash",
+                "sent a hard three-file refactor to a light model".into(),
+            );
+
+            // And the other half of the judgement, which is what breadth was added for. This
+            // prompt names three files and every public signature; whatever model it lands on,
+            // asking that model for the cheapest thinking it offers is the wrong answer. Before
+            // breadth was judged, `high` was the ceiling any prompt could reach and `low` was
+            // where ten of eighteen top picks landed.
+            let judged = ranking.judged.as_ref().expect("a judgement");
+            check(
+                judged.effort >= Effort::High,
+                format!(
+                    "steered a hard multi-file refactor to effort {} ({})",
+                    judged.effort,
+                    judged.summary()
+                ),
+            );
+            check(
+                best.effort > Effort::Low,
+                "asked for the cheapest thinking on a hard refactor".into(),
             );
         }
+
+        assert!(
+            failures.is_empty(),
+            "{} of {} checks failed:\n  {}",
+            failures.len(),
+            checked,
+            failures.join("\n  ")
+        );
     }
 
     /// Every repetition in the grammar has to be bounded. An unbounded rule is a place the
@@ -2889,7 +3482,7 @@ mod tests {
     /// at all. This is cheaper to assert than to rediscover.
     #[test]
     fn the_grammar_has_no_unbounded_repetition() {
-        let g = rank_grammar(&test_rows(15), 5, 1400);
+        let g = rank_grammar(&test_rows(15), 5, Effort::High, 1400);
         for (n, line) in g.lines().enumerate() {
             assert!(
                 !line.contains('*') && !line.contains('+'),
@@ -2906,7 +3499,7 @@ mod tests {
     /// leave `build_choices` to drop a pick the user then cannot account for.
     #[test]
     fn the_grammar_admits_exactly_the_real_indices() {
-        let g = rank_grammar(&test_rows(3), 2, 0);
+        let g = rank_grammar(&test_rows(3), 2, Effort::High, 0);
         let index = g
             .lines()
             .find(|l| l.starts_with("index ::="))
@@ -2918,7 +3511,7 @@ mod tests {
         assert!(!g.contains(END_OF_THOUGHT), "{g}");
 
         // One candidate is still a valid list, and must not produce an empty alternation.
-        assert!(rank_grammar(&test_rows(1), 1, 0).contains("index ::= \"0\""));
+        assert!(rank_grammar(&test_rows(1), 1, Effort::High, 0).contains("index ::= \"0\""));
     }
 
     /// With a budget the reasoning block is *permitted* up to the cap and `</think>` is then
@@ -2926,7 +3519,7 @@ mod tests {
     /// model would think until the token budget ran out, which is the failure this replaced.
     #[test]
     fn a_reasoning_budget_is_a_cap_and_a_forced_close() {
-        let g = rank_grammar(&test_rows(15), 5, 900);
+        let g = rank_grammar(&test_rows(15), 5, Effort::High, 900);
         assert!(
             g.starts_with(&format!("root ::= thought \"{END_OF_THOUGHT}\" answer")),
             "{g}"
@@ -2952,12 +3545,12 @@ mod tests {
                 .count()
         };
 
-        let five = rank_grammar(&test_rows(15), 5, 0);
+        let five = rank_grammar(&test_rows(15), 5, Effort::High, 0);
         assert_eq!(positions(&five), 5, "{five}");
         assert!(five.contains("fit4 ::="), "the fifth band is missing");
         assert!(!five.contains("fit5 ::="), "a sixth position was generated");
 
-        let one = rank_grammar(&test_rows(15), 1, 0);
+        let one = rank_grammar(&test_rows(15), 1, Effort::High, 0);
         assert_eq!(positions(&one), 1, "{one}");
         let answer = one.lines().find(|l| l.starts_with("answer ::=")).unwrap();
         assert!(
@@ -2974,7 +3567,7 @@ mod tests {
         assert_eq!(extract.temperature, 0.0, "extraction must be greedy");
         assert!(matches!(extract.constrain, Constrain::Schema(_)));
 
-        let judge = Task::judgement(rank_grammar(&test_rows(3), 2, 900), 400);
+        let judge = Task::judgement(rank_grammar(&test_rows(3), 2, Effort::High, 900), 400);
         assert_eq!(
             (judge.temperature, judge.top_p, judge.top_k),
             (0.7, 0.95, 20),
@@ -3028,7 +3621,14 @@ mod tests {
         let cands = [candidate("claude", "sonnet", Effort::Low), metered];
         let rows = rows(&cands, &Brief::default());
 
-        let p = rank_prompt("fix a typo", &rows, 2, Demand::Easy, false);
+        let p = rank_prompt(
+            "fix a typo",
+            &rows,
+            2,
+            Demand::Easy,
+            Breadth::OneEdit,
+            false,
+        );
         assert!(
             p.contains("fix a typo"),
             "the prompt itself must be in there"
@@ -3045,8 +3645,24 @@ mod tests {
     #[test]
     fn the_candidate_list_stays_compact() {
         let rows = test_rows(30);
-        let list_bytes = rank_prompt("do a thing", &rows, 5, Demand::Moderate, false).len()
-            - rank_prompt("do a thing", &[], 5, Demand::Moderate, false).len();
+        let list_bytes = rank_prompt(
+            "do a thing",
+            &rows,
+            5,
+            Demand::Moderate,
+            Breadth::FewFiles,
+            false,
+        )
+        .len()
+            - rank_prompt(
+                "do a thing",
+                &[],
+                5,
+                Demand::Moderate,
+                Breadth::FewFiles,
+                false,
+            )
+            .len();
         let per_line = list_bytes / 30;
         assert!(
             per_line < 60,

@@ -307,4 +307,112 @@ mod tests {
         };
         assert!(tight.summary().contains("only *sonnet*"));
     }
+
+    /// A hand-edited config is the only way these lists are ever written, so the shapes a
+    /// hand-edited config actually acquires have to behave. The dangerous one is an empty
+    /// string: `"block": [""]` reads as "block nothing in particular", and a matcher that let
+    /// it match everything would silently empty the field — the ranking would come back saying
+    /// no model qualified, with nothing on screen explaining why.
+    #[test]
+    fn a_stray_empty_pattern_does_not_swallow_the_field() {
+        let f = Filter {
+            block: vec![String::new(), "   ".into()],
+            allow: Vec::new(),
+            block_metered: false,
+            efforts: Vec::new(),
+        };
+        assert!(f.allows_model("claude", "claude-opus-5", "Opus 5", false));
+        assert!(f.allows_model("codex", "gpt-5.1-codex", "GPT-5.1", false));
+
+        // Surrounding whitespace is the other thing hand-editing produces, and it must not
+        // stop a pattern working — `[" *sonnet* "]` means what it looks like.
+        let padded = Filter {
+            block: vec!["  *sonnet*  ".into()],
+            allow: Vec::new(),
+            block_metered: false,
+            efforts: Vec::new(),
+        };
+        assert!(!padded.allows_model("claude", "claude-sonnet-5", "Sonnet 5", false));
+        assert!(padded.allows_model("claude", "claude-opus-5", "Opus 5", false));
+    }
+
+    /// `allow` and `block` are combined with "and", so a model has to satisfy both. The
+    /// property that matters is that it fails *closed*: whenever the two disagree about a
+    /// model, the answer is no.
+    #[test]
+    fn the_two_lists_fail_closed_wherever_they_disagree() {
+        let f = Filter {
+            allow: vec!["*".into()],
+            block: vec!["*opus*".into()],
+            block_metered: true,
+            efforts: Vec::new(),
+        };
+        // Allowed by the whitelist, refused by the blocklist.
+        assert!(!f.allows_model("claude", "claude-opus-5", "Opus 5", false));
+        // Allowed by the whitelist and metered: still refused, without being named.
+        assert!(!f.allows_model("claude", "claude-fable-5", "Fable 5", true));
+        // Allowed by both.
+        assert!(f.allows_model("claude", "claude-sonnet-5", "Sonnet 5", false));
+
+        // A whitelist that names nothing reachable leaves nothing — deliberately, and this is
+        // the state `router` reports as "it was the filter" rather than "nothing installed".
+        let nothing = Filter {
+            allow: vec!["no-such-model".into()],
+            block: Vec::new(),
+            block_metered: false,
+            efforts: Vec::new(),
+        };
+        for (agent, id, display) in [
+            ("claude", "claude-opus-5", "Opus 5"),
+            ("codex", "gpt-5.1-codex", "GPT-5.1"),
+            ("gemini", "gemini-3-pro", "Gemini 3 Pro"),
+        ] {
+            assert!(!nothing.allows_model(agent, id, display, false), "{id}");
+        }
+    }
+
+    /// The metered rule is the one that spends money, so it holds regardless of what the
+    /// name-based lists say — including a whitelist that names the metered model outright.
+    #[test]
+    fn the_metered_rule_outranks_a_whitelist_that_names_the_model() {
+        let f = Filter {
+            allow: vec!["Fable 5".into()],
+            block: Vec::new(),
+            block_metered: true,
+            efforts: Vec::new(),
+        };
+        assert!(
+            !f.allows_model("claude", "claude-fable-5", "Fable 5", true),
+            "naming a metered model in `allow` must not be enough to bill someone"
+        );
+
+        // Clearing the rule is what reaches it — one deliberate change, in the field whose
+        // whole job is to say so.
+        let f = Filter {
+            block_metered: false,
+            ..f
+        };
+        assert!(f.allows_model("claude", "claude-fable-5", "Fable 5", true));
+    }
+
+    /// The glob is run against every model name on every ranking, so a pattern that makes it
+    /// hang is a pattern that hangs pstore. The doc claims backtracking is linear in practice
+    /// and cannot blow the stack; these are the shapes that break the naive recursion.
+    #[test]
+    fn pathological_patterns_terminate() {
+        let name = "a".repeat(2000);
+        assert!(matches(&"*".repeat(64), &name));
+        assert!(matches("*a*a*a*a*a*a*a*a*", &name));
+        assert!(!matches(&format!("{}b", "*a".repeat(32)), &name));
+        assert!(matches("?????", "abcde"));
+        assert!(!matches("?????", "abcd"));
+
+        // Multibyte names must match by character, not by byte — `?` is one character, not one
+        // byte, and lowercasing has to reach the accented ones too.
+        assert!(matches("gém?nï*", "Géminï-3-pro"));
+        assert!(matches("*ï*", "Géminï"));
+        assert!(matches("GÉMINÏ", "géminï"));
+        // ...and an accent is still a difference: `i` is not `ï`.
+        assert!(!matches("gémini*", "Géminï-3-pro"));
+    }
 }

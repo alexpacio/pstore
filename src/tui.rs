@@ -667,14 +667,14 @@ impl Tui {
             ),
             Style::default().add_modifier(Modifier::DIM),
         ))];
-        if let Some((label, because)) = &ranking.demand {
+        if let Some(judged) = &ranking.judged {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("judged {label}"),
+                    format!("judged {}", judged.summary()),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!(" — {because}"),
+                    judged.because_suffix(),
                     Style::default().add_modifier(Modifier::DIM),
                 ),
             ]));

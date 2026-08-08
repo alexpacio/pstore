@@ -393,7 +393,78 @@ pub fn path_token(token: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Things that must appear in the rewrite as often as in the original.
+/// Every path token in `text`, in the order it appears.
+fn path_tokens(text: &str) -> Vec<String> {
+    text.split_whitespace().filter_map(path_token).collect()
+}
+
+/// A token of the rewrite with its surrounding punctuation removed, whatever it turns out to be.
+///
+/// Deliberately *not* [`path_token`]. That one answers "is this a file reference?", and it is
+/// strict on purpose — a bare `README.` at the end of a sentence must not read as one. Here the
+/// question is only "does the rewrite still name the path we already found in the original", so
+/// the strictness has nothing to do and does real harm: it is what made `Update main.rs.` fail
+/// to satisfy a reference to `src/main.rs`, the rewrite having put it at the end of a sentence.
+/// One pass of trimming is not enough here: `` `src/main.rs`. `` ends in a character the
+/// punctuation trim keeps (`.`), so the backtick behind it is never reached and the token comes
+/// out as ``src/main.rs` ``, which matches nothing. So the two trims alternate until neither
+/// takes anything. [`looks_like_path`] deliberately does *not* do this — there the trailing dot
+/// is load-bearing, and eating it would make `e.g.` a file called `g`.
+fn bare_token(token: &str) -> Option<&str> {
+    let mut t = token;
+    loop {
+        let next = t
+            .trim_matches(|c: char| {
+                !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+            })
+            .trim_end_matches('.');
+        if next == t {
+            break;
+        }
+        t = next;
+    }
+    (!t.is_empty()).then_some(t)
+}
+
+/// Whether `wanted` is still named anywhere in `after`.
+///
+/// Not token equality, because the two texts tokenise differently and a rewrite is allowed to
+/// re-punctuate. The live failure: a prompt naming `Next.js` three times was rewritten to
+/// `React/Next.js`, and comparing whole whitespace tokens reported the reference dropped —
+/// from a rewrite whose very first line contains it.
+///
+/// So a reference counts as kept when either side is the other's trailing path segment:
+/// `Next.js` is satisfied by `React/Next.js`, and `src/main.rs` by `main.rs`. It stays a
+/// *segment* boundary rather than a plain substring, so `a/config.rs` and `b/config.rs` remain
+/// different files and `next.js` does not answer for `xnext.js` — which is the whole point of
+/// the check.
+fn still_named(wanted: &str, after: &str) -> bool {
+    after.split_whitespace().filter_map(bare_token).any(|p| {
+        p == wanted || p.ends_with(&format!("/{wanted}")) || wanted.ends_with(&format!("/{p}"))
+    })
+}
+
+/// File references in `before` that `after` no longer names, each reported once.
+///
+/// Shared with [`crate::plan::warnings`], which asks the same question of a plan and had the
+/// same two bugs when it asked it itself.
+///
+/// **Presence, not frequency.** Deduplicated because a repeat is not a second file: reporting
+/// `Next.js, Next.js, Next.js` reads as three dropped references when it is one, and the count
+/// it repeated was the count in the *original*, which says nothing about what the rewrite kept.
+/// Counting occurrences would be wrong here anyway — stating each fact once is exactly what
+/// shrink is for, so a path mentioned three times and kept once is a success, not a warning.
+pub fn dropped_paths(before: &str, after: &str) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    for p in path_tokens(before) {
+        if !still_named(&p, after) && !missing.contains(&p) {
+            missing.push(p);
+        }
+    }
+    missing
+}
+
+/// Things that must still be in the rewrite.
 ///
 /// A cheap structural check before showing the diff: if a code fence or a file path
 /// went missing, the rewrite broke the prompt regardless of how good the prose looks.
@@ -409,14 +480,7 @@ pub fn integrity_warnings(before: &str, after: &str) -> Vec<String> {
         ));
     }
 
-    let paths = |s: &str| -> Vec<String> { s.split_whitespace().filter_map(path_token).collect() };
-    let before_paths = paths(before);
-    let after_paths = paths(after);
-    let missing: Vec<_> = before_paths
-        .iter()
-        .filter(|p| !after_paths.contains(p))
-        .cloned()
-        .collect();
+    let missing = dropped_paths(before, after);
     if !missing.is_empty() {
         warnings.push(format!("file references dropped: {}", missing.join(", ")));
     }
@@ -720,5 +784,76 @@ mod tests {
                       really appreciate it if you ran the tests afterwards.";
         let after = "Update src/main.rs, then run the tests.";
         assert!(integrity_warnings(before, after).is_empty());
+    }
+
+    /// The bug this guards, seen on a real `pstore shrink` run: a prompt naming `Next.js`
+    /// three times was rewritten to `React/Next.js + SQLite`, and the check reported the
+    /// reference dropped — from a rewrite whose first line contains it. The comparison was
+    /// whole whitespace tokens, so re-punctuating a reference read as losing it.
+    #[test]
+    fn a_reference_the_rewrite_repunctuated_is_not_reported_dropped() {
+        for (before, after, why) in [
+            (
+                "Use Next.js for the frontend.",
+                "Build with React/Next.js.",
+                "a reference that gained a leading segment",
+            ),
+            (
+                "Edit src/main.rs.",
+                "Edit main.rs.",
+                "a reference that lost a leading segment",
+            ),
+            (
+                "Update config.toml and README.md.",
+                "Update `config.toml`, `README.md`.",
+                "references the rewrite wrapped in backticks",
+            ),
+            (
+                "Touch src/a.rs, src/b.rs and src/c.rs.",
+                "Touch src/a.rs src/b.rs src/c.rs",
+                "several references, all kept",
+            ),
+        ] {
+            assert!(
+                dropped_paths(before, after).is_empty(),
+                "{why}: {:?}",
+                dropped_paths(before, after)
+            );
+        }
+    }
+
+    /// Segment-boundary, not substring: two files with the same name in different folders
+    /// are different files, and saying otherwise would make the check miss the real thing it
+    /// exists to catch.
+    #[test]
+    fn a_different_file_with_the_same_name_is_still_dropped() {
+        for (before, after) in [
+            ("Edit a/config.rs.", "Edit b/config.rs."),
+            ("Edit src/net/retry.rs.", "Edit src/net/backoff.rs."),
+            // Segment boundary, not substring: one name ending in the other is not the other.
+            ("Edit xnext.js now.", "Edit next.js now."),
+        ] {
+            assert_eq!(
+                dropped_paths(before, after).len(),
+                1,
+                "{before:?} → {after:?} should report exactly one dropped reference"
+            );
+        }
+    }
+
+    /// Presence, not frequency, and reported once. Repeating the token as many times as the
+    /// *original* mentioned it — which is what it used to do — reads as several different
+    /// files dropped, and the number came from the wrong side of the comparison.
+    #[test]
+    fn a_dropped_reference_is_reported_once_however_often_it_was_mentioned() {
+        let before = "Edit src/main.rs. Then src/main.rs again. And src/main.rs once more.";
+        assert_eq!(dropped_paths(before, "Do nothing."), ["src/main.rs"]);
+
+        // Mentioned three times, kept once: shrink's whole job, and not a warning.
+        assert!(dropped_paths(before, "Edit src/main.rs.").is_empty());
+
+        // Distinct files are still listed separately, in the order the original named them.
+        let w = dropped_paths("Edit src/b.rs then src/a.rs then src/b.rs.", "Nothing.");
+        assert_eq!(w, ["src/b.rs", "src/a.rs"]);
     }
 }

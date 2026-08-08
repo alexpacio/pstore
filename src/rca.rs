@@ -172,6 +172,15 @@ fn entry_text(entry: &str) -> String {
     if text.starts_with('{') || text.starts_with("[{") {
         text = json_fragment(&text);
     }
+    strip_leading_markers(&text)
+}
+
+/// `text` with every leading list marker removed.
+///
+/// Shared with [`crate::plan::render`], which lays out the same kind of model-written list and
+/// so meets the same models writing their own bullets into it.
+pub(crate) fn strip_leading_markers(text: &str) -> String {
+    let mut text = text.trim().to_string();
     while let Some(rest) = without_leading_marker(&text) {
         text = rest.to_string();
     }
@@ -188,7 +197,24 @@ fn entry_text(entry: &str) -> String {
 fn without_leading_marker(text: &str) -> Option<&str> {
     let t = text.trim_start();
     if let Some(rest) = t.strip_prefix(['-', '*', '•', '·', '–']) {
-        return rest.starts_with(' ').then(|| rest.trim_start());
+        // The space is what separates a marker from content — `-5 degrees` opens with a hyphen
+        // that is a minus sign. An entry that is *only* a marker has no space left to check
+        // once it has been trimmed, and it is still a marker; left alone it renders as `- -`.
+        return (rest.is_empty() || rest.starts_with(' ')).then(|| rest.trim_start());
+    }
+    // A bracketed index — `[0] do not change the public API`. Seen from this checkpoint on a
+    // real `pstore plan` run: asked for a list of constraints it numbered them itself, from
+    // zero, and the layout then put a bullet in front of the number. Bracketed digits are
+    // never content in these fields, so unlike the bare-digit case below there is no clock
+    // time or thousands separator to protect, and the trailing space is not required either —
+    // `[0]do it` is the same marker.
+    if let Some(rest) = t.strip_prefix('[') {
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if digits > 0
+            && let Some(rest) = rest[digits..].strip_prefix(']')
+        {
+            return Some(rest.trim_start());
+        }
     }
     let digits = t.len() - t.trim_start_matches(|c: char| c.is_ascii_digit()).len();
     if digits == 0 {
@@ -602,6 +628,23 @@ mod tests {
             "detect: alert sooner"
         );
         assert_eq!(entry_text("- • why did it run?"), "why did it run?");
+
+        // Bracketed indices, seen from this checkpoint on a real run: asked for a list it
+        // numbered the entries itself, from zero. Nothing in these fields opens with a
+        // bracketed number as content, so the trailing space is not required either.
+        assert_eq!(entry_text("[0] gate the pool size"), "gate the pool size");
+        assert_eq!(entry_text("[12] gate the pool size"), "gate the pool size");
+        assert_eq!(entry_text("[3]gate the pool size"), "gate the pool size");
+        // ...but a bracket that is not an index is content, and stays.
+        assert_eq!(entry_text("[warn] pool exhausted"), "[warn] pool exhausted");
+        assert_eq!(entry_text("[] pool exhausted"), "[] pool exhausted");
+
+        // A hyphen that is a minus sign is content, not a marker.
+        assert_eq!(entry_text("-5 degrees reported"), "-5 degrees reported");
+        // An entry that is nothing but a marker is an empty entry, not a bullet.
+        assert_eq!(entry_text("- "), "");
+        assert_eq!(entry_text("[0]"), "");
+
         // Newlines inside one entry would become list items with no bullet.
         assert_eq!(
             entry_text("first link.\nsecond link."),

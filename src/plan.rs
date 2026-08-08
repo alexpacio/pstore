@@ -67,19 +67,32 @@ pub const FIELDS: [(&str, &str); 6] = [
 /// than rendered as an empty heading — "Constraints:" with nothing under it reads as a
 /// section the planner forgot, when it means there are none. `steps` is numbered because
 /// its order is load-bearing; the rest are bullets because theirs is not.
+///
+/// Each entry has its own list marker stripped first. The numbering and the bullets here are
+/// pstore's, and a model asked for a list of constraints writes one anyway — a real run of
+/// `pstore plan` returned `[0] The public API ... must remain unchanged`, which this laid out
+/// as `- [0] The public API ...`. [`crate::rca`] met the same thing and already knows the
+/// markers, including the ones that are content rather than punctuation.
 pub fn render(objective: &str, sections: &[(&str, Vec<String>)]) -> String {
-    let mut out = format!("**Objective**\n{}\n", objective.trim());
+    let mut out = format!(
+        "**Objective**\n{}\n",
+        crate::rca::strip_leading_markers(objective)
+    );
     for (heading, items) in sections {
-        let items: Vec<&String> = items.iter().filter(|i| !i.trim().is_empty()).collect();
+        let items: Vec<String> = items
+            .iter()
+            .map(|i| crate::rca::strip_leading_markers(i))
+            .filter(|i| !i.is_empty())
+            .collect();
         if items.is_empty() {
             continue;
         }
         out.push_str(&format!("\n**{heading}**\n"));
         for (n, item) in items.iter().enumerate() {
             if *heading == "Steps" {
-                out.push_str(&format!("{}. {}\n", n + 1, item.trim()));
+                out.push_str(&format!("{}. {item}\n", n + 1));
             } else {
-                out.push_str(&format!("- {}\n", item.trim()));
+                out.push_str(&format!("- {item}\n"));
             }
         }
     }
@@ -135,17 +148,10 @@ pub fn warnings(plan: &str, original: &str) -> Vec<String> {
         ));
     }
 
-    // Paths are the thing an agent needs most and a planner drops most easily.
-    let paths = |s: &str| -> Vec<String> {
-        s.split_whitespace()
-            .filter_map(crate::shrink::path_token)
-            .collect()
-    };
-    let after = paths(plan);
-    let dropped: Vec<String> = paths(original)
-        .into_iter()
-        .filter(|p| !after.contains(p))
-        .collect();
+    // Paths are the thing an agent needs most and a planner drops most easily. The comparison
+    // is `shrink`'s so that the two checks cannot disagree about what "dropped" means — they
+    // ask the same question, and asking it twice is how they came to answer it differently.
+    let dropped = crate::shrink::dropped_paths(original, plan);
     if !dropped.is_empty() {
         out.push(format!("file paths dropped: {}", dropped.join(", ")));
     }
@@ -246,5 +252,84 @@ mod tests {
         let original = "a".repeat(400);
         let w = warnings("**Objective** do it", &original);
         assert!(w.iter().any(|w| w.contains("much shorter")), "got {w:?}");
+    }
+
+    /// The numbering and the bullets are pstore's. A model asked for a *list* of constraints
+    /// writes its own marker anyway, and laying that out again produces `- [0] ...` — which is
+    /// what a real `pstore plan` run returned before this stripped them.
+    #[test]
+    fn a_models_own_list_marker_is_not_laid_out_again() {
+        for marker in ["- ", "* ", "• ", "1. ", "2) ", "[0] ", "[3]"] {
+            let out = render(
+                "Do it.",
+                &[("Constraints", vec![format!("{marker}Keep the public API.")])],
+            );
+            assert!(
+                out.contains("- Keep the public API.\n"),
+                "marker {marker:?} survived into {out:?}"
+            );
+        }
+
+        // Steps get pstore's numbers, so a model that numbered them itself must not end up
+        // with two — and the numbers must be pstore's, not the model's.
+        let out = render(
+            "Do it.",
+            &[(
+                "Steps",
+                vec!["3. Edit src/a.rs.".into(), "- Edit src/b.rs.".into()],
+            )],
+        );
+        assert!(
+            out.contains("1. Edit src/a.rs.\n2. Edit src/b.rs.\n"),
+            "got {out:?}"
+        );
+
+        // Content that merely opens with digits is not a marker and must survive intact.
+        let out = render(
+            "Do it.",
+            &[("Done when", vec!["404 is never returned.".into()])],
+        );
+        assert!(out.contains("- 404 is never returned."), "got {out:?}");
+    }
+
+    /// An entry that is nothing but a marker is an empty entry, and an empty section is
+    /// omitted rather than rendered as a heading with a stray bullet under it.
+    #[test]
+    fn a_section_of_bare_markers_is_omitted() {
+        let out = render(
+            "Do it.",
+            &[("Constraints", vec!["- ".into(), "[0] ".into()])],
+        );
+        assert!(!out.contains("Constraints"), "got {out:?}");
+    }
+
+    /// The two path checks answer the same question and used to answer it differently. This
+    /// is the case that showed it: a plan is allowed to re-punctuate a reference.
+    #[test]
+    fn the_dropped_path_check_agrees_with_shrink() {
+        let original = "Update src/net/retry.rs and src/net/retry.rs again.";
+
+        // Named once, in backticks, at the end of a sentence: kept, and reported so.
+        let plan = "**Objective**\nRetry is configurable.\n\n\
+                    **Steps**\n1. Edit `src/net/retry.rs`.";
+        assert!(
+            warnings(plan, original).is_empty(),
+            "{:?}",
+            warnings(plan, original)
+        );
+
+        // Genuinely dropped, and named twice in the original: reported once, not twice.
+        let w = warnings(
+            "**Objective**\nDo something else entirely, at length.",
+            original,
+        );
+        let dropped: Vec<&String> = w.iter().filter(|w| w.contains("dropped")).collect();
+        assert_eq!(dropped.len(), 1, "got {w:?}");
+        assert_eq!(
+            dropped[0].matches("src/net/retry.rs").count(),
+            1,
+            "one file, reported once: {:?}",
+            dropped[0]
+        );
     }
 }

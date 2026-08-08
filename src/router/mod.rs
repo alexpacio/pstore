@@ -17,6 +17,15 @@
 //! question of which implementation produced it. Now [`rank`] either answers from the model
 //! or returns the reason it cannot, and the caller disables the feature rather than quietly
 //! ranking worse.
+//!
+//! **The prompt is judged on two axes before anything is ranked**, in one cheap call — see
+//! [`llm::Demand`] and [`llm::Breadth`]. Difficulty picks the weight class; breadth picks how
+//! long that model should think. They are asked separately because they answer different
+//! questions and genuinely come apart: renaming a method at 40 call sites is easy and wide, and
+//! finding the off-by-one that only shows under concurrent writers is hard and narrow. With
+//! difficulty as the only input, [`Effort::XHigh`] and [`Effort::Max`] were unreachable — the
+//! registry offered them and no prompt could ask for one. See [`llm::target_effort`] for the
+//! table the two combine through.
 
 pub mod hub;
 pub mod llm;
@@ -94,6 +103,51 @@ pub struct Choice {
     pub row_index: usize,
 }
 
+/// What the prompt was judged to need, before any model was ranked against it.
+///
+/// The premise of the shortlist rather than a summary of it, which is why every front end shows
+/// it above the table: a ranking that looks wrong is usually a judgement that was wrong, and this
+/// is the line that lets someone see which of the two to argue with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Judgement {
+    /// How much capability the work needs: `easy`, `moderate` or `hard`. See [`llm::Demand`].
+    pub demand: &'static str,
+    /// How much of the codebase it reaches across, in words. See [`llm::Breadth`].
+    pub breadth: &'static str,
+    /// The effort the shortlist was steered towards, from the two together.
+    ///
+    /// Kept alongside the labels rather than recomputed by each front end: the mapping is
+    /// [`llm::target_effort`]'s to own, and three copies of it would be three chances to disagree
+    /// with the prompt the ranker was actually given.
+    pub effort: Effort,
+    /// The phrase the model gave for why it judged the prompt this way.
+    pub because: String,
+}
+
+impl Judgement {
+    /// The judgement in one line, for a front end that has room for one.
+    pub fn summary(&self) -> String {
+        format!(
+            "{} · {} · effort {}",
+            self.demand, self.breadth, self.effort
+        )
+    }
+
+    /// The phrase that decided it, with its separator — or nothing at all.
+    ///
+    /// `because` is whatever the model put in that field, and the field is optional: a reply
+    /// that omits it leaves this empty. Every front end wants the same thing then, which is
+    /// silence rather than a dangling `judged hard · one edit · effort high — `, so the check
+    /// lives here instead of in each of the three.
+    pub fn because_suffix(&self) -> String {
+        if self.because.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", self.because)
+        }
+    }
+}
+
 /// A ranked shortlist over the detected agents.
 #[derive(Debug, Clone, Default)]
 pub struct Ranking {
@@ -107,12 +161,14 @@ pub struct Ranking {
     /// nothing could describe. Both belong in the same place — the question they answer is
     /// "why is that not in the list?".
     pub excluded: Vec<(&'static str, String)>,
-    /// How hard the prompt was judged to be, and the phrase that decided it.
+    /// What the prompt was judged to need, and the phrase that decided it.
     ///
     /// Its own model call, made before ranking — see [`llm::Demand`], which explains why that is
     /// worth an extra few seconds. Shown because it is the premise of everything below it: a
-    /// shortlist that looks wrong is usually a difficulty read that was wrong.
-    pub demand: Option<(&'static str, String)>,
+    /// shortlist that looks wrong is usually a judgement that was wrong, and the two axes fail
+    /// differently — a bad difficulty read puts the wrong model first, a bad breadth read puts
+    /// the right model at the wrong effort.
+    pub judged: Option<Judgement>,
     /// How many of the ranked models pstore had to describe to the checkpoint itself.
     ///
     /// Provenance rather than trivia: it is the difference between a ranking the checkpoint made
@@ -426,9 +482,7 @@ pub fn shutdown_model() {
 /// Call it after publishing the new preference. Returns how many runs were stopped, which is
 /// normally zero — nothing is resident between calls.
 pub fn unload_other_model_builds() -> usize {
-    {
-        llm::unload_other_builds()
-    }
+    llm::unload_other_builds()
 }
 
 /// Check the model and runtime are ready now rather than on the next ranking.
@@ -436,9 +490,7 @@ pub fn unload_other_model_builds() -> usize {
 /// Returns the reason when either is missing, so the Models window can show it. Blocking;
 /// call from a worker thread.
 pub fn preload_classifiers() -> Result<(), String> {
-    {
-        llm::preload()
-    }
+    llm::preload()
 }
 
 #[cfg(test)]
@@ -695,6 +747,66 @@ mod tests {
         assert!(kept.iter().all(|c| c.effort == Effort::Low));
     }
 
+    /// The line every front end prints above the shortlist has to carry both halves of the
+    /// judgement and what they came to. Showing only the difficulty is what it used to do, and
+    /// it made the effort in the table below unaccountable: there was nothing on screen that
+    /// explained why one hard prompt got `high` and another got `max`.
+    #[test]
+    fn the_judgement_line_shows_both_axes_and_the_effort() {
+        let j = Judgement {
+            demand: "hard",
+            breadth: "many files",
+            effort: Effort::Max,
+            because: "whole-crate async conversion".into(),
+        };
+        let line = j.summary();
+        assert!(line.contains("hard"), "{line}");
+        assert!(line.contains("many files"), "{line}");
+        assert!(line.contains("max"), "{line}");
+
+        // Every effort the table can reach has to survive into the line, or the one number the
+        // user can act on is the one that goes missing.
+        for effort in Effort::ALL {
+            let j = Judgement {
+                effort,
+                ..j.clone()
+            };
+            assert!(
+                j.summary().contains(effort.as_str()),
+                "{effort:?} did not reach the line: {}",
+                j.summary()
+            );
+        }
+    }
+
+    /// `because` is an optional field of the model's reply, so all three front ends have to
+    /// cope with it being absent. Appending the separator regardless leaves a dangling dash on
+    /// the end of the line, which reads as pstore having truncated its own explanation.
+    #[test]
+    fn a_judgement_with_no_reason_carries_no_separator() {
+        let j = Judgement {
+            demand: "easy",
+            breadth: "one edit",
+            effort: Effort::Low,
+            because: String::new(),
+        };
+        assert_eq!(j.because_suffix(), "", "an absent reason is silence");
+
+        // Whitespace is absent too — a model that answered with a space should not produce a
+        // separator with nothing after it either.
+        let blank = Judgement {
+            because: "   ".into(),
+            ..j.clone()
+        };
+        assert_eq!(blank.because_suffix(), "");
+
+        let given = Judgement {
+            because: "one file, one variable".into(),
+            ..j.clone()
+        };
+        assert_eq!(given.because_suffix(), " — one file, one variable");
+    }
+
     /// "Nothing installed" and "you excluded everything" need different answers — the
     /// second one is fixed in a config file, not by installing an agent.
     #[test]
@@ -719,5 +831,4 @@ mod tests {
             "the reason should point at the config, got {why:?}"
         );
     }
-
 }

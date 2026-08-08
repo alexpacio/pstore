@@ -142,8 +142,13 @@ pub struct Prefs {
     /// reasoning block is bounded by the grammar rather than by hope: at the cap the model
     /// is forced to close it and emit the JSON.
     ///
-    /// Zero disables reasoning entirely, which is faster and measurably worse — see
-    /// [`crate::router::llm::rank`].
+    /// **This is the ranking latency knob, and zero is now the default.** Generating the
+    /// reasoning block is where a ranking spends its time — on a measured call it was 30.7 s of
+    /// 48 s, against 9.7 s evaluating the prompt and 0.7 s mapping the weights. Nothing else in
+    /// the operation is close, and no `llama-server` setting tried against it moved the number.
+    ///
+    /// Raise it to let the checkpoint deliberate before it answers. That used to be necessary and
+    /// is no longer — see the default below for what changed and what was measured.
     pub model_reasoning_budget: usize,
     /// Look up a model pstore has no facts about, over the network.
     ///
@@ -173,9 +178,26 @@ impl Default for Prefs {
             llama_path: None,
             model_context_ceiling: 8192,
             local_model: LocalModel::default(),
-            // Measured: 1 400 characters is where the reasoning on a hard routing prompt
-            // has finished its analysis and started repeating itself.
-            model_reasoning_budget: 1400,
+            // Off, and this reverses a long-standing default of 1 400 characters.
+            //
+            // Reasoning earned its seconds when the ranking prompt asked the checkpoint to work
+            // out the whole answer: which weight class suits this prompt, how the options
+            // compare, what score each deserves. It no longer asks that. The difficulty and
+            // breadth arrive as a stated fact from their own call; `order_for` has already put
+            // the options in the order that judgement implies; the grammar's bands make the
+            // scores descend; and `rank_grammar` anchors the top pick's effort. The deliberation
+            // had been made redundant by the structure around it, and it was still being paid for
+            // on every ranking.
+            //
+            // Measured over thirty prompts, paired, against the same field on the same machine:
+            // difficulty 30/30 either way, model tier 30/30 either way, exact effort 22/30 either
+            // way, no degenerate answers either way, and all five effort levels still reached.
+            // Mean 16.8 s against 35.8 s — faster on thirty of thirty.
+            //
+            // Raise it if a future change puts judgement back into the ranking call. The failure
+            // it guards against is real and documented in `router::llm::degeneracy`; it is simply
+            // not reachable from where the ranking prompt now stands.
+            model_reasoning_budget: 0,
             allow_model_lookup: true,
             filter: Filter::default(),
         }

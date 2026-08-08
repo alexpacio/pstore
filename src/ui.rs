@@ -653,9 +653,18 @@ impl Ui {
                 ranking.choices.len(),
                 ranking.considered
             ));
-            if let Some((label, because)) = &ranking.demand {
-                ui.label(format!("judged {label}"))
-                    .on_hover_text(format!("what decided it: {because}"));
+            if let Some(judged) = &ranking.judged {
+                let decided = if judged.because.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("what decided it: {}\n\n", judged.because)
+                };
+                ui.label(format!("judged {}", judged.summary()))
+                    .on_hover_text(format!(
+                        "{decided}Difficulty picks the weight class, breadth picks how long it \
+                         should think; the shortlist below was steered towards {} effort.",
+                        judged.effort
+                    ));
             }
             ui.checkbox(&mut self.show_all_candidates, "show all");
             // Exclusions are kept, not deleted — they are the only answer to "why is Crush never
